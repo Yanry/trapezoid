@@ -1,0 +1,1 @@
+{"name":"sbt","version":"1.6.0","bspVersion":"2.0.0-M5","languages":["scala"],"argv":["/home/yanry/tools/SpinalHDL/jdk1.8.0_411/jre/bin/java","-Xms100m","-Xmx100m","-classpath","/home/yanry/.local/share/JetBrains/IdeaIC2024.1/Scala/launcher/sbt-launch.jar","-Dsbt.script=/home/yanry/tools/SpinalHDL/sbt/bin/sbt","xsbt.boot.Boot","-bsp"]}

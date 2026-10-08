@@ -1,0 +1,86 @@
+*.npy
+*.npz
+*.hex
+
+*.JPEG
+*.zip
+*.vcd
+
+#################################################
+# SBT / Scala
+#################################################
+
+target/
+project/target/
+project/project/
+.project
+.classpath
+.cache
+.history
+
+# Ivy / Coursier
+lib_managed/
+dependency-reduced-pom.xml
+*.lock
+
+#################################################
+# SpinalHDL generated files
+#################################################
+
+# Generated RTL
+rtl/
+verilog/
+vhdl/
+*.v
+*.sv
+*.vh
+*.vhd
+
+# Spinal internal
+.spinal/
+.spinalhdl/
+.spinalcache/
+
+#################################################
+# Simulation (SpinalSim / Verilator)
+#################################################
+
+simWorkspace/
+sim/
+wave/
+*.vcd
+*.fst
+*.wlf
+*.ghw
+*.log
+
+# Verilator
+obj_dir/
+*.d
+*.o
+
+#################################################
+# IDE
+#################################################
+
+# IntelliJ
+.idea/
+*.iml
+
+# VSCode
+.vscode/
+
+#################################################
+# OS
+#################################################
+
+.DS_Store
+Thumbs.db
+
+#################################################
+# Misc
+#################################################
+
+*.bak
+*.tmp
+*.swp

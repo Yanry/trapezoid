@@ -144,6 +144,16 @@ sbt -batch 'runMain trapezoid.GenerateGustavsonTileEngine'
 
 输出位于 `generated-gustavson/`。
 
+阶段三还提供三个生成入口：
+
+```bash
+sbt -batch 'runMain trapezoid.GenerateTrGtSubrowScheduler'
+sbt -batch 'runMain trapezoid.GenerateTrGsSpatialEngine'
+sbt -batch 'runMain trapezoid.GenerateGustavsonArray'
+```
+
+分别输出到 `generated-trgt/`、`generated-trgs/` 和 `generated-gustavson-array/`。
+
 ### 2.8 矩阵级参考模型
 
 `trapezoid.model.MatrixReference` 提供纯 Scala 正确性基线，包括：
@@ -187,13 +197,26 @@ sbt -batch 'runMain trapezoid.GenerateGustavsonTileEngine'
 7. 不属于 Gustavson 路径的 mode 通过 `unsupportedMode` 拒绝；
 8. busy 状态下 `clear` 会排空已进入 PE 的响应后安全中止。
 
-当前 accumulator 是寄存器式坐标 CAM 和确定性最小坐标选择网络，适合功能验证和小规模配置。后续需要映射为论文风格的 subrow、FIFO、本地 buffer 和可流水化 merge tree。
+当前 accumulator 是寄存器式坐标 CAM 和确定性最小坐标选择网络，适合功能验证和小规模配置。TrGT subrow/FIFO 已由独立前端实现；后续仍需把 FIFO 和 accumulator 映射到本地 SRAM，并将最小坐标选择网络替换为可流水化 merge tree。
+
+### 2.11 TrGT/TrGS 前端与多 PE row 阵列
+
+按照论文 Fig. 15--17 的数据移动方式，新增了：
+
+- `TrGtSubrowScheduler`：将一个 PE row 划分为 4 个逻辑 subrow，每个 subrow 配置独立 B FIFO，每次最多从每个 FIFO 发出一个元素；
+- `GustavsonBFifo`：支持独立 Stream 背压和 occupancy 状态，满 FIFO 会可靠停顿上游；
+- `TrGsSpatialEngine`：把一个 A 非零值广播到 cache-line 内所有有效 B lane，并保留 B 的列坐标用于空间分发和结果累加；
+- `GustavsonArray`：为每个 PE row 复制独立的 Gustavson accumulator、命令/结果 Stream 和状态接口。
+
+TrGT 前端暴露 accepted/issued B-element 计数，便于检查 FIFO 停顿和利用率。调用方应在最后一个 B 元素完成 Stream 握手后拉高 `finish`；前端会先排空四个 FIFO，再发送 `endOfTile`。多 PE row 阵列允许每行独立选择 `TrGt` 或 `TrGs` 并独立背压；当前由外部调度器负责 row 分配，不根据 density 自动改变 mode。
+
+这些模块已经实现论文数据移动方式的功能等价路径，但 TrGT FIFO 当前使用寄存器实现，尚未映射到 `BankedLocalBuffer` SRAM；TrGS 当前通过带坐标的组合适配完成分发，尚未实现流水化物理分发网络。
 
 ## 3. 当前达到的效果
 
 ### 3.1 功能验证
 
-当前共有 13 项自动测试，执行方式为：
+当前共有 16 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -218,9 +241,12 @@ sbt -batch test
 - 两个 K tile 的本地 buffer 读改写累加，且序列内可以切换 `TrIp`/`DenseIp`；
 - TrGT/TrGS 跨命令同坐标累加、坐标排序 flush 和随机输出背压；
 - Gustavson accumulator 容量不足时的显式 overflow；
-- Gustavson 错误 mode 拒绝和 busy 状态安全 abort。
+- Gustavson 错误 mode 拒绝和 busy 状态安全 abort；
+- TrGT 四路 subrow FIFO 的满队列背压、独立排空和有序结果合并；
+- TrGS 对全满或稀疏 cache line 的 A 广播、B 列分发和跨命令累加；
+- 多 PE row Gustavson 阵列的结构 elaboration。
 
-当前测试结果为 13 项全部通过。
+当前测试结果为 16 项全部通过。
 
 ### 3.2 RTL 检查
 
@@ -230,9 +256,12 @@ sbt -batch test
 verilator --lint-only --Wall -Wno-fatal generated/*.v
 verilator --lint-only --Wall -Wno-fatal generated-tile/*.v
 verilator --lint-only --Wall -Wno-fatal generated-gustavson/*.v
+verilator --lint-only --Wall -Wno-fatal generated-trgt/*.v
+verilator --lint-only --Wall -Wno-fatal generated-trgs/*.v
+verilator --lint-only --Wall -Wno-fatal generated-gustavson-array/*.v
 ```
 
-当前三个 RTL 目录都没有 lint error。剩余 warning 主要来自 SpinalHDL 生成的枚举调试字符串、未消费的调试/诊断信号和部分保留接口，不影响功能。
+当前已生成的 RTL 目录都没有 lint error。剩余 warning 主要来自 SpinalHDL 生成的枚举调试字符串、未消费的调试/诊断信号和部分保留接口，不影响功能。
 
 ### 3.3 当前适用范围
 
@@ -242,6 +271,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson/*.v
 - 进行小规模稀疏矩阵输入的 RTL 仿真；
 - 直接输入一个 bitmask/IP tile 并得到有序矩阵结果；
 - 跨多个 K tile 累加 IP 结果，以及跨多个命令累加 Gustavson 结果；
+- 验证 TrGT 四路时间 gather 和 TrGS cache-line 空间分发；
 - 研究 MFIU、动态列打包和 merge/reduction 行为；
 - 作为后续调度器、cache 层次和 FPGA/ASIC 综合工作的基础。
 
@@ -255,7 +285,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson/*.v
 
 - 跨多个 M/N tile 的外层全矩阵循环；
 - 从 CSR/CSC 描述符自动生成 fiber 装载请求；
-- 多 PE row Gustavson tile 调度；
+- 多 PE row 间自动负载均衡；
 - 面向软件的寄存器组、描述符队列或指令译码器。
 
 当前设计刻意不实现根据 density 自动选择 mode。未来即使增加启发式推荐器，也必须保留软件显式覆盖 mode 的能力。
@@ -266,14 +296,14 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson/*.v
 
 ### 4.3 Gustavson 存储和并行调度仍待完成
 
-当前 TrGT/TrGS 已能在任意 lane density 下完成命令内归约、跨命令累加和有序 flush，但尚未完成：
+当前 TrGT/TrGS 已能在任意 lane density 下完成命令内归约、跨命令累加、有序 flush、subrow FIFO 调度和多 PE row 独立执行，但尚未完成：
 
-- TrGT 的 4 个独立 PE subrow/FIFO 调度；
+- 将 TrGT 寄存器 FIFO 映射到四 bank `BankedLocalBuffer`；
 - 将寄存器式坐标 CAM 替换为可扩展的本地 buffer/merge tree；
-- 多 PE row 间的 row 分配和负载均衡；
+- 多 PE row 间自动 row 分配和负载均衡；
 - B row 缓存未命中和 refill 流程。
 
-因此当前已经是可验证的单 PE row Gustavson tile 执行引擎，但还不是论文规模的分布式 Gustavson 系统。
+因此当前已经是可验证的多 PE row Gustavson 功能系统，但还不是论文规模的 SRAM/cache 驱动实现。
 
 ### 4.4 算术格式尚未达到论文 FP32 配置
 
@@ -321,7 +351,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson/*.v
 
 阶段二剩余工作是增加外层 M/N tile 循环以及矩阵描述符接口，使任意尺寸矩阵不需要软件逐 tile 驱动。
 
-### 阶段 3：完成 TrGT/TrGS 执行引擎（单 PE row 累加闭环已完成）
+### 阶段 3：完成 TrGT/TrGS 执行引擎（功能前端与多 PE row 阵列已完成）
 
 1. 把 PE row 划分为最多 4 个可独立调度的 subrow；
 2. 使用本地 buffer bank 实现 B-row FIFO；
@@ -332,7 +362,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson/*.v
 
 验收标准：TrGT 和 TrGS 可以消费完整 CSR row，并直接输出完整、有序的 C row。
 
-当前已完成第 3、4、5 项的功能版本：多个命令可持续累加相同坐标，`endOfTile` 后按坐标排序并背压输出。下一步需要完成第 1、2、6 项及多 PE row 调度，并把当前寄存器式选择网络替换为可扩展结构。
+第 1、3--6 项已完成可仿真的功能版本；第 2 项已实现四个独立 FIFO 的接口、背压和调度语义，但底层仍是寄存器而不是 `BankedLocalBuffer` SRAM。TrGS 已具有广播/列坐标分发路径，多个命令可持续累加相同坐标，`endOfTile` 后按坐标排序并背压输出，多 PE row 也可以独立并发。后续重点是完成 SRAM 映射和流水化 merge tree，并接入 cache refill。
 
 ### 阶段 4：实现多级存储系统
 
@@ -368,6 +398,6 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson/*.v
 
 ## 6. 建议的近期任务
 
-下一轮建议优先实现 TrGT 的 4 个 subrow/B-row FIFO 与 TrGS 的 A 广播/B 空间分发，再把单 PE row Gustavson 引擎扩展到多 PE row。阶段二则补齐外层 M/N tile 循环和矩阵描述符接口，形成不依赖软件逐 tile 驱动的完整矩阵执行路径。
+下一轮建议优先把 TrGT FIFO 映射到现有 `BankedLocalBuffer`，并为多 PE row 阵列增加 row 分配与完成仲裁；阶段二则补齐外层 M/N tile 循环和矩阵描述符接口。随后进入阶段四，实现统一 cache request/refill 接口，让 TrGT 和 TrGS 不再依赖测试平台直接推送 B 元素。
 
 所有后续控制器都应继续遵守本文的 mode 与稀疏度原则：density 可以参与性能推荐，但硬件接口必须允许调用方在任意 sparsity level 下显式选择任何 mode。

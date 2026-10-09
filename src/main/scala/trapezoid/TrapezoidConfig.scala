@@ -91,12 +91,21 @@ case class TrIpTileConfig(core: TrapezoidConfig, maxColumns: Int = 16) {
 /** Capacity of the coordinate accumulator shared by TrGT and TrGS.
   * Mode remains a runtime policy and is never inferred from lane density.
   */
-case class GustavsonTileConfig(core: TrapezoidConfig, accumulatorEntries: Int) {
+case class GustavsonTileConfig(
+    core: TrapezoidConfig,
+    accumulatorEntries: Int,
+    fifoDepthPerSubrow: Int = 8
+) {
   require(accumulatorEntries >= core.outputLanes,
     "the accumulator must hold at least one complete PE response")
+  require(fifoDepthPerSubrow >= 2)
+  require(core.cacheLineWords >= core.localBanks,
+    "TrGT needs one cache-line lane per PE subrow")
 
   val entryIndexWidth: Int = math.max(1, log2Up(accumulatorEntries))
   val entryCountWidth: Int = log2Up(accumulatorEntries + 1)
+  val fifoPointerWidth: Int = math.max(1, log2Up(fifoDepthPerSubrow))
+  val fifoCountWidth: Int = log2Up(fifoDepthPerSubrow + 1)
 }
 
 object GustavsonTileConfig {

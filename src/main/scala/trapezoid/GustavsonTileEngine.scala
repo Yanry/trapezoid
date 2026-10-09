@@ -221,10 +221,51 @@ class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
   }
 }
 
+/** Multi-row Gustavson execution boundary.
+  *
+  * Each PE row owns an independent coordinate accumulator and Stream port, so
+  * rows can execute TrGT or TrGS concurrently with independent backpressure.
+  * Work assignment and load balancing remain explicit scheduler policies.
+  */
+class GustavsonArray(tileCfg: GustavsonTileConfig) extends Component {
+  private val cfg = tileCfg.core
+
+  val io = new Bundle {
+    val clear = in Bool()
+    val commands = Vec(slave(Stream(PERowCommand(cfg))), cfg.peRows)
+    val results = Vec(master(Stream(MatrixResult(cfg))), cfg.peRows)
+    val busy = out Bits(cfg.peRows bits)
+    val done = out Bits(cfg.peRows bits)
+    val overflow = out Bits(cfg.peRows bits)
+    val unsupportedMode = out Bits(cfg.peRows bits)
+    val activeEntries = out Vec(UInt(tileCfg.entryCountWidth bits), cfg.peRows)
+  }
+
+  val engines = Array.fill(cfg.peRows)(new GustavsonTileEngine(tileCfg))
+  for (row <- 0 until cfg.peRows) {
+    engines(row).io.clear := io.clear
+    engines(row).io.command <> io.commands(row)
+    engines(row).io.result <> io.results(row)
+    io.busy(row) := engines(row).io.busy
+    io.done(row) := engines(row).io.done
+    io.overflow(row) := engines(row).io.overflow
+    io.unsupportedMode(row) := engines(row).io.unsupportedMode
+    io.activeEntries(row) := engines(row).io.activeEntries
+  }
+}
+
 object GenerateGustavsonTileEngine extends App {
   SpinalConfig(
     mode = Verilog,
     targetDirectory = "generated-gustavson",
     oneFilePerComponent = true
   ).generate(new GustavsonTileEngine(GustavsonTileConfig(TrapezoidConfig.small)))
+}
+
+object GenerateGustavsonArray extends App {
+  SpinalConfig(
+    mode = Verilog,
+    targetDirectory = "generated-gustavson-array",
+    oneFilePerComponent = true
+  ).generate(new GustavsonArray(GustavsonTileConfig(TrapezoidConfig.small)))
 }

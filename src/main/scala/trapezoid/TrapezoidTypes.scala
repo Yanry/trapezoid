@@ -110,3 +110,27 @@ case class TrIpTileStart(tileCfg: TrIpTileConfig) extends Bundle {
   val firstKTile = Bool()
   val lastKTile = Bool()
 }
+
+case class IndexedGustavsonA(cfg: TrapezoidConfig) extends Bundle {
+  val index = UInt(cfg.aRegisterIndexWidth bits)
+  val element = GustavsonA(cfg)
+}
+
+case class GustavsonStart() extends Bundle {
+  /** The caller selects the execution policy explicitly. */
+  val mode = TrapezoidDataflow()
+}
+
+case class TrGsB(cfg: TrapezoidConfig) extends Bundle {
+  val valid = Bool()
+  val k = UInt(cfg.coordinateWidth bits)
+  val column = UInt(cfg.coordinateWidth bits)
+  val value = SInt(cfg.dataWidth bits)
+}
+
+case class TrGsCommand(cfg: TrapezoidConfig) extends Bundle {
+  val mode = TrapezoidDataflow()
+  val endOfTile = Bool()
+  val a = GustavsonA(cfg)
+  val b = Vec(TrGsB(cfg), cfg.cacheLineWords)
+}

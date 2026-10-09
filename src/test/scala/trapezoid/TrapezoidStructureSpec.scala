@@ -31,4 +31,8 @@ class TrapezoidStructureSpec extends AnyFunSuite {
   test("four-bank local buffer elaborates") {
     elaborate(new BankedLocalBuffer(cfg))
   }
+
+  test("multi-row Gustavson array elaborates") {
+    elaborate(new GustavsonArray(GustavsonTileConfig(cfg, accumulatorEntries = 4)))
+  }
 }

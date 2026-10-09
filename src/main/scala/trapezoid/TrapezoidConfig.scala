@@ -109,6 +109,34 @@ case class TrIpMatrixConfig(
   val kTileIndexWidth: Int = math.max(1, log2Up(maxKTiles))
 }
 
+/** Direct-mapped banked read-cache sizing.
+  * Addresses identify complete cache lines rather than bytes.
+  */
+case class CacheConfig(
+    wordWidth: Int,
+    wordsPerLine: Int,
+    addressWidth: Int,
+    bankCount: Int,
+    setsPerBank: Int,
+    clientCount: Int,
+    requestIdWidth: Int = 8
+) {
+  require(wordWidth > 0 && wordsPerLine > 0)
+  require(addressWidth > 0 && requestIdWidth > 0)
+  require(bankCount > 0 && (bankCount & (bankCount - 1)) == 0,
+    "cache bankCount must be a power of two")
+  require(setsPerBank >= 2 && (setsPerBank & (setsPerBank - 1)) == 0,
+    "cache setsPerBank must be a power of two and at least two")
+  require(clientCount > 0)
+
+  val lineWidth: Int = wordWidth * wordsPerLine
+  val bankIndexWidth: Int = math.max(1, log2Up(bankCount))
+  val setIndexWidth: Int = math.max(1, log2Up(setsPerBank))
+  val clientIndexWidth: Int = math.max(1, log2Up(clientCount))
+  val tagWidth: Int = addressWidth - log2Up(bankCount) - log2Up(setsPerBank)
+  require(tagWidth >= 1, "cache addressWidth must leave at least one tag bit")
+}
+
 /** Capacity of the coordinate accumulator shared by TrGT and TrGS.
   * Mode remains a runtime policy and is never inferred from lane density.
   */

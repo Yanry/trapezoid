@@ -46,4 +46,10 @@ class TrapezoidStructureSpec extends AnyFunSuite {
     elaborate(new TrIpMatrixController(TrIpMatrixConfig(
       tileCfg, maxMatrixRows = 8, maxMatrixColumns = 8, maxKTiles = 1)))
   }
+
+  test("banked read cache elaborates") {
+    elaborate(new BankedReadCache(CacheConfig(
+      wordWidth = 8, wordsPerLine = 4, addressWidth = 6,
+      bankCount = 2, setsPerBank = 2, clientCount = 2)))
+  }
 }

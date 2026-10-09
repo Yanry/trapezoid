@@ -124,6 +124,31 @@ case class MatrixDescriptorResult(cfg: TrapezoidConfig) extends Bundle {
   val endOfMatrix = Bool()
 }
 
+case class CacheReadRequest(cacheCfg: CacheConfig) extends Bundle {
+  val address = UInt(cacheCfg.addressWidth bits)
+  val requestId = UInt(cacheCfg.requestIdWidth bits)
+}
+
+case class CacheReadResponse(cacheCfg: CacheConfig) extends Bundle {
+  val requestId = UInt(cacheCfg.requestIdWidth bits)
+  val data = Bits(cacheCfg.lineWidth bits)
+  /** False means this response required a refill before it could complete. */
+  val wasHit = Bool()
+  val error = Bool()
+}
+
+case class CacheRefillRequest(cacheCfg: CacheConfig) extends Bundle {
+  val bank = UInt(cacheCfg.bankIndexWidth bits)
+  val address = UInt(cacheCfg.addressWidth bits)
+}
+
+case class CacheRefillResponse(cacheCfg: CacheConfig) extends Bundle {
+  val bank = UInt(cacheCfg.bankIndexWidth bits)
+  val address = UInt(cacheCfg.addressWidth bits)
+  val data = Bits(cacheCfg.lineWidth bits)
+  val error = Bool()
+}
+
 case class IndexedGustavsonA(cfg: TrapezoidConfig) extends Bundle {
   val index = UInt(cfg.aRegisterIndexWidth bits)
   val element = GustavsonA(cfg)

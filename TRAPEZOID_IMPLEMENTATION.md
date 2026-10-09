@@ -144,6 +144,14 @@ sbt -batch 'runMain trapezoid.GenerateTrIpMatrixController'
 
 输出位于 `generated-matrix/`。
 
+生成阶段四的多 bank 读 cache：
+
+```bash
+sbt -batch 'runMain trapezoid.GenerateBankedReadCache'
+```
+
+输出位于 `generated-cache/`。
+
 生成阶段三 Gustavson 跨命令累加引擎：
 
 ```bash
@@ -236,11 +244,28 @@ TrGT 前端暴露 accepted/issued B-element 计数，便于检查 FIFO 停顿和
 
 描述符中的 mode 数组由软件逐 K tile 指定，可以在同一矩阵中切换 `DenseIp`/`TrIp`，且不检查 density。当前接口已经自动推进外层循环，但 fiber 数据仍由上游按当前基址流式提供；CSR/CSC 指针读取、cache 请求和 DMA 尚属于后续存储系统工作。
 
+### 2.13 多 bank 读 cache 与 refill 协议
+
+`BankedReadCache` 完成了阶段四的第一版统一读存储边界：
+
+- 参数化 line word 位宽、每 line word 数、地址宽度、bank 数、每 bank set 数、client 数和 request ID；
+- line address 的低位选择 bank、随后位选择 set、高位作为 direct-mapped tag；
+- bank 数和 set 数均为 2 的幂，并且每个 bank 至少包含 2 个 set；
+- 每个 bank 使用独立 data/tag `Mem`，并允许不同 bank 同周期接受请求；
+- 同 bank 多 client 请求使用固定优先级仲裁并通过 Stream 背压串行化；
+- 每个 client 最多一个 outstanding 请求，每个 bank 最多一个独立 miss；
+- 共享 refill 请求端口携带 bank 和 line address，refill 响应可按 bank 乱序返回；
+- hit、miss、refill error 和 request ID 都通过原 client 的响应 Stream 返回；
+- refill error 不会安装 cache line，`clear` 会失效全部 tag 并取消未完成事务；
+- 暴露 bank busy、client outstanding 以及 hit/miss/refill 计数器。
+
+该 cache 不检查计算 mode 或 operand density，四种 mode 后续可以通过相同的 read request/refill 协议取数。当前版本刻意只实现读路径；cache 写入、dirty bit、eviction writeback、多个 miss/bank 的 MSHR、跨 cluster 互连和 DMA 尚未实现。
+
 ## 3. 当前达到的效果
 
 ### 3.1 功能验证
 
-当前共有 22 项自动测试，执行方式为：
+当前共有 25 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -273,9 +298,11 @@ sbt -batch test
 - 共享调度器的 tile-row 固定、双 row 重叠执行、结果仲裁、完成释放，以及同一 tile 内显式切换 `TrGt`/`TrGs`；
 - 6 x 8 与 8 x 6 矩阵的 2 x 2 个 M/N tile、2 个 K tile 自动遍历；
 - 矩阵描述符内逐 K tile 显式切换 `DenseIp`/`TrIp`、随机输出背压、tile/matrix 边界和参考模型比对；
-- 非法矩阵描述符和不兼容 mode 的显式拒绝。
+- 非法矩阵描述符和不兼容 mode 的显式拒绝；
+- 多 bank cache 的独立并行接收、同 bank 冲突背压、request ID 响应路由和跨 bank 乱序 refill；
+- cache miss/refill、重复读取 hit、地址冲突替换、refill error 不安装以及 clear 全局失效。
 
-当前测试结果为 22 项全部通过。
+当前测试结果为 25 项全部通过。
 
 ### 3.2 RTL 检查
 
@@ -285,6 +312,7 @@ sbt -batch test
 verilator --lint-only --Wall -Wno-fatal generated/*.v
 verilator --lint-only --Wall -Wno-fatal generated-tile/*.v
 verilator --lint-only --Wall -Wno-fatal generated-matrix/*.v
+verilator --lint-only --Wall -Wno-fatal generated-cache/*.v
 verilator --lint-only --Wall -Wno-fatal generated-gustavson/*.v
 verilator --lint-only --Wall -Wno-fatal generated-trgt/*.v
 verilator --lint-only --Wall -Wno-fatal generated-trgs/*.v
@@ -302,6 +330,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 - 进行小规模稀疏矩阵输入的 RTL 仿真；
 - 直接输入一个 bitmask/IP tile 并得到有序矩阵结果；
 - 在配置容量内通过一个描述符自动遍历多个 M/N/K tile；
+- 验证多 client、多 bank 的 cache 请求、冲突背压和 refill 行为；
 - 跨多个 K tile 累加 IP 结果，以及跨多个命令累加 Gustavson 结果；
 - 验证 TrGT 四路时间 gather 和 TrGS cache-line 空间分发；
 - 研究 MFIU、动态列打包和 merge/reduction 行为；
@@ -323,7 +352,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 ### 4.2 缺少全局 cache 和 DMA
 
-论文中的 4 个 cache cluster、每 cluster 32 bank、32 x 32 互连、HBM 请求和 cache refill 尚未实现。通用顶层的每 PE row 本地 buffer 仍由外部端口控制；TrIP tile controller 使用独立的四 bank 结果 buffer 完成自动 scatter 和有序读回。后续接入全局存储层次时，需要把该功能映射到分布式 PE buffer 和 cache 写回路径。
+当前已实现一个参数化 multi-client、multi-bank direct-mapped 读 cache，以及每 bank 一个独立 miss 的共享 refill 协议。尚未实现论文中的 4 个 cache cluster、完整 32 x 32 cluster 互连、写 cache/dirty eviction、HBM 请求和 DMA。通用顶层的每 PE row 本地 buffer 仍由外部端口控制；TrIP tile controller 使用独立的四 bank 结果 buffer 完成自动 scatter 和有序读回。后续需要把矩阵/Gustavson 前端接入 cache 协议，并把结果写回映射到统一存储层次。
 
 ### 4.3 Gustavson 存储和并行调度仍待完成
 
@@ -395,7 +424,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 六项均已完成可仿真的功能版本：第 2 项使用四个同步 `Mem` bank 推断 SRAM，但尚未与 TrIP 结果 buffer 复用同一物理实例。TrGS 已具有广播/列坐标分发路径，多个命令可持续累加相同坐标，`endOfTile` 后按坐标排序并背压输出；共享调度器可让多个 PE row 重叠执行，并保证一个 tile 的命令与输出边界不被拆散。后续重点是统一物理 SRAM、实现流水化 merge tree，并接入 cache refill。
 
-### 阶段 4：实现多级存储系统
+### 阶段 4：实现多级存储系统（统一读协议、bank 仲裁与 refill 已完成）
 
 1. 定义统一的 cache request/response 协议；
 2. 实现参数化 cache bank 和地址映射；
@@ -405,6 +434,8 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 6. 提供简单 DMA 或 AXI 接口连接外部存储器。
 
 验收标准：四种数据流都只通过统一存储接口访问矩阵数据，并能在 bank 冲突和 cache miss 下正确停顿。
+
+当前完成了第 1、2 项的读路径、第 3 项的通用多 client bank 仲裁，以及第 5 项的单 miss/bank refill 功能版本。下一步是把矩阵和 Gustavson 前端接入该协议，再增加 cluster 组织、写回/MSHR 和 DMA。
 
 ### 阶段 5：替换为目标算术单元
 
@@ -429,6 +460,6 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 ## 6. 建议的近期任务
 
-下一轮建议进入阶段四，定义统一 cache request/refill 接口，把矩阵控制器的流式 fiber 请求连接到 CSR/CSC 描述符读取与 DMA；同时把 TrGT typed FIFO 与 TrIP 结果 buffer 统一到可按 mode 切换的物理 `BankedLocalBuffer`。随后为 Gustavson scheduler 增加代价感知的公平分配。
+下一轮建议为矩阵控制器增加 fiber-cache adapter，把当前 `rowBase/columnBase/kTileIndex` 请求转换成 cache line 读取；随后增加写 cache、dirty eviction、MSHR 和简单 DMA。并行工作是把 TrGT typed FIFO 与 TrIP 结果 buffer 统一到可按 mode 切换的物理 `BankedLocalBuffer`，并为 cache/Gustavson 仲裁器增加 round-robin 公平策略。
 
 所有后续控制器都应继续遵守本文的 mode 与稀疏度原则：density 可以参与性能推荐，但硬件接口必须允许调用方在任意 sparsity level 下显式选择任何 mode。

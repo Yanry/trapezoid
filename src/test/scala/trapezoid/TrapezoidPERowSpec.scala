@@ -163,4 +163,44 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       assert(results == Seq((2, 0, 22), (2, 1, 40), (3, 1, 133)))
     }
   }
+
+  test("TrGT and TrGS accept sparse or dense lane populations by explicit mode") {
+    simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      val random = new scala.util.Random(0x117a)
+
+      for (mode <- Seq(TrapezoidDataflow.TrGt, TrapezoidDataflow.TrGs);
+           density <- Seq(0.25, 0.5, 1.0)) {
+        clearInputs(dut)
+        dut.io.command.payload.mode #= mode
+        for (index <- 0 until cfg.macLanes) {
+          dut.io.command.payload.gustavson.a(index).valid #= true
+          dut.io.command.payload.gustavson.a(index).row #= index
+          dut.io.command.payload.gustavson.a(index).k #= index
+          dut.io.command.payload.gustavson.a(index).value #= index + 1
+        }
+
+        val expected = scala.collection.mutable.Map.empty[(Int, Int), Int]
+        for (lane <- 0 until cfg.cacheLineWords) {
+          val valid = random.nextDouble() < density
+          val aIndex = lane % cfg.macLanes
+          val column = lane % 2
+          val value = lane + 2
+          dut.io.command.payload.gustavson.b(lane).valid #= valid
+          dut.io.command.payload.gustavson.b(lane).aIndex #= aIndex
+          dut.io.command.payload.gustavson.b(lane).k #= aIndex
+          dut.io.command.payload.gustavson.b(lane).column #= column
+          dut.io.command.payload.gustavson.b(lane).value #= value
+          if (valid) expected((aIndex, column)) = (aIndex + 1) * value
+        }
+
+        issue(dut)
+        val observed = (0 until dut.io.response.payload.count.toInt).map { index =>
+          val result = dut.io.response.payload.results(index)
+          (result.row.toInt, result.column.toInt) -> result.value.toInt
+        }.toMap
+        assert(observed == expected.toMap)
+      }
+    }
+  }
 }

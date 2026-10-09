@@ -62,5 +62,28 @@ object TrapezoidConfig {
 }
 
 object TrapezoidDataflow extends SpinalEnum {
+  // These are explicit execution policies, not operand-density classifications.
   val DenseIp, TrIp, TrGt, TrGs = newElement()
+}
+
+/** Storage bounds for the bitmask/IP tile scheduler.
+  *
+  * Dataflow selection remains a runtime input.  This configuration describes
+  * capacity only and never infers a mode from operand density.
+  */
+case class TrIpTileConfig(core: TrapezoidConfig, maxColumns: Int = 16) {
+  val maxRows: Int = core.peRows * core.maxFibers
+
+  require(maxColumns >= core.maxFibers)
+  require((maxColumns & (maxColumns - 1)) == 0,
+    "maxColumns must be a power of two for compact circular indexing")
+  require(core.macLanes >= core.fiberWidth,
+    "one A fiber and one B fiber must always fit without overflow")
+  require(core.localDepthPerBank * core.localBanks >= maxRows * maxColumns,
+    "local buffers must hold the complete ordered output tile")
+
+  val rowIndexWidth: Int = math.max(1, log2Up(maxRows))
+  val columnIndexWidth: Int = math.max(1, log2Up(maxColumns))
+  val rowCountWidth: Int = log2Up(maxRows + 1)
+  val columnCountWidth: Int = log2Up(maxColumns + 1)
 }

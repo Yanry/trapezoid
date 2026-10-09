@@ -91,3 +91,17 @@ case class LocalBufferBus(cfg: TrapezoidConfig) extends Bundle with IMasterSlave
     readResponses.foreach(slave(_))
   }
 }
+
+case class IndexedFiber(cfg: TrapezoidConfig, indexWidth: Int) extends Bundle {
+  val index = UInt(indexWidth bits)
+  val fiber = CompressedFiber(cfg)
+}
+
+case class TrIpTileStart(tileCfg: TrIpTileConfig) extends Bundle {
+  /** DenseIp and TrIp share the bitmask/IP tile scheduler.  The caller chooses
+    * the mode explicitly; operand density does not alter it.
+    */
+  val mode = TrapezoidDataflow()
+  val rowCount = UInt(tileCfg.rowCountWidth bits)
+  val columnCount = UInt(tileCfg.columnCountWidth bits)
+}

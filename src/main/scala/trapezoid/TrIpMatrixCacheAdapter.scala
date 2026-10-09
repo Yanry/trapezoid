@@ -274,6 +274,13 @@ class TrIpCachedMatrixController(
 ) extends Component {
   private val tileCfg = matrixCfg.tile
   private val cfg = tileCfg.core
+  private val fiberCacheCfg = FiberCacheConfig(cfg, cacheCfg)
+  private val maximumRegionLines = Seq(
+    BigInt(matrixCfg.maxMatrixRows) * matrixCfg.maxKTiles,
+    BigInt(matrixCfg.maxKTiles) * matrixCfg.maxMatrixColumns
+  ).max * fiberCacheCfg.linesPerFiber
+  private val addressCalcWidth = cacheCfg.addressWidth +
+    scala.math.max(1, log2Up(maximumRegionLines + 1)) + 1
 
   val io = new Bundle {
     val clear = in Bool()
@@ -286,6 +293,7 @@ class TrIpCachedMatrixController(
     val busy = out Bool()
     val done = out Bool()
     val descriptorError = out Bool()
+    val addressError = out Bool()
     val innerError = out Bool()
     val memoryError = out Bool()
     val acceptingFibers = out Bool()
@@ -304,14 +312,47 @@ class TrIpCachedMatrixController(
   val bBaseAddress = Reg(UInt(cacheCfg.addressWidth bits)) init 0
   val loadIssued = RegInit(False)
   val memoryError = RegInit(False)
+  val addressError = RegInit(False)
+  val addressDone = RegInit(False)
 
-  controller.io.descriptor.valid := io.descriptor.valid
+  val descriptorRows = io.descriptor.payload.matrix.rowCount.resize(addressCalcWidth)
+  val descriptorColumns =
+    io.descriptor.payload.matrix.columnCount.resize(addressCalcWidth)
+  val descriptorKTiles =
+    io.descriptor.payload.matrix.kTileCount.resize(addressCalcWidth)
+  val nonEmptyDescriptor = descriptorRows =/= 0 &&
+    descriptorColumns =/= 0 && descriptorKTiles =/= 0
+  val aLastOrdinal = UInt(addressCalcWidth bits)
+  val bLastOrdinal = UInt(addressCalcWidth bits)
+  aLastOrdinal := (((descriptorRows - U(1, addressCalcWidth bits)) *
+    U(matrixCfg.maxKTiles, addressCalcWidth bits)) +
+    descriptorKTiles - U(1, addressCalcWidth bits)).resized
+  bLastOrdinal := (((descriptorKTiles - U(1, addressCalcWidth bits)) *
+    U(matrixCfg.maxMatrixColumns, addressCalcWidth bits)) +
+    descriptorColumns - U(1, addressCalcWidth bits)).resized
+  val aLastAddress = UInt(addressCalcWidth bits)
+  val bLastAddress = UInt(addressCalcWidth bits)
+  aLastAddress := (io.descriptor.payload.aBaseAddress.resize(addressCalcWidth) +
+    aLastOrdinal * U(fiberCacheCfg.linesPerFiber, addressCalcWidth bits) +
+    U(fiberCacheCfg.linesPerFiber - 1, addressCalcWidth bits)).resized
+  bLastAddress := (io.descriptor.payload.bBaseAddress.resize(addressCalcWidth) +
+    bLastOrdinal * U(fiberCacheCfg.linesPerFiber, addressCalcWidth bits) +
+    U(fiberCacheCfg.linesPerFiber - 1, addressCalcWidth bits)).resized
+  val descriptorAddressError = nonEmptyDescriptor &&
+    (aLastAddress >= U(BigInt(1) << cacheCfg.addressWidth,
+      addressCalcWidth bits) ||
+      bLastAddress >= U(BigInt(1) << cacheCfg.addressWidth,
+        addressCalcWidth bits))
+
+  controller.io.descriptor.valid := io.descriptor.valid && !descriptorAddressError
   controller.io.descriptor.payload := io.descriptor.payload.matrix
   io.descriptor.ready := controller.io.descriptor.ready
   when(io.descriptor.fire) {
     aBaseAddress := io.descriptor.payload.aBaseAddress
     bBaseAddress := io.descriptor.payload.bBaseAddress
     memoryError := False
+    addressError := descriptorAddressError
+    addressDone := descriptorAddressError
   }
 
   when(!controller.io.acceptingFibers) { loadIssued := False }
@@ -352,8 +393,9 @@ class TrIpCachedMatrixController(
   io.bCacheResponse.ready := loader.io.bCacheResponse.ready
 
   io.busy := controller.io.busy
-  io.done := controller.io.done
-  io.descriptorError := controller.io.descriptorError
+  io.done := controller.io.done || addressDone
+  io.descriptorError := controller.io.descriptorError || addressError
+  io.addressError := addressError
   io.innerError := controller.io.innerError
   io.memoryError := memoryError || (loader.io.busy && loader.io.error)
   io.acceptingFibers := controller.io.acceptingFibers
@@ -365,7 +407,91 @@ class TrIpCachedMatrixController(
   when(io.clear) {
     loadIssued := False
     memoryError := False
+    addressError := False
+    addressDone := False
   }
+}
+
+/** Complete TrIP read path: matrix scheduler, fiber readers, and banked cache. */
+class TrIpCachedMatrixSystem(
+    matrixCfg: TrIpMatrixConfig,
+    cacheCfg: CacheConfig
+) extends Component {
+  private val cfg = matrixCfg.tile.core
+  require(cacheCfg.clientCount >= 2,
+    "cached matrix system requires separate A and B cache clients")
+
+  val io = new Bundle {
+    val clear = in Bool()
+    val descriptor = slave(Stream(CachedTrIpMatrixDescriptor(matrixCfg, cacheCfg)))
+    val refillRequest = master(Stream(CacheRefillRequest(cacheCfg)))
+    val refillResponse = slave(Stream(CacheRefillResponse(cacheCfg)))
+    val result = master(Stream(MatrixDescriptorResult(cfg)))
+    val busy = out Bool()
+    val done = out Bool()
+    val descriptorError = out Bool()
+    val addressError = out Bool()
+    val innerError = out Bool()
+    val memoryError = out Bool()
+    val completedOutputTiles = out UInt(32 bits)
+    val cacheBankBusy = out Bits(cacheCfg.bankCount bits)
+    val cacheClientOutstanding = out Bits(cacheCfg.clientCount bits)
+    val cacheHitCount = out UInt(32 bits)
+    val cacheMissCount = out UInt(32 bits)
+    val cacheRefillCount = out UInt(32 bits)
+  }
+
+  val matrix = new TrIpCachedMatrixController(matrixCfg, cacheCfg)
+  val cache = new BankedReadCache(cacheCfg)
+  matrix.io.clear := io.clear
+  cache.io.clear := io.clear
+
+  matrix.io.descriptor.valid := io.descriptor.valid
+  matrix.io.descriptor.payload := io.descriptor.payload
+  io.descriptor.ready := matrix.io.descriptor.ready
+  io.result.valid := matrix.io.result.valid
+  io.result.payload := matrix.io.result.payload
+  matrix.io.result.ready := io.result.ready
+
+  cache.io.requests(0).valid := matrix.io.aCacheRequest.valid
+  cache.io.requests(0).payload := matrix.io.aCacheRequest.payload
+  matrix.io.aCacheRequest.ready := cache.io.requests(0).ready
+  matrix.io.aCacheResponse.valid := cache.io.responses(0).valid
+  matrix.io.aCacheResponse.payload := cache.io.responses(0).payload
+  cache.io.responses(0).ready := matrix.io.aCacheResponse.ready
+
+  cache.io.requests(1).valid := matrix.io.bCacheRequest.valid
+  cache.io.requests(1).payload := matrix.io.bCacheRequest.payload
+  matrix.io.bCacheRequest.ready := cache.io.requests(1).ready
+  matrix.io.bCacheResponse.valid := cache.io.responses(1).valid
+  matrix.io.bCacheResponse.payload := cache.io.responses(1).payload
+  cache.io.responses(1).ready := matrix.io.bCacheResponse.ready
+
+  for (client <- 2 until cacheCfg.clientCount) {
+    cache.io.requests(client).valid := False
+    cache.io.requests(client).payload := CacheReadRequest(cacheCfg).getZero
+    cache.io.responses(client).ready := True
+  }
+
+  io.refillRequest.valid := cache.io.refillRequest.valid
+  io.refillRequest.payload := cache.io.refillRequest.payload
+  cache.io.refillRequest.ready := io.refillRequest.ready
+  cache.io.refillResponse.valid := io.refillResponse.valid
+  cache.io.refillResponse.payload := io.refillResponse.payload
+  io.refillResponse.ready := cache.io.refillResponse.ready
+
+  io.busy := matrix.io.busy
+  io.done := matrix.io.done
+  io.descriptorError := matrix.io.descriptorError
+  io.addressError := matrix.io.addressError
+  io.innerError := matrix.io.innerError
+  io.memoryError := matrix.io.memoryError
+  io.completedOutputTiles := matrix.io.completedOutputTiles
+  io.cacheBankBusy := cache.io.bankBusy
+  io.cacheClientOutstanding := cache.io.clientOutstanding
+  io.cacheHitCount := cache.io.hitCount
+  io.cacheMissCount := cache.io.missCount
+  io.cacheRefillCount := cache.io.refillCount
 }
 
 object GenerateTrIpCachedMatrixController extends App {
@@ -375,10 +501,25 @@ object GenerateTrIpCachedMatrixController extends App {
     maxMatrixColumns = 64, maxKTiles = 16)
   private val cacheCfg = CacheConfig(
     wordWidth = 32, wordsPerLine = 16, addressWidth = 24,
-    bankCount = 32, setsPerBank = 64, clientCount = 32)
+    bankCount = 32, setsPerBank = 64, clientCount = 2)
   SpinalConfig(
     mode = Verilog,
     targetDirectory = "generated-cached-matrix",
     oneFilePerComponent = true
   ).generate(new TrIpCachedMatrixController(matrixCfg, cacheCfg))
+}
+
+object GenerateTrIpCachedMatrixSystem extends App {
+  private val coreCfg = TrapezoidConfig.small
+  private val matrixCfg = TrIpMatrixConfig(
+    TrIpTileConfig(coreCfg), maxMatrixRows = 64,
+    maxMatrixColumns = 64, maxKTiles = 16)
+  private val cacheCfg = CacheConfig(
+    wordWidth = 32, wordsPerLine = 16, addressWidth = 24,
+    bankCount = 32, setsPerBank = 64, clientCount = 2)
+  SpinalConfig(
+    mode = Verilog,
+    targetDirectory = "generated-cached-system",
+    oneFilePerComponent = true
+  ).generate(new TrIpCachedMatrixSystem(matrixCfg, cacheCfg))
 }

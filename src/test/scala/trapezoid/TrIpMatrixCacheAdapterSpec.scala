@@ -256,4 +256,41 @@ class TrIpMatrixCacheAdapterSpec extends AnyFunSuite {
       assert(dut.io.completedOutputTiles.toLong == 1)
     }
   }
+
+  test("cached matrix controller rejects a fiber region that crosses the address space") {
+    val tileCfg = TrIpTileConfig(cfg, maxColumns = 2)
+    val matrixCfg = TrIpMatrixConfig(tileCfg,
+      maxMatrixRows = 2, maxMatrixColumns = 2, maxKTiles = 1)
+    simConfig.compile(new TrIpCachedMatrixController(matrixCfg, cacheCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.descriptor.valid #= false
+      dut.io.aCacheRequest.ready #= true
+      dut.io.bCacheRequest.ready #= true
+      dut.io.aCacheResponse.valid #= false
+      dut.io.bCacheResponse.valid #= false
+      dut.io.result.ready #= true
+
+      dut.io.descriptor.payload.matrix.rowCount #= 2
+      dut.io.descriptor.payload.matrix.columnCount #= 2
+      dut.io.descriptor.payload.matrix.kTileCount #= 1
+      dut.io.descriptor.payload.matrix.modes(0) #= TrapezoidDataflow.TrIp
+      dut.io.descriptor.payload.aBaseAddress #= 254
+      dut.io.descriptor.payload.bBaseAddress #= 16
+      dut.io.descriptor.valid #= true
+      sleep(1)
+      assert(dut.io.descriptor.ready.toBoolean)
+      dut.clockDomain.waitSampling()
+      dut.io.descriptor.valid #= false
+      sleep(1)
+
+      assert(dut.io.done.toBoolean)
+      assert(dut.io.descriptorError.toBoolean)
+      assert(dut.io.addressError.toBoolean)
+      assert(!dut.io.busy.toBoolean)
+      assert(!dut.io.aCacheRequest.valid.toBoolean)
+      assert(!dut.io.bCacheRequest.valid.toBoolean)
+      assert(dut.io.completedOutputTiles.toLong == 0)
+    }
+  }
 }

@@ -137,6 +137,20 @@ case class CacheConfig(
   require(tagWidth >= 1, "cache addressWidth must leave at least one tag bit")
 }
 
+/** Fixed-width representation used to move one bitmask fiber through cache.
+  * A record may span several cache lines; lines are ordered least-significant
+  * first so the format is independent of the external memory word width.
+  */
+case class FiberCacheConfig(core: TrapezoidConfig, cache: CacheConfig) {
+  val recordWidth: Int = 1 + core.fiberWidth +
+    core.fiberWidth * core.dataWidth + core.coordinateWidth
+  val linesPerFiber: Int = (recordWidth + cache.lineWidth - 1) / cache.lineWidth
+  val lineIndexWidth: Int = math.max(1, log2Up(linesPerFiber))
+
+  require(linesPerFiber <= (BigInt(1) << cache.requestIdWidth),
+    "cache requestIdWidth must identify every line in a fiber record")
+}
+
 /** Capacity of the coordinate accumulator shared by TrGT and TrGS.
   * Mode remains a runtime policy and is never inferred from lane density.
   */

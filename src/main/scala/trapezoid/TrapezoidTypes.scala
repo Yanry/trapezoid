@@ -149,6 +149,45 @@ case class CacheRefillResponse(cacheCfg: CacheConfig) extends Bundle {
   val error = Bool()
 }
 
+case class FiberCacheReadCommand(
+    fiberCacheCfg: FiberCacheConfig,
+    indexWidth: Int
+) extends Bundle {
+  val address = UInt(fiberCacheCfg.cache.addressWidth bits)
+  val index = UInt(indexWidth bits)
+}
+
+case class FiberCacheReadResult(
+    fiberCacheCfg: FiberCacheConfig,
+    indexWidth: Int
+) extends Bundle {
+  val index = UInt(indexWidth bits)
+  val fiber = CompressedFiber(fiberCacheCfg.core)
+  val error = Bool()
+}
+
+case class TrIpMatrixFiberLoad(
+    matrixCfg: TrIpMatrixConfig,
+    cacheCfg: CacheConfig
+) extends Bundle {
+  val aBaseAddress = UInt(cacheCfg.addressWidth bits)
+  val bBaseAddress = UInt(cacheCfg.addressWidth bits)
+  val rowBase = UInt(matrixCfg.rowCountWidth bits)
+  val columnBase = UInt(matrixCfg.columnCountWidth bits)
+  val kTileIndex = UInt(matrixCfg.kTileIndexWidth bits)
+  val rowCount = UInt(matrixCfg.tile.rowCountWidth bits)
+  val columnCount = UInt(matrixCfg.tile.columnCountWidth bits)
+}
+
+case class CachedTrIpMatrixDescriptor(
+    matrixCfg: TrIpMatrixConfig,
+    cacheCfg: CacheConfig
+) extends Bundle {
+  val matrix = TrIpMatrixDescriptor(matrixCfg)
+  val aBaseAddress = UInt(cacheCfg.addressWidth bits)
+  val bBaseAddress = UInt(cacheCfg.addressWidth bits)
+}
+
 case class IndexedGustavsonA(cfg: TrapezoidConfig) extends Bundle {
   val index = UInt(cfg.aRegisterIndexWidth bits)
   val element = GustavsonA(cfg)

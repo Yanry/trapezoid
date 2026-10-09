@@ -144,6 +144,14 @@ sbt -batch 'runMain trapezoid.GenerateTrIpMatrixController'
 
 输出位于 `generated-matrix/`。
 
+生成自动从 cache 读取 A/B fiber 的矩阵控制器：
+
+```bash
+sbt -batch 'runMain trapezoid.GenerateTrIpCachedMatrixController'
+```
+
+输出位于 `generated-cached-matrix/`。
+
 生成阶段四的多 bank 读 cache：
 
 ```bash
@@ -261,11 +269,25 @@ TrGT 前端暴露 accepted/issued B-element 计数，便于检查 FIFO 停顿和
 
 该 cache 不检查计算 mode 或 operand density，四种 mode 后续可以通过相同的 read request/refill 协议取数。当前版本刻意只实现读路径；cache 写入、dirty bit、eviction writeback、多个 miss/bank 的 MSHR、跨 cluster 互连和 DMA 尚未实现。
 
+### 2.14 TrIP 矩阵 fiber-cache adapter
+
+`FiberCacheReader`、`TrIpMatrixFiberLoader` 和 `TrIpCachedMatrixController` 已经把阶段二矩阵循环连接到阶段四 cache 读协议：
+
+- 一个 fiber 可以跨越任意数量的 cache line，不要求 line 宽度大于完整 fiber；
+- 固定记录从低位到高位依次保存 `valid`、mask、固定数量的有符号 value slot 和 tag；
+- cache line 按低有效位优先的顺序读取，并通过 request ID 检查响应属于当前 line；
+- A 使用 `(globalRow * maxKTiles + kTileIndex)` 布局，B 使用转置的 `(kTileIndex * maxMatrixColumns + globalColumn)` 布局；
+- A/B reader 可以并行产生两个独立 cache client 请求，并分别对矩阵控制器的 `aLoad`/`bLoad` 施加背压；
+- cache error 会把对应 fiber 标记为 invalid，并在矩阵顶层锁存 `memoryError`，不会把错误数据静默当作有效 fiber；
+- cached descriptor 仍保留每个 K tile 的显式 mode，adapter 不读取 density，也不会改变 mode。
+
+当前 adapter 使用固定跨度的 bitmask fiber 区，尚未解析内存中的可变长 CSR/CSC pointer/index 数组；配置会检查零基址下的最大 A/B 区域容量，非零 A/B 基地址和整个固定布局仍必须由软件保证落在 cache line 地址空间内。顶层暴露两个 cache client 端口，但尚未把它们和 `BankedReadCache`、refill/DMA 封装为单一系统顶层。
+
 ## 3. 当前达到的效果
 
 ### 3.1 功能验证
 
-当前共有 25 项自动测试，执行方式为：
+当前共有 27 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -300,9 +322,11 @@ sbt -batch test
 - 矩阵描述符内逐 K tile 显式切换 `DenseIp`/`TrIp`、随机输出背压、tile/matrix 边界和参考模型比对；
 - 非法矩阵描述符和不兼容 mode 的显式拒绝；
 - 多 bank cache 的独立并行接收、同 bank 冲突背压、request ID 响应路由和跨 bank 乱序 refill；
-- cache miss/refill、重复读取 hit、地址冲突替换、refill error 不安装以及 clear 全局失效。
+- cache miss/refill、重复读取 hit、地址冲突替换、refill error 不安装以及 clear 全局失效；
+- 跨多个 cache line 的 fiber 重组、输出背压、有符号 value 解码和 cache error 传播；
+- cached matrix descriptor 的 A/B 地址生成，以及稀疏输入下显式 `DenseIp` 的端到端矩阵结果。
 
-当前测试结果为 25 项全部通过。
+当前测试结果为 27 项全部通过。
 
 ### 3.2 RTL 检查
 
@@ -312,6 +336,7 @@ sbt -batch test
 verilator --lint-only --Wall -Wno-fatal generated/*.v
 verilator --lint-only --Wall -Wno-fatal generated-tile/*.v
 verilator --lint-only --Wall -Wno-fatal generated-matrix/*.v
+verilator --lint-only --Wall -Wno-fatal generated-cached-matrix/*.v
 verilator --lint-only --Wall -Wno-fatal generated-cache/*.v
 verilator --lint-only --Wall -Wno-fatal generated-gustavson/*.v
 verilator --lint-only --Wall -Wno-fatal generated-trgt/*.v
@@ -330,6 +355,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 - 进行小规模稀疏矩阵输入的 RTL 仿真；
 - 直接输入一个 bitmask/IP tile 并得到有序矩阵结果；
 - 在配置容量内通过一个描述符自动遍历多个 M/N/K tile；
+- 从固定跨度的 cache fiber 区自动装载 TrIP/DenseIp 矩阵 tile；
 - 验证多 client、多 bank 的 cache 请求、冲突背压和 refill 行为；
 - 跨多个 K tile 累加 IP 结果，以及跨多个命令累加 Gustavson 结果；
 - 验证 TrGT 四路时间 gather 和 TrGS cache-line 空间分发；
@@ -342,9 +368,9 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 ### 4.1 调度器覆盖范围
 
-`TrIpTileController` 已完成 bitmask/IP tile 和跨 K 累加，`TrIpMatrixController` 已完成描述符驱动的 M/N/K 外层循环，但尚未实现：
+`TrIpTileController` 已完成 bitmask/IP tile 和跨 K 累加，`TrIpMatrixController` 已完成描述符驱动的 M/N/K 外层循环，cached wrapper 也能从固定跨度的 bitmask fiber 区自动取数，但尚未实现：
 
-- 从内存中的 CSR/CSC 指针自动生成 fiber、cache 和 DMA 请求；
+- 从内存中的可变长 CSR/CSC 指针和 index 数组自动生成 fiber；
 - 从矩阵描述符生成 Gustavson tile，并进行代价感知的多 PE row 负载均衡；
 - 面向软件的寄存器组、描述符队列或指令译码器。
 
@@ -352,7 +378,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 ### 4.2 缺少全局 cache 和 DMA
 
-当前已实现一个参数化 multi-client、multi-bank direct-mapped 读 cache，以及每 bank 一个独立 miss 的共享 refill 协议。尚未实现论文中的 4 个 cache cluster、完整 32 x 32 cluster 互连、写 cache/dirty eviction、HBM 请求和 DMA。通用顶层的每 PE row 本地 buffer 仍由外部端口控制；TrIP tile controller 使用独立的四 bank 结果 buffer 完成自动 scatter 和有序读回。后续需要把矩阵/Gustavson 前端接入 cache 协议，并把结果写回映射到统一存储层次。
+当前已实现一个参数化 multi-client、multi-bank direct-mapped 读 cache，以及每 bank 一个独立 miss 的共享 refill 协议。TrIP 矩阵前端已经能产生两个 cache client 请求，但尚未与 cache/refill 封装成完整系统，也未实现论文中的 4 个 cache cluster、完整 32 x 32 cluster 互连、写 cache/dirty eviction、HBM 请求和 DMA。通用顶层的每 PE row 本地 buffer 仍由外部端口控制；TrIP tile controller 使用独立的四 bank 结果 buffer 完成自动 scatter 和有序读回。后续需要接入 Gustavson 前端，并把结果写回映射到统一存储层次。
 
 ### 4.3 Gustavson 存储和并行调度仍待完成
 
@@ -409,7 +435,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 当前已经达到 tile controller 验收标准：测试平台只需逐个装载 K tile 并发送 `start`，控制器会自动完成列规划、必要的 A-group 拆分、PE 命令生成、跨 K 累加和最终有序读回。
 
-矩阵控制器进一步接收一次全局描述符并自动推进 M/N/K tile，软件不再逐 tile 发送 `start`。阶段二剩余工作是把当前流式 fiber 装载口连接到 CSR/CSC 描述符读取、cache 请求和 DMA，使软件不再逐 fiber 提供数据。
+矩阵控制器进一步接收一次全局描述符并自动推进 M/N/K tile，软件不再逐 tile 发送 `start`。cached wrapper 已把当前流式 fiber 装载口连接到固定跨度的 cache fiber 记录，使软件不再逐 fiber 握手。阶段二剩余工作是解析可变长 CSR/CSC 描述符并连接 DMA，同时增加基地址范围检查。
 
 ### 阶段 3：完成 TrGT/TrGS 执行引擎（功能前端与多 PE row 阵列已完成）
 
@@ -435,7 +461,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 验收标准：四种数据流都只通过统一存储接口访问矩阵数据，并能在 bank 冲突和 cache miss 下正确停顿。
 
-当前完成了第 1、2 项的读路径、第 3 项的通用多 client bank 仲裁，以及第 5 项的单 miss/bank refill 功能版本。下一步是把矩阵和 Gustavson 前端接入该协议，再增加 cluster 组织、写回/MSHR 和 DMA。
+当前完成了第 1、2 项的读路径、第 3 项的通用多 client bank 仲裁、第 5 项的单 miss/bank refill 功能版本，并已将 TrIP 矩阵前端接入统一读协议。下一步是连接 Gustavson 前端和实际 cache 实例，再增加 cluster 组织、写回/MSHR 和 DMA。
 
 ### 阶段 5：替换为目标算术单元
 
@@ -460,6 +486,6 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 ## 6. 建议的近期任务
 
-下一轮建议为矩阵控制器增加 fiber-cache adapter，把当前 `rowBase/columnBase/kTileIndex` 请求转换成 cache line 读取；随后增加写 cache、dirty eviction、MSHR 和简单 DMA。并行工作是把 TrGT typed FIFO 与 TrIP 结果 buffer 统一到可按 mode 切换的物理 `BankedLocalBuffer`，并为 cache/Gustavson 仲裁器增加 round-robin 公平策略。
+下一轮建议把 cached matrix 顶层的两个 client 接到实际 `BankedReadCache`，补充地址越界检查和 refill 集成测试；随后为 Gustavson 增加 B-row cache adapter，并实现简单 DMA。并行工作是把 TrGT typed FIFO 与 TrIP 结果 buffer 统一到可按 mode 切换的物理 `BankedLocalBuffer`，并为 cache/Gustavson 仲裁器增加 round-robin 公平策略。
 
 所有后续控制器都应继续遵守本文的 mode 与稀疏度原则：density 可以参与性能推荐，但硬件接口必须允许调用方在任意 sparsity level 下显式选择任何 mode。

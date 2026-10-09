@@ -111,6 +111,19 @@ case class TrIpTileStart(tileCfg: TrIpTileConfig) extends Bundle {
   val lastKTile = Bool()
 }
 
+case class TrIpMatrixDescriptor(matrixCfg: TrIpMatrixConfig) extends Bundle {
+  /** Mode is selected explicitly for each K tile and reused across all M/N tiles. */
+  val modes = Vec(TrapezoidDataflow(), matrixCfg.maxKTiles)
+  val rowCount = UInt(matrixCfg.rowCountWidth bits)
+  val columnCount = UInt(matrixCfg.columnCountWidth bits)
+  val kTileCount = UInt(matrixCfg.kTileCountWidth bits)
+}
+
+case class MatrixDescriptorResult(cfg: TrapezoidConfig) extends Bundle {
+  val element = MatrixResult(cfg)
+  val endOfMatrix = Bool()
+}
+
 case class IndexedGustavsonA(cfg: TrapezoidConfig) extends Bundle {
   val index = UInt(cfg.aRegisterIndexWidth bits)
   val element = GustavsonA(cfg)

@@ -136,6 +136,14 @@ sbt -batch 'runMain trapezoid.GenerateTrIpTileController'
 
 输出位于 `generated-tile/`。
 
+生成带外层 M/N/K 循环的矩阵描述符控制器：
+
+```bash
+sbt -batch 'runMain trapezoid.GenerateTrIpMatrixController'
+```
+
+输出位于 `generated-matrix/`。
+
 生成阶段三 Gustavson 跨命令累加引擎：
 
 ```bash
@@ -214,11 +222,25 @@ TrGT 前端暴露 accepted/issued B-element 计数，便于检查 FIFO 停顿和
 
 这些模块已经实现论文数据移动方式的功能等价路径。TrGT FIFO 已使用四个同步 memory bank，但由于 B 元素包含 `aIndex/k/column/value`，其 typed word 宽度不同于当前结果 buffer；两种用途尚未统一成同一个可切换的 `BankedLocalBuffer` 实例。TrGS 当前通过带坐标的组合适配完成分发，尚未实现流水化物理分发网络。
 
+### 2.12 矩阵描述符与外层 M/N/K 循环
+
+`TrIpMatrixController` 在 tile controller 外增加了完整的外层循环边界：
+
+1. 接收全局 row/column 数量、K tile 数量以及每个 K tile 的显式 mode；
+2. 自动维护 `rowBase`、`columnBase` 和 `kTileIndex`，循环顺序为 K、N、M；
+3. 计算边界 tile 的实际 row/column 数量；
+4. 通过 `acceptingFibers` 和当前基址请求上游装载对应的 A row/B column fiber，fiber tag 使用全局 row/column 坐标；
+5. 自动生成 `firstKTile/lastKTile` 并启动内部 `TrIpTileController`；
+6. 保留每个输出 tile 的 `endOfTile`，并在整个描述符最后一个结果上额外产生 `endOfMatrix`；
+7. 统计完成的输出 tile，拒绝越界、空维度、零 K tile 以及与 IP 输入格式不兼容的 mode。
+
+描述符中的 mode 数组由软件逐 K tile 指定，可以在同一矩阵中切换 `DenseIp`/`TrIp`，且不检查 density。当前接口已经自动推进外层循环，但 fiber 数据仍由上游按当前基址流式提供；CSR/CSC 指针读取、cache 请求和 DMA 尚属于后续存储系统工作。
+
 ## 3. 当前达到的效果
 
 ### 3.1 功能验证
 
-当前共有 19 项自动测试，执行方式为：
+当前共有 22 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -248,9 +270,12 @@ sbt -batch test
 - TrGS 对全满或稀疏 cache line 的 A 广播、B 列分发和跨命令累加；
 - TrGT SRAM FIFO 的满队列背压、输出停顿、顺序保持和指针环回；
 - 多 PE row Gustavson 阵列和共享 row scheduler 的结构 elaboration；
-- 共享调度器的 tile-row 固定、双 row 重叠执行、结果仲裁、完成释放，以及同一 tile 内显式切换 `TrGt`/`TrGs`。
+- 共享调度器的 tile-row 固定、双 row 重叠执行、结果仲裁、完成释放，以及同一 tile 内显式切换 `TrGt`/`TrGs`；
+- 6 x 8 与 8 x 6 矩阵的 2 x 2 个 M/N tile、2 个 K tile 自动遍历；
+- 矩阵描述符内逐 K tile 显式切换 `DenseIp`/`TrIp`、随机输出背压、tile/matrix 边界和参考模型比对；
+- 非法矩阵描述符和不兼容 mode 的显式拒绝。
 
-当前测试结果为 19 项全部通过。
+当前测试结果为 22 项全部通过。
 
 ### 3.2 RTL 检查
 
@@ -259,6 +284,7 @@ sbt -batch test
 ```bash
 verilator --lint-only --Wall -Wno-fatal generated/*.v
 verilator --lint-only --Wall -Wno-fatal generated-tile/*.v
+verilator --lint-only --Wall -Wno-fatal generated-matrix/*.v
 verilator --lint-only --Wall -Wno-fatal generated-gustavson/*.v
 verilator --lint-only --Wall -Wno-fatal generated-trgt/*.v
 verilator --lint-only --Wall -Wno-fatal generated-trgs/*.v
@@ -275,6 +301,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 - 验证论文四种数据流的 PE row 级计算和路由思路；
 - 进行小规模稀疏矩阵输入的 RTL 仿真；
 - 直接输入一个 bitmask/IP tile 并得到有序矩阵结果；
+- 在配置容量内通过一个描述符自动遍历多个 M/N/K tile；
 - 跨多个 K tile 累加 IP 结果，以及跨多个命令累加 Gustavson 结果；
 - 验证 TrGT 四路时间 gather 和 TrGS cache-line 空间分发；
 - 研究 MFIU、动态列打包和 merge/reduction 行为；
@@ -286,10 +313,9 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 ### 4.1 调度器覆盖范围
 
-`TrIpTileController` 已完成 bitmask/IP tile 和跨 K 累加，但尚未实现：
+`TrIpTileController` 已完成 bitmask/IP tile 和跨 K 累加，`TrIpMatrixController` 已完成描述符驱动的 M/N/K 外层循环，但尚未实现：
 
-- 跨多个 M/N tile 的外层全矩阵循环；
-- 从 CSR/CSC 描述符自动生成 fiber 装载请求；
+- 从内存中的 CSR/CSC 指针自动生成 fiber、cache 和 DMA 请求；
 - 从矩阵描述符生成 Gustavson tile，并进行代价感知的多 PE row 负载均衡；
 - 面向软件的寄存器组、描述符队列或指令译码器。
 
@@ -342,7 +368,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 已完成参考模型、格式转换、随机 density 覆盖、四 mode 语义测试、负数/空输入以及 Stream 背压测试。当前验收测试全部通过。
 
-### 阶段 2：完成 TrIP 调度器（tile 与跨 K 累加已完成）
+### 阶段 2：完成 TrIP 调度器（tile、跨 K 累加与外层 M/N/K 循环已完成）
 
 1. 增加 tile 配置和 A fiber 装载状态；
 2. 汇总所有 PE row 的动态列容量；
@@ -352,9 +378,9 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 6. 从本地 buffer 有序读取并写回输出 tile；
 7. 通过同步读改写跨多个 K tile 累加同一个 C tile。
 
-当前已经达到该验收标准：测试平台只需逐个装载 K tile 并发送 `start`，控制器会自动完成列规划、必要的 A-group 拆分、PE 命令生成、跨 K 累加和最终有序读回。
+当前已经达到 tile controller 验收标准：测试平台只需逐个装载 K tile 并发送 `start`，控制器会自动完成列规划、必要的 A-group 拆分、PE 命令生成、跨 K 累加和最终有序读回。
 
-阶段二剩余工作是增加外层 M/N tile 循环以及矩阵描述符接口，使任意尺寸矩阵不需要软件逐 tile 驱动。
+矩阵控制器进一步接收一次全局描述符并自动推进 M/N/K tile，软件不再逐 tile 发送 `start`。阶段二剩余工作是把当前流式 fiber 装载口连接到 CSR/CSC 描述符读取、cache 请求和 DMA，使软件不再逐 fiber 提供数据。
 
 ### 阶段 3：完成 TrGT/TrGS 执行引擎（功能前端与多 PE row 阵列已完成）
 
@@ -403,6 +429,6 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 ## 6. 建议的近期任务
 
-下一轮建议优先补齐阶段二的外层 M/N tile 循环和矩阵描述符接口，同时把 TrGT typed FIFO 与 TrIP 结果 buffer 统一到可按 mode 切换的物理 `BankedLocalBuffer`。随后为 Gustavson scheduler 增加代价感知的公平分配，并进入阶段四，实现统一 cache request/refill 接口，让 TrGT 和 TrGS 不再依赖测试平台直接推送 B 元素。
+下一轮建议进入阶段四，定义统一 cache request/refill 接口，把矩阵控制器的流式 fiber 请求连接到 CSR/CSC 描述符读取与 DMA；同时把 TrGT typed FIFO 与 TrIP 结果 buffer 统一到可按 mode 切换的物理 `BankedLocalBuffer`。随后为 Gustavson scheduler 增加代价感知的公平分配。
 
 所有后续控制器都应继续遵守本文的 mode 与稀疏度原则：density 可以参与性能推荐，但硬件接口必须允许调用方在任意 sparsity level 下显式选择任何 mode。

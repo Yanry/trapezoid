@@ -88,6 +88,27 @@ case class TrIpTileConfig(core: TrapezoidConfig, maxColumns: Int = 16) {
   val columnCountWidth: Int = log2Up(maxColumns + 1)
 }
 
+/** Bounds for the descriptor-driven outer M/N/K tile loops. */
+case class TrIpMatrixConfig(
+    tile: TrIpTileConfig,
+    maxMatrixRows: Int,
+    maxMatrixColumns: Int,
+    maxKTiles: Int
+) {
+  require(maxMatrixRows >= tile.maxRows)
+  require(maxMatrixColumns >= tile.maxColumns)
+  require(maxKTiles >= 1)
+  require(BigInt(maxMatrixRows) <= (BigInt(1) << tile.core.coordinateWidth),
+    "matrix row coordinates must fit coordinateWidth")
+  require(BigInt(maxMatrixColumns) <= (BigInt(1) << tile.core.coordinateWidth),
+    "matrix column coordinates must fit coordinateWidth")
+
+  val rowCountWidth: Int = log2Up(maxMatrixRows + 1)
+  val columnCountWidth: Int = log2Up(maxMatrixColumns + 1)
+  val kTileCountWidth: Int = log2Up(maxKTiles + 1)
+  val kTileIndexWidth: Int = math.max(1, log2Up(maxKTiles))
+}
+
 /** Capacity of the coordinate accumulator shared by TrGT and TrGS.
   * Mode remains a runtime policy and is never inferred from lane density.
   */

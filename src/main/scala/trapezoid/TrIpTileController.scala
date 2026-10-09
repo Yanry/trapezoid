@@ -189,7 +189,7 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
         state === TrIpTileState.AbortDrain
   }
 
-  val currentResponse = responseRegs(scatterPe)
+  val currentResponse = if (cfg.peRows == 1) responseRegs(0) else responseRegs(scatterPe)
   val currentResult = currentResponse.results(scatterLane)
 
   val rowFound = Bool()

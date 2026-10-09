@@ -40,4 +40,10 @@ class TrapezoidStructureSpec extends AnyFunSuite {
     elaborate(new GustavsonRowScheduler(GustavsonTileConfig(
       cfg.copy(peRows = 2), accumulatorEntries = 4)))
   }
+
+  test("descriptor-driven TrIP matrix controller elaborates") {
+    val tileCfg = TrIpTileConfig(cfg, maxColumns = 4)
+    elaborate(new TrIpMatrixController(TrIpMatrixConfig(
+      tileCfg, maxMatrixRows = 8, maxMatrixColumns = 8, maxKTiles = 1)))
+  }
 }

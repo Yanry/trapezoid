@@ -104,4 +104,9 @@ case class TrIpTileStart(tileCfg: TrIpTileConfig) extends Bundle {
   val mode = TrapezoidDataflow()
   val rowCount = UInt(tileCfg.rowCountWidth bits)
   val columnCount = UInt(tileCfg.columnCountWidth bits)
+  /** firstKTile resets C; lastKTile emits C.  Intermediate tiles only add
+    * their partial sums, allowing K to exceed one fiber.
+    */
+  val firstKTile = Bool()
+  val lastKTile = Bool()
 }

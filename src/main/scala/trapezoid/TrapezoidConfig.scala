@@ -87,3 +87,19 @@ case class TrIpTileConfig(core: TrapezoidConfig, maxColumns: Int = 16) {
   val rowCountWidth: Int = log2Up(maxRows + 1)
   val columnCountWidth: Int = log2Up(maxColumns + 1)
 }
+
+/** Capacity of the coordinate accumulator shared by TrGT and TrGS.
+  * Mode remains a runtime policy and is never inferred from lane density.
+  */
+case class GustavsonTileConfig(core: TrapezoidConfig, accumulatorEntries: Int) {
+  require(accumulatorEntries >= core.outputLanes,
+    "the accumulator must hold at least one complete PE response")
+
+  val entryIndexWidth: Int = math.max(1, log2Up(accumulatorEntries))
+  val entryCountWidth: Int = log2Up(accumulatorEntries + 1)
+}
+
+object GustavsonTileConfig {
+  def apply(core: TrapezoidConfig): GustavsonTileConfig =
+    new GustavsonTileConfig(core, core.outputLanes)
+}

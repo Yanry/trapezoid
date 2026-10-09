@@ -16,7 +16,7 @@
 - `TrGt` 和 `TrGs` 都可以接收任意数量的有效 Gustavson lane；
 - 后续调度器可以把 density 作为性能选择依据，但不能改变各 mode 的功能可用性。
 
-新增的 `TrIpTileController` 服务于 bitmask/IP 输入格式，因此支持 `DenseIp` 和 `TrIp`。`TrGt` 和 `TrGs` 继续通过通用 PE row 命令接口使用，后续实现其 tile 调度器时也必须保持与 density 解耦。
+`TrIpTileController` 服务于 bitmask/IP 输入格式，因此支持 `DenseIp` 和 `TrIp`；`GustavsonTileEngine` 同时支持 `TrGt` 和 `TrGs`。两个控制器都只检查输入格式是否匹配，不检查或推断 density。同一个多 K/多命令序列也允许调用方逐次显式选择兼容的 mode。
 
 ## 2. 当前已经完成的内容
 
@@ -136,6 +136,14 @@ sbt -batch 'runMain trapezoid.GenerateTrIpTileController'
 
 输出位于 `generated-tile/`。
 
+生成阶段三 Gustavson 跨命令累加引擎：
+
+```bash
+sbt -batch 'runMain trapezoid.GenerateGustavsonTileEngine'
+```
+
+输出位于 `generated-gustavson/`。
+
 ### 2.8 矩阵级参考模型
 
 `trapezoid.model.MatrixReference` 提供纯 Scala 正确性基线，包括：
@@ -157,20 +165,35 @@ sbt -batch 'runMain trapezoid.GenerateTrIpTileController'
 4. 当一个 B column 仍可能溢出时，自动缩小 A fiber group 并重放同一 B 前缀；
 5. 原子地向所有 PE row 分发命令，避免部分 PE 提前接受批次；
 6. 收集所有 PE 响应，并逐项 scatter 到控制器内的四 bank 结果 buffer；
-7. 按 A/B 的载入索引以 row-major 顺序读回非零交叉结果；
-8. 支持输出背压、稳定的 `endOfTile` 和保持型 `done`；
-9. `clear` 在空闲时清除装载状态，在 busy 时执行同步 abort；若命令已经送入 PE，会先排空未决响应再回到空闲，避免污染下一次 tile；
-10. 拒绝不属于 IP 路径的 mode 或超出 tile 容量的 row/column 数，并通过 `unsupportedMode` 报告配置错误；
-11. 暴露当前 A offset、group size、B base 和规划列数，便于调试和性能计数。
+7. 使用 `firstKTile/lastKTile` 描述 K 序列，在四 bank buffer 中同步读改写并跨 K tile 累加；
+8. 中间 K tile 只完成累加，最后一个 K tile 才按 row-major 顺序读回结果；
+9. 支持输出背压、稳定的 `endOfTile`、保持型 `done` 和 `awaitingKTile` 状态；
+10. `clear` 在空闲时清除装载状态，在 busy 时执行同步 abort；若命令已经送入 PE，会先排空未决响应再回到空闲，避免污染下一次 tile；
+11. 拒绝不属于 IP 路径的 mode、超出容量的维度以及不一致的 K 序列，并通过 `unsupportedMode` 报告配置错误；
+12. 暴露当前 A offset、group size、B base 和规划列数，便于调试和性能计数。
 
-本控制器处理一个 K 范围不超过 `fiberWidth` 的 tile。更大的 K 仍需要上层 K-tile 累加器。
-同一 tile 内有效 A row tag 和 B column tag 必须分别唯一，控制器使用 tag 将 PE 结果映射回载入槽位。
+单个 K tile 的范围不超过 `fiberWidth`，但一个序列可以包含任意数量的 K tile。序列内 row/column 数量和 tag 布局必须保持一致；每次 K tile 可以独立选择 `DenseIp` 或 `TrIp`，不受 density 限制。
+
+### 2.10 Gustavson tile 执行引擎
+
+`GustavsonTileEngine` 在 `TrapezoidPERow` 外增加了跨命令执行闭环：
+
+1. 接收任意数量的 `TrGt`/`TrGs` 命令，并允许同一 tile 内显式切换 mode；
+2. 复用 PE row 完成单条 cache-line 命令内的乘法与坐标归约；
+3. 使用参数化坐标 accumulator 合并跨周期、跨命令的同坐标部分和；
+4. `endOfTile` 命令完成后按 `(row,column)` 递增顺序输出；
+5. 输出支持 Stream 背压，最后一个结果带 `endOfTile`；
+6. accumulator 容量不足时设置保持型 `overflow`，不会静默覆盖已有坐标；
+7. 不属于 Gustavson 路径的 mode 通过 `unsupportedMode` 拒绝；
+8. busy 状态下 `clear` 会排空已进入 PE 的响应后安全中止。
+
+当前 accumulator 是寄存器式坐标 CAM 和确定性最小坐标选择网络，适合功能验证和小规模配置。后续需要映射为论文风格的 subrow、FIFO、本地 buffer 和可流水化 merge tree。
 
 ## 3. 当前达到的效果
 
 ### 3.1 功能验证
 
-当前共有 9 项自动测试，执行方式为：
+当前共有 13 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -191,9 +214,13 @@ sbt -batch test
 - `TrGt` 和 `TrGs` 在不同有效 lane density 下显式运行；
 - 完整 tile 的加载、全局列规划、A-group 拆分、scatter 和 row-major 读回；
 - 非满 tile、全零 tile、负数输入和随机输出背压；
-- busy 状态下的同步 abort 和未决 PE 响应排空。
+- busy 状态下的同步 abort 和未决 PE 响应排空；
+- 两个 K tile 的本地 buffer 读改写累加，且序列内可以切换 `TrIp`/`DenseIp`；
+- TrGT/TrGS 跨命令同坐标累加、坐标排序 flush 和随机输出背压；
+- Gustavson accumulator 容量不足时的显式 overflow；
+- Gustavson 错误 mode 拒绝和 busy 状态安全 abort。
 
-当前测试结果为 9 项全部通过。
+当前测试结果为 13 项全部通过。
 
 ### 3.2 RTL 检查
 
@@ -202,9 +229,10 @@ sbt -batch test
 ```bash
 verilator --lint-only --Wall -Wno-fatal generated/*.v
 verilator --lint-only --Wall -Wno-fatal generated-tile/*.v
+verilator --lint-only --Wall -Wno-fatal generated-gustavson/*.v
 ```
 
-当前两个 RTL 目录都没有 lint error。剩余 warning 主要来自 SpinalHDL 生成的枚举调试字符串、未消费的调试/诊断信号和部分保留接口，不影响功能。
+当前三个 RTL 目录都没有 lint error。剩余 warning 主要来自 SpinalHDL 生成的枚举调试字符串、未消费的调试/诊断信号和部分保留接口，不影响功能。
 
 ### 3.3 当前适用范围
 
@@ -213,6 +241,7 @@ verilator --lint-only --Wall -Wno-fatal generated-tile/*.v
 - 验证论文四种数据流的 PE row 级计算和路由思路；
 - 进行小规模稀疏矩阵输入的 RTL 仿真；
 - 直接输入一个 bitmask/IP tile 并得到有序矩阵结果；
+- 跨多个 K tile 累加 IP 结果，以及跨多个命令累加 Gustavson 结果；
 - 研究 MFIU、动态列打包和 merge/reduction 行为；
 - 作为后续调度器、cache 层次和 FPGA/ASIC 综合工作的基础。
 
@@ -222,11 +251,11 @@ verilator --lint-only --Wall -Wno-fatal generated-tile/*.v
 
 ### 4.1 调度器覆盖范围
 
-`TrIpTileController` 已完成单个 bitmask/IP tile 的调度，但尚未实现：
+`TrIpTileController` 已完成 bitmask/IP tile 和跨 K 累加，但尚未实现：
 
-- 跨多个 M/K/N tile 的全矩阵循环；
-- K 超过 `fiberWidth` 时的跨 tile 部分和累加；
-- TrGT 和 TrGS 的矩阵级 tile controller；
+- 跨多个 M/N tile 的外层全矩阵循环；
+- 从 CSR/CSC 描述符自动生成 fiber 装载请求；
+- 多 PE row Gustavson tile 调度；
 - 面向软件的寄存器组、描述符队列或指令译码器。
 
 当前设计刻意不实现根据 density 自动选择 mode。未来即使增加启发式推荐器，也必须保留软件显式覆盖 mode 的能力。
@@ -235,17 +264,16 @@ verilator --lint-only --Wall -Wno-fatal generated-tile/*.v
 
 论文中的 4 个 cache cluster、每 cluster 32 bank、32 x 32 互连、HBM 请求和 cache refill 尚未实现。通用顶层的每 PE row 本地 buffer 仍由外部端口控制；TrIP tile controller 使用独立的四 bank 结果 buffer 完成自动 scatter 和有序读回。后续接入全局存储层次时，需要把该功能映射到分布式 PE buffer 和 cache 写回路径。
 
-### 4.3 Gustavson 只完成命令内归约
+### 4.3 Gustavson 存储和并行调度仍待完成
 
-当前 TrGT/TrGS 可以在任意 lane density 下合并单次输入中相同坐标的部分积，但尚未完成：
+当前 TrGT/TrGS 已能在任意 lane density 下完成命令内归约、跨命令累加和有序 flush，但尚未完成：
 
-- 跨多个周期或多个 cache line 的 C 元素持续累加；
 - TrGT 的 4 个独立 PE subrow/FIFO 调度；
-- 按 N 坐标排序的完整 merge tree；
-- 输出 row 完成后的有序写回；
+- 将寄存器式坐标 CAM 替换为可扩展的本地 buffer/merge tree；
+- 多 PE row 间的 row 分配和负载均衡；
 - B row 缓存未命中和 refill 流程。
 
-因此当前 TrGT/TrGS 是可验证的核心 datapath，而不是完整的矩阵级 Gustavson 执行引擎。
+因此当前已经是可验证的单 PE row Gustavson tile 执行引擎，但还不是论文规模的分布式 Gustavson 系统。
 
 ### 4.4 算术格式尚未达到论文 FP32 配置
 
@@ -279,20 +307,21 @@ verilator --lint-only --Wall -Wno-fatal generated-tile/*.v
 
 已完成参考模型、格式转换、随机 density 覆盖、四 mode 语义测试、负数/空输入以及 Stream 背压测试。当前验收测试全部通过。
 
-### 阶段 2：完成 TrIP 调度器（已完成单 K tile）
+### 阶段 2：完成 TrIP 调度器（tile 与跨 K 累加已完成）
 
 1. 增加 tile 配置和 A fiber 装载状态；
 2. 汇总所有 PE row 的动态列容量；
 3. 自动选择本周期发送的 B column 数；
 4. 实现 overflow 命令拆分或重放；
 5. 将 PE row 结果自动 scatter 到本地 buffer；
-6. 从本地 buffer 有序读取并写回输出 tile。
+6. 从本地 buffer 有序读取并写回输出 tile；
+7. 通过同步读改写跨多个 K tile 累加同一个 C tile。
 
-当前已经达到该验收标准：测试平台只装载 A/B fiber 并发送一次 `start`，控制器会自动完成列规划、必要的 A-group 拆分、PE 命令生成、结果 scatter 和有序读回。
+当前已经达到该验收标准：测试平台只需逐个装载 K tile 并发送 `start`，控制器会自动完成列规划、必要的 A-group 拆分、PE 命令生成、跨 K 累加和最终有序读回。
 
-阶段二仍有一个扩展项：增加 K-tile 累加器，使 K 大于 `fiberWidth` 的矩阵也能由同一控制器连续执行。
+阶段二剩余工作是增加外层 M/N tile 循环以及矩阵描述符接口，使任意尺寸矩阵不需要软件逐 tile 驱动。
 
-### 阶段 3：完成 TrGT/TrGS 执行引擎
+### 阶段 3：完成 TrGT/TrGS 执行引擎（单 PE row 累加闭环已完成）
 
 1. 把 PE row 划分为最多 4 个可独立调度的 subrow；
 2. 使用本地 buffer bank 实现 B-row FIFO；
@@ -302,6 +331,8 @@ verilator --lint-only --Wall -Wno-fatal generated-tile/*.v
 6. 为 TrGS 实现 A value 广播和按 N 坐标的 B 分发。
 
 验收标准：TrGT 和 TrGS 可以消费完整 CSR row，并直接输出完整、有序的 C row。
+
+当前已完成第 3、4、5 项的功能版本：多个命令可持续累加相同坐标，`endOfTile` 后按坐标排序并背压输出。下一步需要完成第 1、2、6 项及多 PE row 调度，并把当前寄存器式选择网络替换为可扩展结构。
 
 ### 阶段 4：实现多级存储系统
 
@@ -337,6 +368,6 @@ verilator --lint-only --Wall -Wno-fatal generated-tile/*.v
 
 ## 6. 建议的近期任务
 
-下一轮建议进入阶段三，优先实现 TrGT/TrGS 共用的跨周期坐标累加与有序 merge，再分别补充 TrGT subrow/FIFO 调度和 TrGS 的 A 广播/B 空间分发。与此同时可以给现有 `TrIpTileController` 增加 K-tile 累加，并随后补齐外层 M/N tile 循环，形成第一个支持任意 M/K/N 尺寸的完整矩阵执行路径。
+下一轮建议优先实现 TrGT 的 4 个 subrow/B-row FIFO 与 TrGS 的 A 广播/B 空间分发，再把单 PE row Gustavson 引擎扩展到多 PE row。阶段二则补齐外层 M/N tile 循环和矩阵描述符接口，形成不依赖软件逐 tile 驱动的完整矩阵执行路径。
 
 所有后续控制器都应继续遵守本文的 mode 与稀疏度原则：density 可以参与性能推荐，但硬件接口必须允许调用方在任意 sparsity level 下显式选择任何 mode。

@@ -31,6 +31,8 @@ class TrIpTileControllerSpec extends AnyFunSuite {
     dut.io.aLoad.valid #= false
     dut.io.bLoad.valid #= false
     dut.io.start.valid #= false
+    dut.io.start.payload.firstKTile #= true
+    dut.io.start.payload.lastKTile #= true
     dut.io.result.ready #= false
   }
 
@@ -76,6 +78,8 @@ class TrIpTileControllerSpec extends AnyFunSuite {
     dut.io.start.payload.mode #= mode
     dut.io.start.payload.rowCount #= a.rows
     dut.io.start.payload.columnCount #= b.columns
+    dut.io.start.payload.firstKTile #= true
+    dut.io.start.payload.lastKTile #= true
     dut.io.start.valid #= true
     while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
     dut.clockDomain.waitSampling()
@@ -145,6 +149,8 @@ class TrIpTileControllerSpec extends AnyFunSuite {
       dut.io.start.payload.mode #= TrapezoidDataflow.TrIp
       dut.io.start.payload.rowCount #= 2
       dut.io.start.payload.columnCount #= 2
+      dut.io.start.payload.firstKTile #= true
+      dut.io.start.payload.lastKTile #= true
       dut.io.start.valid #= true
       while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
       dut.clockDomain.waitSampling()
@@ -167,12 +173,86 @@ class TrIpTileControllerSpec extends AnyFunSuite {
       dut.io.start.payload.mode #= TrapezoidDataflow.TrIp
       dut.io.start.payload.rowCount #= 1
       dut.io.start.payload.columnCount #= tileCfg.maxColumns + 1
+      dut.io.start.payload.firstKTile #= true
+      dut.io.start.payload.lastKTile #= true
       dut.io.start.valid #= true
       while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
       dut.clockDomain.waitSampling()
       dut.io.start.valid #= false
       while (!dut.io.done.toBoolean) dut.clockDomain.waitSampling()
       assert(dut.io.unsupportedMode.toBoolean)
+    }
+  }
+
+  test("tile scheduler accumulates partial sums across K tiles") {
+    simConfig.compile(new TrIpTileController(tileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      initialize(dut)
+      dut.io.result.ready #= true
+
+      val aTiles = Seq(
+        DenseMatrix(Vector(Vector(1L, 0L, 2L, 0L), Vector(0L, 3L, 0L, 4L))),
+        DenseMatrix(Vector(Vector(5L, 0L, 6L, 0L), Vector(0L, 7L, 0L, 8L)))
+      )
+      val bTiles = Seq(
+        DenseMatrix(Vector(Vector(1L, 2L), Vector(3L, 0L),
+          Vector(4L, 5L), Vector(0L, 6L))),
+        DenseMatrix(Vector(Vector(7L, 0L), Vector(8L, 9L),
+          Vector(0L, 10L), Vector(11L, 12L)))
+      )
+
+      for (tile <- 0 until 2) {
+        MatrixReference.rowFibers(aTiles(tile)).zipWithIndex.foreach {
+          case (fiber, index) => loadA(dut, index, fiber)
+        }
+        MatrixReference.columnFibers(bTiles(tile)).zipWithIndex.foreach {
+          case (fiber, index) => loadB(dut, index, fiber)
+        }
+        dut.io.start.payload.mode #= (if (tile == 0) TrapezoidDataflow.TrIp
+          else TrapezoidDataflow.DenseIp)
+        dut.io.start.payload.rowCount #= 2
+        dut.io.start.payload.columnCount #= 2
+        dut.io.start.payload.firstKTile #= (tile == 0)
+        dut.io.start.payload.lastKTile #= (tile == 1)
+        dut.io.start.valid #= true
+        while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        dut.io.start.valid #= false
+
+        if (tile == 0) {
+          var timeout = 0
+          while (!dut.io.done.toBoolean && timeout < 500) {
+            dut.clockDomain.waitSampling()
+            assert(!dut.io.result.valid.toBoolean)
+            timeout += 1
+          }
+          assert(dut.io.done.toBoolean)
+          assert(dut.io.awaitingKTile.toBoolean)
+        }
+      }
+
+      val observed = mutable.Map.empty[(Int, Int), Long]
+      dut.clockDomain.waitSampling()
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 1000) {
+        dut.clockDomain.waitSampling()
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt)) = dut.io.result.payload.value.toLong
+        }
+        timeout += 1
+      }
+      assert(dut.io.done.toBoolean,
+        s"K accumulation timed out at aOffset=${dut.io.activeAOffset.toInt}, " +
+          s"bBase=${dut.io.activeBBase.toInt}")
+      assert(!dut.io.awaitingKTile.toBoolean)
+
+      val expected = for {
+        row <- 0 until 2
+        column <- 0 until 2
+      } yield (row, column) -> (MatrixReference.multiply(aTiles(0), bTiles(0))(row, column) +
+        MatrixReference.multiply(aTiles(1), bTiles(1))(row, column))
+      assert(observed.toMap == expected.toMap)
     }
   }
 }

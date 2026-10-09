@@ -99,6 +99,8 @@ case class GustavsonTileConfig(
   require(accumulatorEntries >= core.outputLanes,
     "the accumulator must hold at least one complete PE response")
   require(fifoDepthPerSubrow >= 2)
+  require(fifoDepthPerSubrow <= core.localDepthPerBank,
+    "each TrGT FIFO must fit in one local-buffer bank")
   require(core.cacheLineWords >= core.localBanks,
     "TrGT needs one cache-line lane per PE subrow")
 

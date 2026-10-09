@@ -3,7 +3,11 @@ package trapezoid
 import spinal.core._
 import spinal.lib._
 
-/** Small synchronous FIFO used by one TrGT PE subrow. */
+/** SRAM-backed synchronous FIFO used by one TrGT PE subrow.
+  *
+  * The memory models one bank of the PE-local buffer.  One prefetched head
+  * element keeps the Stream payload stable while the consumer is stalled.
+  */
 class GustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
   private val pointerWidth = scala.math.max(1, log2Up(depth))
   private val countWidth = log2Up(depth + 1)
@@ -15,27 +19,39 @@ class GustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
     val occupancy = out UInt(countWidth bits)
   }
 
-  val storage = Vec((0 until depth).map(_ => Reg(GustavsonB(cfg))))
+  val storage = Mem(GustavsonB(cfg), depth)
   val readPointer = Reg(UInt(pointerWidth bits)) init 0
   val writePointer = Reg(UInt(pointerWidth bits)) init 0
   val occupancy = Reg(UInt(countWidth bits)) init 0
+  val storedCount = Reg(UInt(countWidth bits)) init 0
+  val outputValid = RegInit(False)
 
-  // A full register FIFO waits one cycle after a pop, avoiding ambiguous
-  // same-address read/write behavior without assuming a specific RAM mode.
+  // Conservatively stop writes while full so a bank never depends on a
+  // particular read-during-write behavior from the target SRAM.
   io.push.ready := !io.clear && occupancy =/= depth
-  io.pop.valid := !io.clear && occupancy =/= 0
-  io.pop.payload := storage(readPointer)
+  io.pop.valid := !io.clear && outputValid
   io.occupancy := occupancy
 
   when(io.push.fire) {
-    storage(writePointer) := io.push.payload
+    storage.write(writePointer, io.push.payload)
     when(writePointer === depth - 1) { writePointer := 0 }
       .otherwise { writePointer := writePointer + 1 }
   }
-  when(io.pop.fire) {
+
+  val issueRead = !io.clear && storedCount =/= 0 && (!outputValid || io.pop.fire)
+  val readPayload = storage.readSync(readPointer, issueRead)
+  io.pop.payload := readPayload
+  when(issueRead) {
     when(readPointer === depth - 1) { readPointer := 0 }
       .otherwise { readPointer := readPointer + 1 }
   }
+
+  switch(io.push.fire ## issueRead) {
+    is(B"10") { storedCount := storedCount + 1 }
+    is(B"01") { storedCount := storedCount - 1 }
+  }
+  outputValid := (outputValid && !io.pop.fire) || issueRead
+
   switch(io.push.fire ## io.pop.fire) {
     is(B"10") { occupancy := occupancy + 1 }
     is(B"01") { occupancy := occupancy - 1 }
@@ -45,6 +61,8 @@ class GustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
     readPointer := 0
     writePointer := 0
     occupancy := 0
+    storedCount := 0
+    outputValid := False
   }
 }
 

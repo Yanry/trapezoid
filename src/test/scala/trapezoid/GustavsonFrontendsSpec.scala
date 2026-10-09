@@ -26,6 +26,57 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     .addSimulatorFlag("-CFLAGS -std=c++14")
     .addSimulatorFlag("-LDFLAGS -std=c++14")
 
+  test("SRAM-backed Gustavson FIFO preserves order across full stalls and wrap-around") {
+    simConfig.compile(new GustavsonBFifo(cfg, depth = 2)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.push.valid #= false
+      dut.io.pop.ready #= false
+
+      def drivePush(column: Int, value: Int): Unit = {
+        dut.io.push.payload.valid #= true
+        dut.io.push.payload.aIndex #= 0
+        dut.io.push.payload.k #= 0
+        dut.io.push.payload.column #= column
+        dut.io.push.payload.value #= value
+        dut.io.push.valid #= true
+        sleep(1)
+        while (!dut.io.push.ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        sleep(1)
+        dut.io.push.valid #= false
+      }
+
+      def popOne(): (Int, Int) = {
+        dut.io.pop.ready #= true
+        sleep(1)
+        while (!dut.io.pop.valid.toBoolean) dut.clockDomain.waitSampling()
+        val result = (dut.io.pop.payload.column.toInt, dut.io.pop.payload.value.toInt)
+        dut.clockDomain.waitSampling()
+        sleep(1)
+        dut.io.pop.ready #= false
+        result
+      }
+
+      drivePush(1, 11)
+      drivePush(2, 22)
+      assert(dut.io.occupancy.toInt == 2)
+
+      dut.io.push.payload.column #= 3
+      dut.io.push.payload.value #= 33
+      dut.io.push.valid #= true
+      sleep(1)
+      assert(!dut.io.push.ready.toBoolean)
+      dut.io.push.valid #= false
+
+      assert(popOne() == (1, 11))
+      drivePush(3, 33)
+      assert(popOne() == (2, 22))
+      assert(popOne() == (3, 33))
+      assert(dut.io.occupancy.toInt == 0)
+    }
+  }
+
   private def initializeTrGt(dut: TrGtSubrowScheduler): Unit = {
     dut.io.clear #= false
     dut.io.aLoad.valid #= false

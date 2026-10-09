@@ -76,9 +76,18 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
       dut.io.command.payload.gustavson.b(lane).value #= value
     }
     dut.io.command.valid #= true
-    while (!dut.io.command.ready.toBoolean) dut.clockDomain.waitSampling()
-    dut.clockDomain.waitSampling()
+    var accepted = false
+    var timeout = 0
+    while (!accepted && timeout < 500) {
+      sleep(1)
+      accepted = dut.io.command.ready.toBoolean
+      dut.clockDomain.waitSampling()
+      timeout += 1
+    }
+    sleep(1)
     dut.io.command.valid #= false
+    sleep(1)
+    assert(accepted, "Gustavson command timed out")
   }
 
   private def collect(dut: GustavsonTileEngine): Seq[(Int, Int, Long, Boolean)] = {
@@ -87,13 +96,15 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
     var timeout = 0
     while (!dut.io.done.toBoolean && timeout < 500) {
       dut.io.result.ready #= random.nextBoolean()
+      sleep(1)
+      val resultFire = dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean
+      val sampled = if (resultFire) Some((dut.io.result.payload.row.toInt,
+        dut.io.result.payload.column.toInt,
+        dut.io.result.payload.value.toLong,
+        dut.io.result.payload.endOfTile.toBoolean)) else None
       dut.clockDomain.waitSampling()
-      if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
-        result += ((dut.io.result.payload.row.toInt,
-          dut.io.result.payload.column.toInt,
-          dut.io.result.payload.value.toLong,
-          dut.io.result.payload.endOfTile.toBoolean))
-      }
+      sleep(1)
+      sampled.foreach(result += _)
       timeout += 1
     }
     assert(dut.io.done.toBoolean, "Gustavson tile engine timed out")

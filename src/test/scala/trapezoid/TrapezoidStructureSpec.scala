@@ -35,4 +35,9 @@ class TrapezoidStructureSpec extends AnyFunSuite {
   test("multi-row Gustavson array elaborates") {
     elaborate(new GustavsonArray(GustavsonTileConfig(cfg, accumulatorEntries = 4)))
   }
+
+  test("shared Gustavson row scheduler elaborates") {
+    elaborate(new GustavsonRowScheduler(GustavsonTileConfig(
+      cfg.copy(peRows = 2), accumulatorEntries = 4)))
+  }
 }

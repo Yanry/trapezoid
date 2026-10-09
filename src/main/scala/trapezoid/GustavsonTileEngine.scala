@@ -254,6 +254,153 @@ class GustavsonArray(tileCfg: GustavsonTileConfig) extends Component {
   }
 }
 
+/** Shared command/result boundary for the multi-row Gustavson array.
+  *
+  * Commands through one `endOfTile` marker stay on the same PE row.  Once that
+  * marker is accepted, the next tile may use another free row while the first
+  * row flushes.  Result arbitration remains locked through `endOfTile`, so two
+  * concurrently executing tiles never interleave on the shared output.
+  */
+class GustavsonRowScheduler(tileCfg: GustavsonTileConfig) extends Component {
+  private val cfg = tileCfg.core
+  private val rowIndexWidth = scala.math.max(1, log2Up(cfg.peRows))
+
+  val io = new Bundle {
+    val clear = in Bool()
+    val command = slave(Stream(PERowCommand(cfg)))
+    val result = master(Stream(MatrixResult(cfg)))
+    val allocated = out Bits(cfg.peRows bits)
+    val busy = out Bits(cfg.peRows bits)
+    val overflow = out Bits(cfg.peRows bits)
+    val unsupportedMode = out Bits(cfg.peRows bits)
+    val assignedTiles = out UInt(32 bits)
+    val completedTiles = out UInt(32 bits)
+  }
+
+  val array = new GustavsonArray(tileCfg)
+  array.io.clear := io.clear
+  io.busy := array.io.busy
+  io.overflow := array.io.overflow
+  io.unsupportedMode := array.io.unsupportedMode
+
+  val allocated = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
+  val closing = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
+  val inputActive = RegInit(False)
+  val inputRow = Reg(UInt(rowIndexWidth bits)) init 0
+  val assignedTiles = Reg(UInt(32 bits)) init 0
+  val completedTiles = Reg(UInt(32 bits)) init 0
+  io.allocated := allocated.asBits
+  io.assignedTiles := assignedTiles
+  io.completedTiles := completedTiles
+
+  val freeChoices = Vec(Bool(), cfg.peRows)
+  var earlierFree: Bool = False
+  for (row <- 0 until cfg.peRows) {
+    freeChoices(row) := !allocated(row) && !earlierFree
+    earlierFree = earlierFree || !allocated(row)
+  }
+  val freeFound = freeChoices.asBits.orR
+  val freeRow = UInt(rowIndexWidth bits)
+  freeRow := 0
+  for (row <- 0 until cfg.peRows) {
+    when(freeChoices(row)) { freeRow := row }
+  }
+
+  val selectedInputRow = UInt(rowIndexWidth bits)
+  selectedInputRow := Mux(inputActive, inputRow, freeRow)
+  val inputRouteValid = inputActive || freeFound
+  io.command.ready := False
+  for (row <- 0 until cfg.peRows) {
+    array.io.commands(row).valid := io.command.valid && inputRouteValid &&
+      selectedInputRow === row
+    array.io.commands(row).payload := io.command.payload
+    when(inputRouteValid && selectedInputRow === row) {
+      io.command.ready := array.io.commands(row).ready
+    }
+  }
+
+  val supportedInputMode = io.command.payload.mode === TrapezoidDataflow.TrGt ||
+    io.command.payload.mode === TrapezoidDataflow.TrGs
+  when(io.command.fire) {
+    when(!inputActive) {
+      for (row <- 0 until cfg.peRows) {
+        when(selectedInputRow === row) { allocated(row) := True }
+      }
+      assignedTiles := assignedTiles + 1
+    }
+    when(io.command.payload.endOfTile || !supportedInputMode) {
+      inputActive := False
+      for (row <- 0 until cfg.peRows) {
+        when(selectedInputRow === row) { closing(row) := True }
+      }
+    } otherwise {
+      inputActive := True
+      inputRow := selectedInputRow
+    }
+  }
+
+  val completionBits = Bits(cfg.peRows bits)
+  for (row <- 0 until cfg.peRows) {
+    completionBits(row) := allocated(row) && closing(row) && array.io.done(row)
+    when(completionBits(row)) {
+      allocated(row) := False
+      closing(row) := False
+    }
+  }
+  val completionsThisCycle = CountOne(completionBits).resize(32)
+  when(completionsThisCycle =/= 0) {
+    completedTiles := completedTiles + completionsThisCycle
+  }
+
+  val outputChoices = Vec(Bool(), cfg.peRows)
+  var earlierOutput: Bool = False
+  for (row <- 0 until cfg.peRows) {
+    outputChoices(row) := array.io.results(row).valid && !earlierOutput
+    earlierOutput = earlierOutput || array.io.results(row).valid
+  }
+  val outputFound = outputChoices.asBits.orR
+  val chosenOutputRow = UInt(rowIndexWidth bits)
+  chosenOutputRow := 0
+  for (row <- 0 until cfg.peRows) {
+    when(outputChoices(row)) { chosenOutputRow := row }
+  }
+
+  val outputLocked = RegInit(False)
+  val outputRow = Reg(UInt(rowIndexWidth bits)) init 0
+  val selectedOutputRow = UInt(rowIndexWidth bits)
+  selectedOutputRow := Mux(outputLocked, outputRow, chosenOutputRow)
+  val outputRouteValid = !io.clear && (outputLocked || outputFound)
+  io.result.valid := False
+  io.result.payload := MatrixResult(cfg).getZero
+  for (row <- 0 until cfg.peRows) {
+    array.io.results(row).ready := io.result.ready && outputRouteValid &&
+      selectedOutputRow === row
+    when(outputRouteValid && selectedOutputRow === row) {
+      io.result.valid := array.io.results(row).valid
+      io.result.payload := array.io.results(row).payload
+    }
+  }
+
+  when(!outputLocked && outputFound) {
+    outputLocked := True
+    outputRow := chosenOutputRow
+  }
+  when(io.result.fire && io.result.payload.endOfTile) {
+    outputLocked := False
+  }
+
+  when(io.clear) {
+    for (row <- 0 until cfg.peRows) {
+      allocated(row) := False
+      closing(row) := False
+    }
+    inputActive := False
+    outputLocked := False
+    assignedTiles := 0
+    completedTiles := 0
+  }
+}
+
 object GenerateGustavsonTileEngine extends App {
   SpinalConfig(
     mode = Verilog,
@@ -268,4 +415,12 @@ object GenerateGustavsonArray extends App {
     targetDirectory = "generated-gustavson-array",
     oneFilePerComponent = true
   ).generate(new GustavsonArray(GustavsonTileConfig(TrapezoidConfig.small)))
+}
+
+object GenerateGustavsonRowScheduler extends App {
+  SpinalConfig(
+    mode = Verilog,
+    targetDirectory = "generated-gustavson-scheduler",
+    oneFilePerComponent = true
+  ).generate(new GustavsonRowScheduler(GustavsonTileConfig(TrapezoidConfig.small)))
 }

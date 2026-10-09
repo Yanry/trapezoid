@@ -177,3 +177,27 @@ object GustavsonTileConfig {
   def apply(core: TrapezoidConfig): GustavsonTileConfig =
     new GustavsonTileConfig(core, core.outputLanes)
 }
+
+/** Fixed-width B-row storage consumed by the Gustavson cache adapter.
+  *
+  * Each packed element contains valid, value, then column in low-to-high bit
+  * order.  A cache line may contain fewer elements than the PE row can consume;
+  * unused PE lanes are marked invalid by the adapter.
+  */
+case class GustavsonCacheConfig(
+    tile: GustavsonTileConfig,
+    cache: CacheConfig,
+    maxLinesPerRow: Int = 256
+) {
+  require(maxLinesPerRow >= 1)
+
+  val elementWidth: Int = 1 + tile.core.dataWidth + tile.core.coordinateWidth
+  val elementsPerLine: Int = math.min(tile.core.cacheLineWords,
+    cache.lineWidth / elementWidth)
+  require(elementsPerLine >= 1,
+    "a cache line must hold at least one packed Gustavson B element")
+  require(maxLinesPerRow <= (BigInt(1) << cache.requestIdWidth),
+    "cache requestIdWidth must identify every B-row line")
+
+  val lineCountWidth: Int = log2Up(maxLinesPerRow + 1)
+}

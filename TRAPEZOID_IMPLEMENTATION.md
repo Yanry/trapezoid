@@ -187,6 +187,14 @@ sbt -batch 'runMain trapezoid.GenerateGustavsonRowScheduler'
 
 分别输出到 `generated-trgt/`、`generated-trgs/`、`generated-gustavson-array/` 和 `generated-gustavson-scheduler/`。
 
+生成集成 B-row adapter、banked cache 和多 PE-row 调度器的 Gustavson 系统：
+
+```bash
+sbt -batch 'runMain trapezoid.GenerateCachedGustavsonSystem'
+```
+
+输出位于 `generated-cached-gustavson/`。
+
 ### 2.8 矩阵级参考模型
 
 `trapezoid.model.MatrixReference` 提供纯 Scala 正确性基线，包括：
@@ -292,11 +300,26 @@ TrGT 前端暴露 accepted/issued B-element 计数，便于检查 FIFO 停顿和
 
 `TrIpCachedMatrixSystem` 进一步把 A/B reader 分别连接到 `BankedReadCache` 的 client 0/1，未使用 client 保持空闲，并向外暴露共享 refill Stream、bank/client 状态和 hit/miss/refill 计数器。默认系统生成入口只配置实际使用的 2 个 client；独立 cache 生成入口仍保留论文式 32 client 配置。当前 adapter 使用固定跨度的 bitmask fiber 区，尚未解析内存中的可变长 CSR/CSC pointer/index 数组；系统已经闭合 cache 读路径，但 refill 端仍需由外部内存或后续 DMA 提供数据。
 
+### 2.15 Gustavson B-row cache adapter
+
+`GustavsonBRowCacheAdapter` 和 `CachedGustavsonSystem` 已经把阶段三执行路径接入阶段四统一 cache：
+
+- 一条命令显式携带 `TrGt`/`TrGs`、驻留 A 非零值、`aIndex`、B-row 基址和 cache-line 数量；
+- B 元素按低位到高位的 `valid`、有符号 value、column 固定记录打包，每条 cache line 可容纳的元素数量由实际 line 宽度计算；
+- B 的 K 坐标来自当前 A 元素，未占用的 PE lane 自动置 invalid；
+- adapter 串行请求整段 B row，并把每条 cache line 转换成带背压的 `PERowCommand`；
+- 最后一条 cache line 继承调用方的 `endOfTile`，因此同一输出 tile 可以连续累加多段 B row；
+- 对零长度、超配置长度、地址空间越界和非 Gustavson mode 进行显式拒绝，不产生 cache 请求；
+- cache error 或 request ID 不匹配会置位 `memoryError`；若 tile 已打开，还会发送空的结束命令释放 PE row，避免调度器永久停在半开状态；
+- 暴露 requested/emitted line、cache hit/miss/refill、PE row 分配和完成 tile 等状态计数。
+
+`CachedGustavsonSystem` 使用 cache client 0，并集成 `GustavsonRowScheduler`、`BankedReadCache` 和外部 refill Stream。相同 valid density 的 B row 可以由调用方分别选择 `TrGt` 或 `TrGs`；adapter 不统计 density，也不会修改 mode。当前地址仍由软件提供固定宽度 B-row 区域，CSR row pointer 解析和 DMA 尚未实现。
+
 ## 3. 当前达到的效果
 
 ### 3.1 功能验证
 
-当前共有 29 项自动测试，执行方式为：
+当前共有 32 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -334,9 +357,12 @@ sbt -batch test
 - cache miss/refill、重复读取 hit、地址冲突替换、refill error 不安装以及 clear 全局失效；
 - 跨多个 cache line 的 fiber 重组、输出背压、有符号 value 解码和 cache error 传播；
 - cached matrix descriptor 的 A/B 地址生成、运行时地址越界拒绝，以及稀疏输入下显式 `DenseIp` 的端到端矩阵结果；
-- 矩阵前端、banked cache 和 refill 的完整读链路，以及重复描述符从首次 miss/refill 转为 cache hit。
+- 矩阵前端、banked cache 和 refill 的完整读链路，以及重复描述符从首次 miss/refill 转为 cache hit；
+- Gustavson B row 的跨 cache-line 解码、负数、同坐标跨行累加和随机输出背压；
+- 同一稀疏 B row 分别显式运行 `TrGt`/`TrGs`，并验证首次 miss/refill、重复读取 hit 和结果一致性；
+- Gustavson B-row 非法 mode、地址越界和 refill error 拒绝，以及 cache error 后自动关闭半开 tile。
 
-当前测试结果为 29 项全部通过。
+当前测试结果为 32 项全部通过。
 
 ### 3.2 RTL 检查
 
@@ -354,6 +380,7 @@ verilator --lint-only --Wall -Wno-fatal generated-trgt/*.v
 verilator --lint-only --Wall -Wno-fatal generated-trgs/*.v
 verilator --lint-only --Wall -Wno-fatal generated-gustavson-array/*.v
 verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
+verilator --lint-only --Wall -Wno-fatal generated-cached-gustavson/*.v
 ```
 
 当前已生成的 RTL 目录都没有 lint error。剩余 warning 主要来自 SpinalHDL 生成的枚举调试字符串、未消费的调试/诊断信号和部分保留接口，不影响功能。
@@ -371,6 +398,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 - 验证多 client、多 bank 的 cache 请求、冲突背压和 refill 行为；
 - 跨多个 K tile 累加 IP 结果，以及跨多个命令累加 Gustavson 结果；
 - 验证 TrGT 四路时间 gather 和 TrGS cache-line 空间分发；
+- 从固定宽度 B-row cache 区域运行完整的 TrGT/TrGS miss/refill/hit 数据通路；
 - 研究 MFIU、动态列打包和 merge/reduction 行为；
 - 作为后续调度器、cache 层次和 FPGA/ASIC 综合工作的基础。
 
@@ -390,7 +418,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 ### 4.2 缺少全局 cache 和 DMA
 
-当前已实现一个参数化 multi-client、multi-bank direct-mapped 读 cache，以及每 bank 一个独立 miss 的共享 refill 协议。TrIP 矩阵前端、cache 和外部 refill 端口已经封装成完整读系统，但仍未实现论文中的 4 个 cache cluster、完整 32 x 32 cluster 互连、写 cache/dirty eviction、HBM 请求和 DMA。通用顶层的每 PE row 本地 buffer 仍由外部端口控制；TrIP tile controller 使用独立的四 bank 结果 buffer 完成自动 scatter 和有序读回。后续需要接入 Gustavson 前端，并把结果写回映射到统一存储层次。
+当前已实现一个参数化 multi-client、multi-bank direct-mapped 读 cache，以及每 bank 一个独立 miss 的共享 refill 协议。TrIP 矩阵前端和 Gustavson B-row 前端都已经与实际 cache、外部 refill 端口封装成完整读系统，但仍未实现论文中的 4 个 cache cluster、完整 32 x 32 cluster 互连、写 cache/dirty eviction、HBM 请求和 DMA。通用顶层的每 PE row 本地 buffer 仍由外部端口控制；TrIP tile controller 使用独立的四 bank 结果 buffer 完成自动 scatter 和有序读回。后续需要把结果写回映射到统一存储层次。
 
 ### 4.3 Gustavson 存储和并行调度仍待完成
 
@@ -399,9 +427,9 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 - 将 TrGT typed FIFO bank 与 TrIP 结果 buffer 统一成可按 mode 切换的同一组物理 SRAM；
 - 将寄存器式坐标 CAM 替换为可扩展的本地 buffer/merge tree；
 - 在 first-free 分配之上增加 row 成本估计、公平仲裁和描述符驱动的负载均衡；
-- B row 缓存未命中和 refill 流程。
+- 从 CSR row pointer 自动生成 B-row cache 区间，以及 DMA/HBM refill 流程。
 
-因此当前已经是可验证的多 PE row Gustavson 功能系统，但还不是论文规模的 SRAM/cache 驱动实现。
+因此当前已经是可验证的多 PE row、cache/refill 驱动 Gustavson 功能系统，但还不是论文规模的 CSR/DMA/SRAM 实现。
 
 ### 4.4 算术格式尚未达到论文 FP32 配置
 
@@ -460,7 +488,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 验收标准：TrGT 和 TrGS 可以消费完整 CSR row，并直接输出完整、有序的 C row。
 
-六项均已完成可仿真的功能版本：第 2 项使用四个同步 `Mem` bank 推断 SRAM，但尚未与 TrIP 结果 buffer 复用同一物理实例。TrGS 已具有广播/列坐标分发路径，多个命令可持续累加相同坐标，`endOfTile` 后按坐标排序并背压输出；共享调度器可让多个 PE row 重叠执行，并保证一个 tile 的命令与输出边界不被拆散。后续重点是统一物理 SRAM、实现流水化 merge tree，并接入 cache refill。
+六项均已完成可仿真的功能版本：第 2 项使用四个同步 `Mem` bank 推断 SRAM，但尚未与 TrIP 结果 buffer 复用同一物理实例。TrGS 已具有广播/列坐标分发路径，多个命令可持续累加相同坐标，`endOfTile` 后按坐标排序并背压输出；共享调度器可让多个 PE row 重叠执行，并保证一个 tile 的命令与输出边界不被拆散。固定宽度 B-row 区域已经通过统一 cache 完成 miss/refill/hit，后续重点是解析 CSR row pointer、统一物理 SRAM 和实现流水化 merge tree。
 
 ### 阶段 4：实现多级存储系统（统一读协议、bank 仲裁与 refill 已完成）
 
@@ -473,7 +501,7 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 验收标准：四种数据流都只通过统一存储接口访问矩阵数据，并能在 bank 冲突和 cache miss 下正确停顿。
 
-当前完成了第 1、2 项的读路径、第 3 项的通用多 client bank 仲裁、第 5 项的单 miss/bank refill 功能版本，并已将 TrIP 矩阵前端、实际 cache 和 refill 端口集成为系统顶层。下一步是连接 Gustavson 前端，再增加 cluster 组织、写回/MSHR 和 DMA。
+当前完成了第 1、2 项的读路径、第 3 项的通用多 client bank 仲裁、第 5 项的单 miss/bank refill 功能版本，并已分别将 TrIP 矩阵前端和 Gustavson B-row 前端与实际 cache、refill 端口集成为系统顶层。下一步是增加 cluster 组织、写回/MSHR 和 DMA。
 
 ### 阶段 5：替换为目标算术单元
 
@@ -498,6 +526,6 @@ verilator --lint-only --Wall -Wno-fatal generated-gustavson-scheduler/*.v
 
 ## 6. 建议的近期任务
 
-下一轮建议为 Gustavson 增加 B-row cache adapter，并把它作为额外 client 接入统一 cache；随后实现简单 DMA/AXI refill。并行工作是把 TrGT typed FIFO 与 TrIP 结果 buffer 统一到可按 mode 切换的物理 `BankedLocalBuffer`，并为 cache/Gustavson 仲裁器增加 round-robin 公平策略。
+下一轮建议实现简单 DMA/AXI refill，并增加 CSR/CSC row/column pointer walker，使软件不再直接提供固定宽度 fiber/B-row 地址。并行工作是把 TrGT typed FIFO 与 TrIP 结果 buffer 统一到可按 mode 切换的物理 `BankedLocalBuffer`，并为 cache/Gustavson 仲裁器增加 round-robin 公平策略。
 
 所有后续控制器都应继续遵守本文的 mode 与稀疏度原则：density 可以参与性能推荐，但硬件接口必须允许调用方在任意 sparsity level 下显式选择任何 mode。

@@ -211,3 +211,17 @@ case class TrGsCommand(cfg: TrapezoidConfig) extends Bundle {
   val a = GustavsonA(cfg)
   val b = Vec(TrGsB(cfg), cfg.cacheLineWords)
 }
+
+/** Fetch one fixed-width B-row region for one stationary Gustavson A value.
+  * The caller selects TrGT or TrGS explicitly, independently of valid density.
+  */
+case class CachedGustavsonBRowCommand(gustCfg: GustavsonCacheConfig) extends Bundle {
+  private val cfg = gustCfg.tile.core
+
+  val mode = TrapezoidDataflow()
+  val endOfTile = Bool()
+  val aIndex = UInt(cfg.aRegisterIndexWidth bits)
+  val a = GustavsonA(cfg)
+  val bBaseAddress = UInt(gustCfg.cache.addressWidth bits)
+  val lineCount = UInt(gustCfg.lineCountWidth bits)
+}

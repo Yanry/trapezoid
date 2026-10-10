@@ -146,6 +146,17 @@ class TrIpTileControllerSpec extends AnyFunSuite {
         assert(execute(dut, mode, a, b, random) == MatrixReference.multiply(a, b))
       }
 
+      // A later dense B column must not cause the scheduler to shrink an A
+      // group after earlier columns have already been accumulated.
+      val lateDenseA = DenseMatrix(Vector(
+        Vector(3L, 4L, 1L, 0L), Vector(0L, 4L, 1L, 2L),
+        Vector(3L, 4L, 1L, 2L), Vector(0L, 4L, 1L, 0L)))
+      val lateDenseB = DenseMatrix(Vector(
+        Vector(1L, 2L, 3L, 4L), Vector(1L, 0L, 3L, 4L),
+        Vector(0L, 0L, 3L, 4L), Vector(1L, 0L, 3L, 4L)))
+      assert(execute(dut, TrapezoidDataflow.DenseIp,
+        lateDenseA, lateDenseB, random) == MatrixReference.multiply(lateDenseA, lateDenseB))
+
       dut.io.start.payload.mode #= TrapezoidDataflow.TrIp
       dut.io.start.payload.rowCount #= 2
       dut.io.start.payload.columnCount #= 2

@@ -4,7 +4,7 @@ import spinal.core._
 import spinal.lib._
 
 object TrIpTileState extends SpinalEnum {
-  val Idle, Plan, Dispatch, Collect, Scatter, ScatterAccumWait,
+  val Idle, Preflight, Plan, Dispatch, Collect, Scatter, ScatterAccumWait,
     ReadPlan, ReadWait, Output, AbortDrain = newElement()
 }
 
@@ -317,7 +317,7 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
         aOffset := (aOffset + groupSize).resized
         groupSize := (U(cfg.maxFibers, fiberCounterWidth bits) -
           (aOffset + groupSize).resized).resized
-        state := TrIpTileState.Plan
+        state := TrIpTileState.Preflight
       }
     } otherwise {
       bBase := (bBase + batchColumns).resized
@@ -376,8 +376,31 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
         when(io.start.payload.rowCount === 0 || io.start.payload.columnCount === 0) {
           doneReg := True
         } otherwise {
-          state := TrIpTileState.Plan
+          state := TrIpTileState.Preflight
         }
+      }
+    }
+
+    is(TrIpTileState.Preflight) {
+      // Scan every B column before dispatch.  If one column cannot fit, restart
+      // the scan with a smaller A group so no completed column is replayed.
+      when(modeError) {
+        state := TrIpTileState.Idle
+        doneReg := True
+      } elsewhen(globalChoice === 0) {
+        when(groupSize > 1) {
+          groupSize := groupSize - 1
+          bBase := 0
+        } otherwise {
+          modeError := True
+          state := TrIpTileState.Idle
+          doneReg := True
+        }
+      } elsewhen(bBase.resize(tileCfg.columnCountWidth + 1) + 1 >= columnCount) {
+        bBase := 0
+        state := TrIpTileState.Plan
+      } otherwise {
+        bBase := bBase + 1
       }
     }
 
@@ -388,11 +411,9 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
       } elsewhen(globalChoice =/= 0) {
         batchColumns := globalChoice
         state := TrIpTileState.Dispatch
-      } elsewhen(groupSize > 1) {
-        // Replay the same B prefix with fewer A fibers until it fits.
-        groupSize := groupSize - 1
       } otherwise {
-        // Prevent deadlock if a future configuration violates macLanes >= fiberWidth.
+        // A zero choice after dispatch has begun must not change the A group,
+        // because that would replay already accumulated output coordinates.
         modeError := True
         state := TrIpTileState.Idle
         doneReg := True

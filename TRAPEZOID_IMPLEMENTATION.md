@@ -213,7 +213,7 @@ sbt -batch 'runMain trapezoid.GenerateCachedGustavsonSystem'
 1. 通过带索引的 Stream 装载 A row fiber 和 B column fiber；
 2. 通过 `start` 配置实际 row/column 数量和显式 mode；
 3. 同时计算所有活动 PE row 的 B-column 容量并取全局最小值；
-4. 当一个 B column 仍可能溢出时，自动缩小 A fiber group 并重放同一 B 前缀；
+4. 在发送一个 A fiber group 前复用列规划器顺序预检全部 B column；若任意单列可能溢出，则先缩小 group 并重新扫描，避免处理中途改变分组和重复累加；
 5. 原子地向所有 PE row 分发命令，避免部分 PE 提前接受批次；
 6. 收集所有 PE 响应，并逐项 scatter 到控制器内的四 bank 结果 buffer；
 7. 使用 `firstKTile/lastKTile` 描述 K 序列，在四 bank buffer 中同步读改写并跨 K tile 累加；
@@ -340,6 +340,7 @@ sbt -batch test
 - `TrGt` 和 `TrGs` 在不同有效 lane density 下显式运行；
 - 完整 tile 的加载、全局列规划、A-group 拆分、scatter 和 row-major 读回；
 - 非满 tile、全零 tile、负数输入和随机输出背压；
+- 后段高密 B column 触发 A group 缩小时不会重放、重复累加已经完成的前段列；
 - busy 状态下的同步 abort 和未决 PE 响应排空；
 - 两个 K tile 的本地 buffer 读改写累加，且序列内可以切换 `TrIp`/`DenseIp`；
 - TrGT/TrGS 跨命令同坐标累加、坐标排序 flush 和随机输出背压；
@@ -385,7 +386,57 @@ verilator --lint-only --Wall -Wno-fatal generated-cached-gustavson/*.v
 
 当前已生成的 RTL 目录都没有 lint error。剩余 warning 主要来自 SpinalHDL 生成的枚举调试字符串、未消费的调试/诊断信号和部分保留接口，不影响功能。
 
-### 3.3 当前适用范围
+### 3.3 四种 mode 的论文规模周期模型
+
+`DataflowLatencyBenchmark` 按论文的六类 workload 运行：`HS x HS`、`HS x MS`、`HS x D`、`MS x D`、`MS x MS` 和 `D x D`。运行命令为：
+
+```bash
+sbt -batch 'Test/runMain trapezoid.DataflowLatencyBenchmark'
+```
+
+模型固定使用：
+
+- A、B 均为 `256 x 256`；
+- 计算阵列为论文 Table I 的 `128 PE rows x 128 MACs`；
+- 时钟按论文的 `1 GHz` 换算，因此 1 个 model cycle 等于 1 ns；
+- `HS=0.5%`、`MS=20%`、`D=100%` 非零密度；
+- 每类运行 3 个固定随机样本，A/B 都具有精确的非零元素数量；
+- 每个样本实际执行一次矩阵乘，统计有效 MAC 数并生成结果 checksum；
+- 每一类都显式计算全部四种 mode，不把论文的推荐 mode 做成接口限制。
+
+论文只定义 `HS < 1%`、`MS = 1%~90%`，并没有规定每一类只能使用一个固定密度。这里的 `0.5%` 和 `20%` 是可重复测试所选的代表点，不是新的硬件限制。需要扫描其他密度时只需修改 workload 参数，四种 mode 仍然全部可用。
+
+周期模型计算的是 compute issue cycle 下界：
+
+- `DenseIp` 统计标准 IP 在 128 行、128 个 K-lane 上的 M/N/K wave；
+- `TrIp` 逐个 128-wide K tile 建立 bitmask，并实际执行最多 4 条 A fiber、4 条 B fiber，以及每 PE row 不超过 128 个有效乘法的 MFIU 打包规则；
+- `TrGt` 按 4 个 temporal subrow/PE row、每 subrow 每周期 1 个 MAC 计算最长 row work；
+- `TrGs` 按 128 个 PE row、每行每周期 16 个空间 MAC 计算 row work。
+
+当前固定种子的运行结果如下。单位为 cycle；在假设的 1 GHz 下，数值也等于 ns。
+
+| 类别 | A 非零密度 | B 非零密度 | 论文推荐 mode | 有效 MAC | `DenseIp` | `TrIp` | `TrGt` | `TrGs` |
+| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
+| HS x HS | 0.50% | 0.50% | `TrGt` | 442.3 | 1024.0 | 128.0 | 9.0 | 2.0 |
+| HS x MS | 0.50% | 20.00% | `TrGs` | 16766.3 | 1024.0 | 128.0 | 273.7 | 33.0 |
+| HS x D | 0.50% | 100.00% | `TrGs` | 83968.0 | 1024.0 | 128.0 | 1280.0 | 154.7 |
+| MS x D | 20.00% | 100.00% | `TrIp` | 3355392.0 | 1024.0 | 469.3 | 17834.7 | 2170.7 |
+| MS x MS | 20.00% | 20.00% | `TrIp` | 671825.0 | 1024.0 | 128.0 | 3520.0 | 431.3 |
+| D x D | 100.00% | 100.00% | `DenseIp` | 16777216.0 | 1024.0 | 1024.0 | 65536.0 | 8192.0 |
+
+表中为 3 个样本的算术平均值。该结果没有包含 pipeline fill/drain、cache/HBM 访问、bank 冲突、NoC 争用、结果写回和背压，因此不是当前 RTL 的端到端延迟，也不能替代论文的完整 cycle-level system simulator。尤其是 `HS x HS` 中 compute-only 的 `TrGs` 数字更小，而论文推荐 `TrGt` 是因为它减少存储流量；加入完整存储层次之前不能用本表推翻或复现该结论。
+
+原有的逐周期 Verilator RTL benchmark 被保留为：
+
+```bash
+sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
+```
+
+它仍使用 `4 x 4` 小配置，逐次运行真实 `TrIpTileController` 和 `GustavsonTileEngine`，并把每次硬件结果与 Scala 参考结果比较。该小基准适合做 RTL 正确性和控制器周期回归；论文规模模型适合快速检查 `256 x 256` workload 映射。两者用途不同。
+
+小 RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用同一个 `TrIpTileController` 调度和 PE 数据通路；`TrGt`/`TrGs` 同样共用 `GustavsonTileEngine`。接口已经允许任意 density 下显式选择每种 mode，但尚未加入使同一路径内两个 mode 产生不同周期行为的完整专用微架构优化。
+
+### 3.4 当前适用范围
 
 当前版本适合：
 
@@ -437,17 +488,18 @@ verilator --lint-only --Wall -Wno-fatal generated-cached-gustavson/*.v
 
 要和论文的 32 TFLOP/s 配置进行严格对比，需要接入可综合 FP32 multiplier/adder/FMA，并定义 NaN、Inf、舍入和异常处理策略。
 
-### 4.5 尚未获得性能和面积结论
+### 4.5 尚未获得实现后性能和面积结论
 
-目前完成的是功能 RTL 和小配置验证，尚未执行：
+目前已经有 small 配置的逐周期 RTL 基准，以及 `256 x 256`、`128 x 128 MAC` 的 compute issue 周期模型，但尚未执行：
 
 - paper 配置的完整 RTL 生成；
 - FPGA place-and-route；
 - ASIC synthesis；
 - 时序、面积和功耗分析；
-- 与论文 TPU、SIGMA、Flexagon 基线的周期级性能比较。
+- 包含 cache/HBM/NoC/写回争用的论文规模端到端 RTL 或系统级周期模拟；
+- 与论文 TPU、SIGMA、Flexagon 基线的完整周期级性能比较。
 
-因此目前不能声称达到论文报告的 1 GHz、32 TFLOP/s 或性能/面积结果。
+因此当前表格中的 1 GHz 只是论文时钟假设下的时间换算，不能声称本 RTL 已达到论文报告的 1 GHz、32 TFLOP/s 或性能/面积结果。
 
 ## 5. 下一步工作建议
 

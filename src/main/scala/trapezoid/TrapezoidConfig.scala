@@ -19,7 +19,8 @@ case class TrapezoidConfig(
     outputLanes: Int = 16,
     peRows: Int = 4,
     localBanks: Int = 4,
-    localDepthPerBank: Int = 128
+    localDepthPerBank: Int = 128,
+    responseFifoDepth: Int = 2
 ) {
   require(dataWidth > 0)
   require(fiberWidth >= 2)
@@ -32,6 +33,7 @@ case class TrapezoidConfig(
   require(peRows > 0)
   require(localBanks == 4, "the paper's PE row has four local-buffer banks")
   require(localDepthPerBank >= 2)
+  require(responseFifoDepth >= 1)
   require(accumulatorWidth >= 2 * dataWidth + log2Up(macLanes),
     "accumulator is too narrow for a full-lane dot product")
 

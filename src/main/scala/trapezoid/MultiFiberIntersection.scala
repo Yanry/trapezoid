@@ -11,7 +11,24 @@ import spinal.lib._
   * shift unit in Fig. 12.
   */
 class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
-  private val candidateCount = cfg.maxFibers * cfg.maxFibers * cfg.fiberWidth
+  private val pairCount = cfg.maxFibers * cfg.maxFibers
+
+  private def parallelPrefix(values: Seq[UInt]): Seq[UInt] = {
+    var level = values.map(_.resize(cfg.matchCountWidth))
+    var distance = 1
+    while (distance < values.length) {
+      val previous = level
+      level = previous.indices.map { index =>
+        if (index >= distance) {
+          (previous(index) + previous(index - distance)).resize(cfg.matchCountWidth)
+        } else {
+          previous(index)
+        }
+      }
+      distance *= 2
+    }
+    level
+  }
 
   val io = new Bundle {
     val aValid = in Vec(Bool(), cfg.maxFibers)
@@ -23,18 +40,60 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
     val overflow = out Bool()
   }
 
-  val hits = Vec(Bool(), candidateCount)
-  val prefix = Vec(UInt(cfg.matchCountWidth bits), candidateCount + 1)
-  prefix(0) := 0
-
-  for (a <- 0 until cfg.maxFibers; b <- 0 until cfg.maxFibers; k <- 0 until cfg.fiberWidth) {
-    val candidate = (a * cfg.maxFibers + b) * cfg.fiberWidth + k
-    hits(candidate) := io.aValid(a) && io.bValid(b) && io.aMask(a)(k) && io.bMask(b)(k)
-    prefix(candidate + 1) := prefix(candidate) + hits(candidate).asUInt
+  // Intersections are first formed independently for each A/B fiber pair.
+  // This mirrors the paper's parallel MFIU organization and avoids a single
+  // maxFibers^2 * fiberWidth-long prefix dependency.
+  val pairMasks = Vec(Bits(cfg.fiberWidth bits), pairCount)
+  val pairMatches = Vec(UInt(cfg.matchCountWidth bits), pairCount)
+  val pairLocalRanks = Vec(
+    Vec(UInt(cfg.matchCountWidth bits), cfg.fiberWidth), pairCount)
+  val pairOffsets = Vec(UInt(cfg.matchCountWidth bits), pairCount + 1)
+  for (a <- 0 until cfg.maxFibers; b <- 0 until cfg.maxFibers) {
+    val pair = a * cfg.maxFibers + b
+    pairMasks(pair) := Mux(io.aValid(a) && io.bValid(b),
+      io.aMask(a) & io.bMask(b), B(0, cfg.fiberWidth bits))
+    val localPrefix = parallelPrefix((0 until cfg.fiberWidth).map { coordinate =>
+      pairMasks(pair)(coordinate).asUInt.resize(cfg.matchCountWidth)
+    })
+    pairMatches(pair) := localPrefix.last
+    pairLocalRanks(pair)(0) := 0
+    for (coordinate <- 1 until cfg.fiberWidth) {
+      pairLocalRanks(pair)(coordinate) := localPrefix(coordinate - 1)
+    }
   }
 
-  io.count := prefix(candidateCount)
-  io.overflow := prefix(candidateCount) > cfg.macLanes
+  // The paper's cumulative match indices are produced by a prefix tree.
+  // Keep the pair-local popcounts in parallel, then scan only the 4 x 4 pair
+  // counts; this bounds the offset path to log2(maxFibers^2) adder levels.
+  val inclusivePairCounts = parallelPrefix(pairMatches.toSeq)
+  pairOffsets(0) := 0
+  for (pair <- 0 until pairCount) {
+    pairOffsets(pair + 1) := inclusivePairCounts(pair)
+  }
+
+  io.count := pairOffsets.last
+  io.overflow := pairOffsets.last > cfg.macLanes
+
+  // The shift unit's compressed-value ranks depend only on one source fiber.
+  // Build each rank network once and share it across all destination lanes.
+  val aValueRanks = Vec(
+    Vec(UInt(cfg.fiberValueIndexWidth bits), cfg.fiberWidth), cfg.maxFibers)
+  val bValueRanks = Vec(
+    Vec(UInt(cfg.fiberValueIndexWidth bits), cfg.fiberWidth), cfg.maxFibers)
+  for (fiber <- 0 until cfg.maxFibers) {
+    val aPrefix = parallelPrefix((0 until cfg.fiberWidth).map { coordinate =>
+      io.aMask(fiber)(coordinate).asUInt.resize(cfg.matchCountWidth)
+    })
+    val bPrefix = parallelPrefix((0 until cfg.fiberWidth).map { coordinate =>
+      io.bMask(fiber)(coordinate).asUInt.resize(cfg.matchCountWidth)
+    })
+    aValueRanks(fiber)(0) := 0
+    bValueRanks(fiber)(0) := 0
+    for (coordinate <- 1 until cfg.fiberWidth) {
+      aValueRanks(fiber)(coordinate) := aPrefix(coordinate - 1).resized
+      bValueRanks(fiber)(coordinate) := bPrefix(coordinate - 1).resized
+    }
+  }
 
   for (lane <- 0 until cfg.macLanes) {
     io.routes(lane).valid := False
@@ -45,19 +104,16 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
     io.routes(lane).bValueIndex := 0
 
     for (a <- 0 until cfg.maxFibers; b <- 0 until cfg.maxFibers; k <- 0 until cfg.fiberWidth) {
-      val candidate = (a * cfg.maxFibers + b) * cfg.fiberWidth + k
-      when(hits(candidate) && prefix(candidate) === lane) {
+      val pair = a * cfg.maxFibers + b
+      val globalRank =
+        (pairOffsets(pair) + pairLocalRanks(pair)(k)).resize(cfg.matchCountWidth)
+      when(pairMasks(pair)(k) && globalRank === lane) {
         io.routes(lane).valid := True
         io.routes(lane).aFiber := a
         io.routes(lane).bFiber := b
         io.routes(lane).coordinate := k
-        if (k == 0) {
-          io.routes(lane).aValueIndex := 0
-          io.routes(lane).bValueIndex := 0
-        } else {
-          io.routes(lane).aValueIndex := CountOne(io.aMask(a)(k - 1 downto 0)).resized
-          io.routes(lane).bValueIndex := CountOne(io.bMask(b)(k - 1 downto 0)).resized
-        }
+        io.routes(lane).aValueIndex := aValueRanks(a)(k)
+        io.routes(lane).bValueIndex := bValueRanks(b)(k)
       }
     }
   }

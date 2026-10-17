@@ -22,29 +22,31 @@ class TrapezoidPERowSpec extends AnyFunSuite {
     .addSimulatorFlag("-CFLAGS -std=c++14")
     .addSimulatorFlag("-LDFLAGS -std=c++14")
 
-  private def clearInputs(dut: TrapezoidPERow): Unit = {
+  private def clearInputs(
+      dut: TrapezoidPERow,
+      config: TrapezoidConfig = cfg): Unit = {
     dut.io.command.valid #= false
     dut.io.command.payload.endOfTile #= false
     dut.io.response.ready #= true
-    for (fiber <- 0 until cfg.maxFibers) {
+    for (fiber <- 0 until config.maxFibers) {
       dut.io.command.payload.trip.a(fiber).valid #= false
       dut.io.command.payload.trip.a(fiber).tag #= 0
       dut.io.command.payload.trip.a(fiber).mask #= 0
       dut.io.command.payload.trip.b(fiber).valid #= false
       dut.io.command.payload.trip.b(fiber).tag #= 0
       dut.io.command.payload.trip.b(fiber).mask #= 0
-      for (entry <- 0 until cfg.fiberWidth) {
+      for (entry <- 0 until config.fiberWidth) {
         dut.io.command.payload.trip.a(fiber).values(entry) #= 0
         dut.io.command.payload.trip.b(fiber).values(entry) #= 0
       }
     }
-    for (entry <- 0 until cfg.macLanes) {
+    for (entry <- 0 until config.macLanes) {
       dut.io.command.payload.gustavson.a(entry).valid #= false
       dut.io.command.payload.gustavson.a(entry).row #= 0
       dut.io.command.payload.gustavson.a(entry).k #= 0
       dut.io.command.payload.gustavson.a(entry).value #= 0
     }
-    for (entry <- 0 until cfg.cacheLineWords) {
+    for (entry <- 0 until config.cacheLineWords) {
       dut.io.command.payload.gustavson.b(entry).valid #= false
       dut.io.command.payload.gustavson.b(entry).aIndex #= 0
       dut.io.command.payload.gustavson.b(entry).k #= 0
@@ -55,10 +57,10 @@ class TrapezoidPERowSpec extends AnyFunSuite {
 
   private def issue(dut: TrapezoidPERow): Unit = {
     dut.io.command.valid #= true
+    while (!dut.io.command.ready.toBoolean) dut.clockDomain.waitSampling()
     dut.clockDomain.waitSampling()
     dut.io.command.valid #= false
-    dut.clockDomain.waitSampling()
-    assert(dut.io.response.valid.toBoolean)
+    while (!dut.io.response.valid.toBoolean) dut.clockDomain.waitSampling()
   }
 
   test("TrIP intersects packed fibers and reduces each output coordinate") {
@@ -102,6 +104,64 @@ class TrapezoidPERowSpec extends AnyFunSuite {
           dut.io.response.payload.results(index).value.toInt)
       }
       assert(results == Seq((2, 0, 22), (2, 1, 91), (3, 1, 133)))
+    }
+  }
+
+  test("TrIP prefix routing and reduction scale across four by four fibers") {
+    val wideCfg = cfg.copy(maxFibers = 4, macLanes = 16, outputLanes = 16)
+    simConfig.compile(new TrapezoidPERow(wideCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      clearInputs(dut, wideCfg)
+      dut.io.command.payload.mode #= TrapezoidDataflow.TrIp
+
+      val aFibers = Seq(
+        (0x9, Seq(2, -1)),
+        (0x6, Seq(3, 4)),
+        (0x5, Seq(-2, 5)),
+        (0x8, Seq(6))
+      )
+      val bFibers = Seq(
+        (0x1, Seq(7)),
+        (0x6, Seq(2, -3)),
+        (0x9, Seq(-4, 5)),
+        (0x4, Seq(6))
+      )
+      for (fiber <- 0 until wideCfg.maxFibers) {
+        dut.io.command.payload.trip.a(fiber).valid #= true
+        dut.io.command.payload.trip.a(fiber).tag #= 10 + fiber
+        dut.io.command.payload.trip.a(fiber).mask #= aFibers(fiber)._1
+        for ((value, index) <- aFibers(fiber)._2.zipWithIndex) {
+          dut.io.command.payload.trip.a(fiber).values(index) #= value
+        }
+
+        dut.io.command.payload.trip.b(fiber).valid #= true
+        dut.io.command.payload.trip.b(fiber).tag #= 20 + fiber
+        dut.io.command.payload.trip.b(fiber).mask #= bFibers(fiber)._1
+        for ((value, index) <- bFibers(fiber)._2.zipWithIndex) {
+          dut.io.command.payload.trip.b(fiber).values(index) #= value
+        }
+      }
+
+      issue(dut)
+      assert(!dut.io.response.payload.overflow.toBoolean)
+      assert(dut.io.response.payload.selectedColumns.toInt == 4)
+      assert(dut.io.response.payload.effectualMacs.toInt == 11)
+      assert(dut.io.response.payload.count.toInt == 9)
+      val results = (0 until 9).map { index =>
+        val result = dut.io.response.payload.results(index)
+        (result.row.toInt, result.column.toInt, result.value.toInt)
+      }
+      assert(results == Seq(
+        (10, 20, 14),
+        (10, 22, -13),
+        (11, 21, -6),
+        (11, 23, 24),
+        (12, 20, -14),
+        (12, 21, -15),
+        (12, 22, 8),
+        (12, 23, 30),
+        (13, 22, 30)
+      ))
     }
   }
 
@@ -201,6 +261,52 @@ class TrapezoidPERowSpec extends AnyFunSuite {
         }.toMap
         assert(observed == expected.toMap)
       }
+    }
+  }
+
+  test("pipeline accepts ordered commands and holds responses under backpressure") {
+    simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      clearInputs(dut)
+      dut.io.response.ready #= false
+      dut.io.command.payload.mode #= TrapezoidDataflow.TrGs
+      dut.io.command.payload.gustavson.a(0).valid #= true
+      dut.io.command.payload.gustavson.a(0).k #= 0
+      dut.io.command.payload.gustavson.b(0).valid #= true
+      dut.io.command.payload.gustavson.b(0).aIndex #= 0
+      dut.io.command.payload.gustavson.b(0).k #= 0
+      dut.io.command.payload.gustavson.b(0).column #= 3
+
+      def send(row: Int, aValue: Int, bValue: Int): Unit = {
+        dut.io.command.payload.gustavson.a(0).row #= row
+        dut.io.command.payload.gustavson.a(0).value #= aValue
+        dut.io.command.payload.gustavson.b(0).value #= bValue
+        dut.io.command.valid #= true
+        while (!dut.io.command.ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        dut.io.command.valid #= false
+      }
+
+      send(row = 1, aValue = 2, bValue = 3)
+      send(row = 2, aValue = 4, bValue = 5)
+
+      while (!dut.io.response.valid.toBoolean) dut.clockDomain.waitSampling()
+      assert(dut.io.response.payload.results(0).row.toInt == 1)
+      assert(dut.io.response.payload.results(0).value.toInt == 6)
+      for (_ <- 0 until 3) {
+        dut.clockDomain.waitSampling()
+        assert(dut.io.response.valid.toBoolean)
+        assert(dut.io.response.payload.results(0).row.toInt == 1)
+        assert(dut.io.response.payload.results(0).value.toInt == 6)
+      }
+
+      dut.io.response.ready #= true
+      dut.clockDomain.waitSampling()
+      dut.io.response.ready #= false
+      sleep(1)
+      while (!dut.io.response.valid.toBoolean) dut.clockDomain.waitSampling()
+      assert(dut.io.response.payload.results(0).row.toInt == 2)
+      assert(dut.io.response.payload.results(0).value.toInt == 20)
     }
   }
 }

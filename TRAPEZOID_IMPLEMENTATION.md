@@ -29,7 +29,8 @@
 - 每个 PE row 的 MAC lane 数；
 - cache line 输入宽度和输出 lane 数；
 - PE row 数量；
-- 本地 buffer 的 bank 数和深度。
+- 本地 buffer 的 bank 数和深度；
+- PE row 响应 FIFO 深度 `responseFifoDepth`。
 
 工程提供两套预定义配置：
 
@@ -59,7 +60,7 @@
 5. 生成 A/B fiber、坐标以及压缩值索引等路由信息；
 6. 当 effectual computation 超过 MAC lane 数时产生 `overflow`。
 
-当前实现完成了论文 MFIU 和 shift-unit 的等价逻辑功能。路由逻辑由 SpinalHDL 组合选择网络生成，还没有进一步映射成论文采用的 Benes network 物理结构。
+当前实现完成了论文 MFIU 和 shift-unit 的等价逻辑功能。MFIU 已从单条全局候选前缀链改为两级结构：先并行形成最多 4 x 4 个 fiber-pair intersection，并用 pair-local prefix tree 生成局部 computation index；再用第二棵并行 prefix-sum tree 生成 pair offset，将匹配压缩到全局 MAC lane。这避免了 `maxFibers^2 * fiberWidth` 长度的串行前缀依赖；4 x 4 pair 配置的 offset 路径只有 4 层窄加法器，更接近论文 Fig. 11 的并行 intersection/prefix 组织。shift unit 使用的 A/B 压缩 value rank 也按源 fiber 预计算一次，由所有目标 lane 共享，不会为每个 lane 重复展开 popcount 网络。最终 lane 选择仍由 SpinalHDL 组合选择网络生成，还没有进一步映射成论文采用的 Benes network 物理结构。
 
 ### 2.4 动态 B 列打包
 
@@ -88,7 +89,17 @@ PE row 响应会返回：
 
 IP/TrIP 路径可以在一次命令中输出多个 `(row, column, value)`。Gustavson 路径可以在一个 cache-line 命令内合并相同坐标的部分积。
 
-响应使用寄存器保存，并正确处理 `valid/ready` 背压；下游停顿时不会覆盖尚未消费的结果。
+PE row 已拆分为五个逻辑阶段：
+
+1. `Input`：锁存完整命令，隔离阵列调度器与 MFIU；
+2. `Route/Distribution`：执行 MFIU、动态列规划、A/B 值索引和 Gustavson `aIndex` 选择；
+3. `MAC`：固定 lane 有符号乘法，并把无效 lane 清零；
+4. `Reduce/Merge`：按输出坐标归约部分积；
+5. `Output`：将完整响应写入可配置深度的弹性寄存器 FIFO。
+
+前三个阶段之间使用支持同周期出入的弹性 `Stream` 流水寄存器。在无背压时，流水线填满后可以每周期接收一条命令；任一级停顿都会沿 `ready` 反压到命令入口。TrIP 利用 MFIU 输出按 fiber pair 连续排列的性质，通过共享的可切片 contiguous reduction tree 归约：每个树节点只比较并合并左右子树边界上的一个输出簇，而不是为最多 16 个候选输出分别复制一棵全宽加法树。这对应论文 MRN 的 reduction mode，并将加法器数量从 O(`maxFibers^2 * macLanes`) 降到 O(`macLanes`)。Gustavson 路径仍允许命令内坐标任意排列，使用平衡加法树合并相同坐标。两条路径的组合加法深度均为 O(log2(lane 数))。默认响应 FIFO 深度为 2，并以 field-wise 弹性寄存器实现，避免 paper 配置的超宽 `PERowResponse` 被 `StreamFifo` 压成超过 SpinalHDL 1.7 限制的单个 `Bits`；下游停顿时会保持输出稳定，并允许前级继续运行到所有弹性存储占满。
+
+这次流水化没有改变 `PERowCommand`/`PERowResponse` 外部协议，也没有根据 density 改写 mode。代价是 PE row 不再是一拍命令/响应模块，上层必须只依赖 Stream 握手，不能假定固定的一拍响应延迟。
 
 ### 2.6 四 bank 本地 buffer
 
@@ -319,7 +330,7 @@ TrGT 前端暴露 accepted/issued B-element 计数，便于检查 FIFO 停顿和
 
 ### 3.1 功能验证
 
-当前共有 32 项自动测试，执行方式为：
+当前共有 34 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -338,6 +349,7 @@ sbt -batch test
 - 四种 mode 在 0%、低、中、高和 100% density 下与统一参考结果一致；
 - `DenseIp` 在稀疏输入上运行，以及 `TrIp` 在全稠密输入上运行；
 - `TrGt` 和 `TrGs` 在不同有效 lane density 下显式运行；
+- PE row 连续命令在流水线中保持顺序，输出停顿时响应内容保持稳定，恢复后不丢失后续响应；
 - 完整 tile 的加载、全局列规划、A-group 拆分、scatter 和 row-major 读回；
 - 非满 tile、全零 tile、负数输入和随机输出背压；
 - 后段高密 B column 触发 A group 缩小时不会重放、重复累加已经完成的前段列；
@@ -363,7 +375,7 @@ sbt -batch test
 - 同一稀疏 B row 分别显式运行 `TrGt`/`TrGs`，并验证首次 miss/refill、重复读取 hit 和结果一致性；
 - Gustavson B-row 非法 mode、地址越界和 refill error 拒绝，以及 cache error 后自动关闭半开 tile。
 
-当前测试结果为 32 项全部通过。
+当前测试结果为 34 项全部通过。
 
 ### 3.2 RTL 检查
 
@@ -385,6 +397,8 @@ verilator --lint-only --Wall -Wno-fatal generated-cached-gustavson/*.v
 ```
 
 当前已生成的 RTL 目录都没有 lint error。剩余 warning 主要来自 SpinalHDL 生成的枚举调试字符串、未消费的调试/诊断信号和部分保留接口，不影响功能。
+
+此外，已用 `TrapezoidConfig.paper.copy(peRows = 1)` 对论文参数的单个 PE row 做独立 elaboration：128 个 FP32 宽输入 MAC lane、128-wide fiber、4 x 4 fiber intersection 和 128 个输出 lane 均成功生成 Verilog。输出缓冲使用 field-wise 弹性寄存器，避免 SpinalHDL 1.7 将约 13.6 Kbit 的完整响应压成超宽单一 `Bits`。该检查只覆盖单 PE row 的 RTL 可生成性；完整 128-row 阵列的生成、lint 和综合仍属于后续规模化工作。
 
 ### 3.3 四种 mode 的论文规模周期模型
 
@@ -569,8 +583,8 @@ sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
 
 1. 先对 1、4、16 个 PE row 做综合；
 2. 检查 MFIU 前缀逻辑和路由网络的关键路径；
-3. 将当前组合路由逐步替换为流水化前缀网络和 Benes network；
-4. 将归约链改为平衡、可切分的流水化 reduction tree；
+3. 在现有两级 fiber-pair MFIU、并行 prefix tree 和 stage 边界基础上，将组合 lane 选择替换为 Benes network；
+4. 当前 TrIP contiguous reduction tree 已按输出簇切片；下一步补齐 Gustavson 的流式 merge mode，并根据综合关键路径在树中增加可配置寄存器切分；
 5. 再尝试生成和综合 128 x 128 paper 配置；
 6. 建立吞吐、利用率、面积、频率和存储流量统计。
 
@@ -578,6 +592,8 @@ sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
 
 ## 6. 建议的近期任务
 
-下一轮建议实现简单 DMA/AXI refill，并增加 CSR/CSC row/column pointer walker，使软件不再直接提供固定宽度 fiber/B-row 地址。并行工作是把 TrGT typed FIFO 与 TrIP 结果 buffer 统一到可按 mode 切换的物理 `BankedLocalBuffer`，并为 cache/Gustavson 仲裁器增加 round-robin 公平策略。
+PE row 方向下一轮应优先完成统一物理本地存储：把 TrGT typed FIFO、A register、TrIP 结果 scatter buffer 和 Gustavson partial-sum storage 映射到可按 mode 切换用途的同一组四 bank SRAM；随后用 16/32/64/128 lane 配置综合新的流水化 PE row，根据报告确定 MFIU、Benes 路由和 reduction tree 的附加寄存器位置。
+
+系统方向仍需实现简单 DMA/AXI refill 和 CSR/CSC row/column pointer walker，使软件不再直接提供固定宽度 fiber/B-row 地址。cache/Gustavson 仲裁器也仍需增加 round-robin 公平策略。
 
 所有后续控制器都应继续遵守本文的 mode 与稀疏度原则：density 可以参与性能推荐，但硬件接口必须允许调用方在任意 sparsity level 下显式选择任何 mode。

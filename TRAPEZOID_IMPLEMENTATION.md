@@ -207,9 +207,10 @@ sbt -batch 'runMain trapezoid.GenerateGustavsonRowScheduler'
 ```bash
 sbt -batch 'runMain trapezoid.GenerateCachedGustavsonSystem'
 sbt -batch 'runMain trapezoid.GenerateCachedTrGsSpatialSystem'
+sbt -batch 'runMain trapezoid.GenerateClusteredCachedTrGsSpatialSystem'
 ```
 
-分别输出位于 `generated-cached-gustavson/` 和 `generated-cached-trgs/`。
+分别输出位于 `generated-cached-gustavson/`、`generated-cached-trgs/` 和 `generated-clustered-cached-trgs/`。
 
 ### 2.8 矩阵级参考模型
 
@@ -346,11 +347,13 @@ sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 
 `CachedGustavsonSystem` 使用 cache client 0，并集成 `GustavsonRowScheduler`、`BankedReadCache` 和外部 refill Stream。相同 valid density 的 B row 可以由调用方分别选择 `TrGt` 或 `TrGs`；adapter 不统计 density，也不会修改 mode。`CachedTrGsSpatialSystem` 是面向 TrGS 综合和周期实验的专用顶层：adapter 直接产生窄 `TrGsCommand`，不再构造 128-entry A 向量；cache line 送入 `TrGsSpatialRowScheduler`，非 TrGS 命令在发出 cache 请求前被拒绝。该顶层只实例化一套 TrGS PE-row 阵列，不会为了保留通用路径同时复制一套 TrGT 阵列。当前地址仍由软件提供固定宽度 B-row 区域，CSR row pointer 解析和 DMA 尚未实现。
 
+`ClusteredCachedTrGsSpatialSystem` 进一步按 cache client 数量划分 TrGS cluster。每个 cluster 包含一个独立 B-row adapter 和 `peRows / clientCount` 条 PE row，总 PE row 数不变；输入 tile 从 first-free cluster 分配，并在该 tile 的所有 B-row command 完成前保持 cluster 归属。不同 cluster 可同时持有 cache outstanding request、等待不同 bank refill 或运行 PE row。各 cluster 内部先完成 PE-row 结果仲裁，顶层结果端口再锁定一个 cluster 直到 `endOfTile`，因此并行 tile 的结果不会交叉。small 生成配置使用 2 个 cluster，每个 cluster 2 条 PE row；映射到论文的 32 个 cache client 和 128 条 PE row 时对应每 cluster 4 条 PE row。
+
 ## 3. 当前达到的效果
 
 ### 3.1 功能验证
 
-当前共有 41 项自动测试，执行方式为：
+当前共有 42 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -394,9 +397,11 @@ sbt -batch test
 - 矩阵前端、banked cache 和 refill 的完整读链路，以及重复描述符从首次 miss/refill 转为 cache hit；
 - Gustavson B row 的跨 cache-line 解码、负数、同坐标跨行累加和随机输出背压；
 - 同一稀疏 B row 分别显式运行 `TrGt`/`TrGs`，并验证首次 miss/refill、重复读取 hit 和结果一致性；
-- Gustavson B-row 非法 mode、地址越界和 refill error 拒绝，以及 cache error 后自动关闭半开 tile。
+- Gustavson B-row 非法 mode、地址越界和 refill error 拒绝，以及 cache error 后自动关闭半开 tile；
+- TrGS adapter 在输出已缓存 line 的同周期发出下一条 cache 请求；
+- 两个 TrGS cluster 使用独立 cache client，并行持有和执行不同 tile。
 
-当前测试结果为 34 项全部通过。
+当前测试结果为 42 项全部通过。
 
 ### 3.2 RTL 检查
 

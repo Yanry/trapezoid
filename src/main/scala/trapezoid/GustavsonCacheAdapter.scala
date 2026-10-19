@@ -377,6 +377,216 @@ class CachedTrGsSpatialSystem(gustCfg: GustavsonCacheConfig) extends Component {
   io.cacheRefillCount := cache.io.refillCount
 }
 
+/** Multi-client TrGS system partitioned into cache/PE-row clusters. */
+class ClusteredCachedTrGsSpatialSystem(gustCfg: GustavsonCacheConfig)
+    extends Component {
+  private val cfg = gustCfg.tile.core
+  private val cacheCfg = gustCfg.cache
+  private val clusterCount = cacheCfg.clientCount
+  private val rowsPerCluster = cfg.peRows / clusterCount
+  private val clusterIndexWidth = scala.math.max(1, log2Up(clusterCount))
+  require(clusterCount <= cfg.peRows,
+    "the TrGS cluster count cannot exceed the number of PE rows")
+  require(cfg.peRows % clusterCount == 0,
+    "PE rows must divide evenly across TrGS cache clusters")
+
+  private val localCore = cfg.copy(peRows = rowsPerCluster)
+  private val localTile = gustCfg.tile.copy(core = localCore)
+  private val localGustCfg = gustCfg.copy(tile = localTile)
+
+  val io = new Bundle {
+    val clear = in Bool()
+    val command = slave(Stream(CachedGustavsonBRowCommand(gustCfg)))
+    val result = master(Stream(MatrixResult(cfg)))
+    val refillRequest = master(Stream(CacheRefillRequest(cacheCfg)))
+    val refillResponse = slave(Stream(CacheRefillResponse(cacheCfg)))
+    val clusterOwned = out Bits(clusterCount bits)
+    val adapterBusy = out Bits(clusterCount bits)
+    val commandDone = out Bits(clusterCount bits)
+    val memoryError = out Bits(clusterCount bits)
+    val addressError = out Bits(clusterCount bits)
+    val adapterUnsupportedMode = out Bits(clusterCount bits)
+    val requestedLines = out Vec(UInt(32 bits), clusterCount)
+    val emittedLines = out Vec(UInt(32 bits), clusterCount)
+    val allocated = out Bits(cfg.peRows bits)
+    val schedulerBusy = out Bits(cfg.peRows bits)
+    val schedulerOverflow = out Bits(cfg.peRows bits)
+    val schedulerUnsupportedMode = out Bits(cfg.peRows bits)
+    val assignedTiles = out UInt(32 bits)
+    val completedTiles = out UInt(32 bits)
+    val cacheBankBusy = out Bits(cacheCfg.bankCount bits)
+    val cacheClientOutstanding = out Bits(clusterCount bits)
+    val cacheHitCount = out UInt(32 bits)
+    val cacheMissCount = out UInt(32 bits)
+    val cacheRefillCount = out UInt(32 bits)
+  }
+
+  val adapters = Array.fill(clusterCount)(new GustavsonBRowCacheAdapter(
+    localGustCfg, allowTrGt = false, allowTrGs = true,
+    emitSpatialCommand = true))
+  val schedulers = Array.fill(clusterCount)(
+    new TrGsSpatialRowScheduler(localTile))
+  val cache = new BankedReadCache(cacheCfg)
+  cache.io.clear := io.clear
+  io.refillRequest <> cache.io.refillRequest
+  cache.io.refillResponse <> io.refillResponse
+
+  for (cluster <- 0 until clusterCount) {
+    adapters(cluster).io.clear := io.clear
+    schedulers(cluster).io.clear := io.clear
+    schedulers(cluster).io.command <> adapters(cluster).io.spatialCommand
+    cache.io.requests(cluster) <> adapters(cluster).io.cacheRequest
+    adapters(cluster).io.cacheResponse <> cache.io.responses(cluster)
+    io.adapterBusy(cluster) := adapters(cluster).io.busy
+    io.commandDone(cluster) := adapters(cluster).io.done
+    io.memoryError(cluster) := adapters(cluster).io.memoryError
+    io.addressError(cluster) := adapters(cluster).io.addressError
+    io.adapterUnsupportedMode(cluster) := adapters(cluster).io.unsupportedMode
+    io.requestedLines(cluster) := adapters(cluster).io.requestedLines
+    io.emittedLines(cluster) := adapters(cluster).io.emittedLines
+    for (row <- 0 until rowsPerCluster) {
+      val globalRow = cluster * rowsPerCluster + row
+      io.allocated(globalRow) := schedulers(cluster).io.allocated(row)
+      io.schedulerBusy(globalRow) := schedulers(cluster).io.busy(row)
+      io.schedulerOverflow(globalRow) := schedulers(cluster).io.overflow(row)
+      io.schedulerUnsupportedMode(globalRow) :=
+        schedulers(cluster).io.unsupportedMode(row)
+    }
+  }
+
+  val clusterOwned = Vec((0 until clusterCount).map(_ => RegInit(False)))
+  val clusterClosing = Vec((0 until clusterCount).map(_ => RegInit(False)))
+  val completionBase = Vec((0 until clusterCount).map(_ =>
+    Reg(UInt(32 bits)) init 0))
+  val inputActive = RegInit(False)
+  val inputCluster = Reg(UInt(clusterIndexWidth bits)) init 0
+  io.clusterOwned := clusterOwned.asBits
+
+  val freeChoices = Vec(Bool(), clusterCount)
+  var earlierFree: Bool = False
+  for (cluster <- 0 until clusterCount) {
+    val available = !clusterOwned(cluster) &&
+      adapters(cluster).io.rowCommand.ready
+    freeChoices(cluster) := available && !earlierFree
+    earlierFree = earlierFree || available
+  }
+  val freeFound = freeChoices.asBits.orR
+  val freeCluster = UInt(clusterIndexWidth bits)
+  freeCluster := 0
+  for (cluster <- 0 until clusterCount) {
+    when(freeChoices(cluster)) { freeCluster := cluster }
+  }
+
+  val selectedInputCluster = UInt(clusterIndexWidth bits)
+  selectedInputCluster := Mux(inputActive, inputCluster, freeCluster)
+  val inputRouteValid = inputActive || freeFound
+  io.command.ready := False
+  for (cluster <- 0 until clusterCount) {
+    adapters(cluster).io.rowCommand.valid := io.command.valid &&
+      inputRouteValid && selectedInputCluster === cluster
+    adapters(cluster).io.rowCommand.payload := io.command.payload
+    when(inputRouteValid && selectedInputCluster === cluster) {
+      io.command.ready := adapters(cluster).io.rowCommand.ready
+    }
+  }
+
+  when(io.command.fire) {
+    when(!inputActive) {
+      for (cluster <- 0 until clusterCount) {
+        when(selectedInputCluster === cluster) {
+          clusterOwned(cluster) := True
+          completionBase(cluster) := schedulers(cluster).io.completedTiles
+        }
+      }
+    }
+    when(io.command.payload.endOfTile) {
+      inputActive := False
+      for (cluster <- 0 until clusterCount) {
+        when(selectedInputCluster === cluster) {
+          clusterClosing(cluster) := True
+        }
+      }
+    } otherwise {
+      inputActive := True
+      inputCluster := selectedInputCluster
+    }
+  }
+
+  for (cluster <- 0 until clusterCount) {
+    val adapterFailed = adapters(cluster).io.memoryError ||
+      adapters(cluster).io.addressError || adapters(cluster).io.unsupportedMode
+    val rejectedBeforeAllocation = clusterOwned(cluster) &&
+      adapters(cluster).io.done && adapterFailed &&
+      !schedulers(cluster).io.allocated.orR
+    val tileCompleted = clusterOwned(cluster) && clusterClosing(cluster) &&
+      schedulers(cluster).io.completedTiles =/= completionBase(cluster)
+    when(rejectedBeforeAllocation || tileCompleted) {
+      clusterOwned(cluster) := False
+      clusterClosing(cluster) := False
+      when(inputActive && inputCluster === cluster) { inputActive := False }
+    }
+  }
+
+  val assignedSum = schedulers.map(_.io.assignedTiles)
+    .reduce(_ + _).resize(32)
+  val completedSum = schedulers.map(_.io.completedTiles)
+    .reduce(_ + _).resize(32)
+  io.assignedTiles := assignedSum
+  io.completedTiles := completedSum
+
+  val outputChoices = Vec(Bool(), clusterCount)
+  var earlierOutput: Bool = False
+  for (cluster <- 0 until clusterCount) {
+    outputChoices(cluster) := schedulers(cluster).io.result.valid && !earlierOutput
+    earlierOutput = earlierOutput || schedulers(cluster).io.result.valid
+  }
+  val outputFound = outputChoices.asBits.orR
+  val chosenOutputCluster = UInt(clusterIndexWidth bits)
+  chosenOutputCluster := 0
+  for (cluster <- 0 until clusterCount) {
+    when(outputChoices(cluster)) { chosenOutputCluster := cluster }
+  }
+
+  val outputLocked = RegInit(False)
+  val outputCluster = Reg(UInt(clusterIndexWidth bits)) init 0
+  val selectedOutputCluster = UInt(clusterIndexWidth bits)
+  selectedOutputCluster := Mux(outputLocked, outputCluster, chosenOutputCluster)
+  val outputRouteValid = !io.clear && (outputLocked || outputFound)
+  io.result.valid := False
+  io.result.payload := MatrixResult(cfg).getZero
+  for (cluster <- 0 until clusterCount) {
+    schedulers(cluster).io.result.ready := io.result.ready &&
+      outputRouteValid && selectedOutputCluster === cluster
+    when(outputRouteValid && selectedOutputCluster === cluster) {
+      io.result.valid := schedulers(cluster).io.result.valid
+      io.result.payload := schedulers(cluster).io.result.payload
+    }
+  }
+  when(!outputLocked && outputFound) {
+    outputLocked := True
+    outputCluster := chosenOutputCluster
+  }
+  when(io.result.fire && io.result.payload.endOfTile) {
+    outputLocked := False
+  }
+
+  io.cacheBankBusy := cache.io.bankBusy
+  io.cacheClientOutstanding := cache.io.clientOutstanding
+  io.cacheHitCount := cache.io.hitCount
+  io.cacheMissCount := cache.io.missCount
+  io.cacheRefillCount := cache.io.refillCount
+
+  when(io.clear) {
+    for (cluster <- 0 until clusterCount) {
+      clusterOwned(cluster) := False
+      clusterClosing(cluster) := False
+      completionBase(cluster) := 0
+    }
+    inputActive := False
+    outputLocked := False
+  }
+}
+
 object GenerateCachedGustavsonSystem extends App {
   private val core = TrapezoidConfig.small
   private val tile = GustavsonTileConfig(core)
@@ -411,4 +621,23 @@ object GenerateCachedTrGsSpatialSystem extends App {
     targetDirectory = "generated-cached-trgs",
     oneFilePerComponent = true
   ).generate(new CachedTrGsSpatialSystem(GustavsonCacheConfig(tile, cache)))
+}
+
+object GenerateClusteredCachedTrGsSpatialSystem extends App {
+  private val core = TrapezoidConfig.small
+  private val tile = GustavsonTileConfig(core)
+  private val cache = CacheConfig(
+    wordWidth = 32,
+    wordsPerLine = 16,
+    addressWidth = 24,
+    bankCount = 32,
+    setsPerBank = 64,
+    clientCount = 2
+  )
+  SpinalConfig(
+    mode = Verilog,
+    targetDirectory = "generated-clustered-cached-trgs",
+    oneFilePerComponent = true
+  ).generate(new ClusteredCachedTrGsSpatialSystem(
+    GustavsonCacheConfig(tile, cache)))
 }

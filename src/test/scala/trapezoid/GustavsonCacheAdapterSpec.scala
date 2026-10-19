@@ -297,6 +297,131 @@ class GustavsonCacheAdapterSpec extends AnyFunSuite {
     }
   }
 
+  test("clustered TrGS system overlaps independent cache clients and tiles") {
+    val clusteredCacheCfg = cacheCfg.copy(clientCount = 2)
+    val clusteredGustCfg = gustCfg.copy(cache = clusteredCacheCfg)
+    simConfig.compile(new ClusteredCachedTrGsSpatialSystem(
+      clusteredGustCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.command.valid #= false
+      dut.io.result.ready #= false
+      dut.io.refillRequest.ready #= false
+      dut.io.refillResponse.valid #= false
+      dut.io.refillResponse.payload.bank #= 0
+      dut.io.refillResponse.payload.address #= 0
+      dut.io.refillResponse.payload.data #= 0
+      dut.io.refillResponse.payload.error #= false
+
+      val memory = Map(
+        40 -> encodeLine(Seq(Some(1 -> 3), None, None, None)),
+        41 -> encodeLine(Seq(Some(2 -> 5), None, None, None)))
+
+      def issue(row: Int, aValue: Int, address: Int): Unit = {
+        dut.io.command.payload.mode #= TrapezoidDataflow.TrGs
+        dut.io.command.payload.endOfTile #= true
+        dut.io.command.payload.aIndex #= 0
+        dut.io.command.payload.a.valid #= true
+        dut.io.command.payload.a.row #= row
+        dut.io.command.payload.a.k #= 0
+        dut.io.command.payload.a.value #= aValue
+        dut.io.command.payload.bBaseAddress #= address
+        dut.io.command.payload.lineCount #= 1
+        dut.io.command.valid #= true
+        sleep(1)
+        var timeout = 0
+        while (!dut.io.command.ready.toBoolean && timeout < 100) {
+          dut.clockDomain.waitSampling()
+          sleep(1)
+          timeout += 1
+        }
+        assert(timeout < 100, s"cluster command for row $row timed out")
+        dut.clockDomain.waitSampling()
+        dut.io.command.valid #= false
+      }
+
+      issue(row = 10, aValue = 2, address = 40)
+      issue(row = 20, aValue = 4, address = 41)
+
+      var timeout = 0
+      sleep(1)
+      while (dut.io.cacheClientOutstanding.toBigInt != 3 && timeout < 100) {
+        dut.clockDomain.waitSampling()
+        sleep(1)
+        timeout += 1
+      }
+      assert(timeout < 100, "both cache clients did not become outstanding")
+      assert(dut.io.clusterOwned.toBigInt == 3)
+      assert(dut.io.adapterBusy.toBigInt == 3)
+
+      val refillAddresses = mutable.ArrayBuffer.empty[Int]
+      for (_ <- 0 until 2) {
+        dut.io.refillRequest.ready #= true
+        sleep(1)
+        while (!dut.io.refillRequest.valid.toBoolean) {
+          dut.clockDomain.waitSampling()
+          sleep(1)
+        }
+        val bank = dut.io.refillRequest.payload.bank.toInt
+        val address = dut.io.refillRequest.payload.address.toInt
+        refillAddresses += address
+        dut.clockDomain.waitSampling()
+        dut.io.refillRequest.ready #= false
+
+        dut.io.refillResponse.payload.bank #= bank
+        dut.io.refillResponse.payload.address #= address
+        dut.io.refillResponse.payload.data #= memory(address)
+        dut.io.refillResponse.payload.error #= false
+        dut.io.refillResponse.valid #= true
+        sleep(1)
+        while (!dut.io.refillResponse.ready.toBoolean) {
+          dut.clockDomain.waitSampling()
+          sleep(1)
+        }
+        dut.clockDomain.waitSampling()
+        dut.io.refillResponse.valid #= false
+      }
+
+      timeout = 0
+      while ((dut.io.assignedTiles.toLong != 2 ||
+          dut.io.allocated.toBigInt.bitCount != 2) && timeout < 200) {
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(timeout < 200,
+        s"assigned=${dut.io.assignedTiles.toLong} allocated=${dut.io.allocated.toBigInt}")
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      dut.io.result.ready #= true
+      timeout = 0
+      while (observed.size < 2 && timeout < 300) {
+        sleep(1)
+        if (dut.io.result.valid.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(observed.toSet == Set((10, 1, 6L), (20, 2, 20L)))
+
+      while ((dut.io.completedTiles.toLong != 2 ||
+          dut.io.clusterOwned.toBigInt != 0) && timeout < 340) {
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(dut.io.completedTiles.toLong == 2)
+      assert(dut.io.clusterOwned.toBigInt == 0)
+      assert(dut.io.cacheClientOutstanding.toBigInt == 0)
+      assert(refillAddresses.sorted == Seq(40, 41))
+      assert(dut.io.cacheMissCount.toLong == 2)
+      assert(dut.io.cacheRefillCount.toLong == 2)
+      assert(dut.io.schedulerOverflow.toBigInt == 0)
+      assert(dut.io.memoryError.toBigInt == 0)
+    }
+  }
+
   test("B-row adapter rejects unsupported modes and overflowing address ranges") {
     simConfig.compile(new GustavsonBRowCacheAdapter(gustCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)

@@ -141,7 +141,7 @@ sbt -batch 'runMain trapezoid.GenerateTrapezoid'
 sbt -batch 'runMain trapezoid.GeneratePaperTrapezoid'
 ```
 
-该配置规模很大，生成和后续综合需要较高的内存与运行时间。目前主要验证的是 small 配置，尚未完成 paper 配置的完整 elaboration 和综合评估。
+该配置规模很大，生成和后续综合需要较高的内存与运行时间。paper 参数的单 PE row 已完成独立 elaboration；完整 128-row 阵列和 paper RTL benchmark 使用显式入口，不放入默认快速回归。
 
 生成带阶段二调度器的 bitmask/IP tile controller：
 
@@ -451,32 +451,21 @@ sbt -batch 'Test/runMain trapezoid.DataflowLatencyBenchmark'
 
 表中为 3 个样本的算术平均值。该结果没有包含 pipeline fill/drain、cache/HBM 访问、bank 冲突、NoC 争用、结果写回和背压，因此不是当前 RTL 的端到端延迟，也不能替代论文的完整 cycle-level system simulator。尤其是 `HS x HS` 中 compute-only 的 `TrGs` 数字更小，而论文推荐 `TrGt` 是因为它减少存储流量；加入完整存储层次之前不能用本表推翻或复现该结论。
 
-原有的逐周期 Verilator RTL benchmark 被保留为：
+论文配置的逐周期 Verilator RTL benchmark 为：
 
 ```bash
-sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
+sbt -batch 'Test/runMain trapezoid.PaperRtlDataflowLatencyBenchmark'
 ```
 
-它使用 `16 x 16` 矩阵，逐次运行真实 `TrIpTileController` 和 `GustavsonTileEngine`，并把每次硬件结果与 Scala 参考结果比较。A、B 的稀疏度独立设置为 `HS=1/256=0.39%`、`MS=51/256=19.92%` 和 `D=100%`，覆盖论文的 `HS x HS`、`HS x MS`、`HS x D`、`MS x MS`、`MS x D`、`D x D` 六类 workload。每个矩阵都保持精确非零数；A、B 固定保留 `(0,0)` 非零点，使极稀疏样本仍至少产生一次有效乘法，不会因随机 K 维完全错开而退化成零工作量。
+该测试不再使用 small 配置，而是直接使用 `TrapezoidConfig.paper`：`128 PE rows x 128 MACs`、128-wide fiber、4 条 A/B fiber、16-word cache line、16 个结果 lane、32-bit 输入和 72-bit 累加器。矩阵为 `128 x 128`，对应一个完整的 paper K tile。A、B 的稀疏度独立设置为 `HS=82/16384=0.50%`、`MS=3277/16384=20.00%` 和 `D=100%`，覆盖论文的 `HS x HS`、`HS x MS`、`HS x D`、`MS x MS`、`MS x D`、`D x D` 六类 workload。每个矩阵都保持精确非零数；A、B 固定保留 `(0,0)` 非零点，使极稀疏样本仍至少产生一次有效乘法。
 
-小 RTL benchmark 同时输出两组数据。第一张表保留原来的 `start/first command -> done` execution cycle，便于版本间直接回归；第二张详细表增加 IP fiber 本地装载周期、boundary 总周期、实际接受的 batch/command 数、TrIP 平均 B-column packing 数、useful MAC/cycle 和 issue-slot utilization。TrIP 的 issue 数、packed column 和 effectual MAC 均从内部 PE Stream 握手直接采样；TrGT/TrGS 的 effectual MAC 从实际接受命令的 valid B lane 采样，并分别与软件参考工作量核对。因此详细表可以区分控制开销、dynamic-column packing 不足和 lane 空闲，但仍不包含 cache、HBM 或 DMA 延迟。
+paper RTL benchmark 同时输出两组数据。第一张表保留 `start/first command -> done` execution cycle；第二张详细表增加 IP fiber 本地装载周期、boundary 总周期、实际接受的 batch/command 数、TrIP 平均 B-column packing 数、useful MAC/cycle 和 issue-slot utilization。TrIP 的 issue 数、packed column 和 effectual MAC 均从内部 PE Stream 握手直接采样；TrGT/TrGS 的 effectual MAC 从实际接受命令的 valid B lane 采样，并分别与软件参考工作量核对。因此详细表可以区分控制开销、dynamic-column packing 不足和 lane 空闲，但仍不包含 cache、HBM 或 DMA 延迟。
 
-当前固定种子的 RTL 仿真结果为：
+每类运行 3 个确定性样本。IP 从 `start` 握手计到 `done`，本地 A/B fiber 装载单独列为 setup cycle；Gustavson 从第一条 command 计时，并包括后续 command、merge、flush 和逐行 tile 边界。结果输出保持 `ready=true`。测试会输出 execution cycle、boundary cycle、issue 数、B-column packing、useful MAC/cycle 和 issue-slot utilization，并将硬件结果及有效 MAC 数与 Scala 参考模型逐项核对。
 
-| 类别 | A 非零密度 | B 非零密度 | 论文推荐 mode | `DenseIp` | `TrIp` | `TrGt` | `TrGs` |
-| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: |
-| HS x HS | 0.39% | 0.39% | `TrGt` | 84.0 | 84.0 | 114.7 | 116.0 |
-| HS x MS | 0.39% | 19.92% | `TrGs` | 100.7 | 100.7 | 122.0 | 122.0 |
-| HS x D | 0.39% | 100.00% | `TrGs` | 129.0 | 129.0 | 146.0 | 146.0 |
-| MS x MS | 19.92% | 19.92% | `TrIp` | 596.7 | 596.7 | 1543.7 | 1542.3 |
-| MS x D | 19.92% | 100.00% | `TrIp` | 870.3 | 870.3 | 2304.7 | 2304.7 |
-| D x D | 100.00% | 100.00% | `DenseIp` | 1058.0 | 1058.0 | 10512.0 | 10512.0 |
+paper 配置的 elaboration、Verilator 编译和仿真资源消耗很高，因此不放入默认 `sbt test`；需要通过上述 `runMain` 命令显式运行。测量仍不包含 cache、HBM、DMA 和主机装载周期。
 
-表中是每类 3 个确定性样本的平均 execution cycle。IP 从 `start` 握手计到 `done`，本地 A/B fiber 装载单独列为 setup cycle；Gustavson 从第一条 command 计时，并包括后续 command、merge、flush 和逐行 tile 边界。结果输出保持 `ready=true`。这些数字包含当前 RTL 的 PE pipeline、controller 状态转换、TrIP scatter/读改写/有序读回和 Gustavson merge/flush；不包含 cache、HBM、DMA 和主机装载，也不能直接与论文 128 x 128 阵列结果比较。
-
-详细指标显示，`D x D` 时 DenseIp/TrIP 的 issue-slot utilization 为 `100%`，但当前动态 B-column 选择平均每个 issue 只打包 `1.00` 列；`MS x D` 时平均打包 `1.20` 列，issue-slot utilization 为 `47.8%`。Gustavson 在 `MS x D` 和 `D x D` 的 cache-line lane utilization 接近 `100%`，但逐项 merge、逐行 flush 和命令开销使 useful MAC/cycle 明显低于 IP 路径。该指标只计算已接受 issue 上的 lane 使用率，因此应与 execution cycle 和 useful MAC/cycle 一起观察。
-
-小 RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用同一个 `TrIpTileController` 调度和 PE 数据通路；`TrGt`/`TrGs` 同样共用 `GustavsonTileEngine`。接口已经允许任意 density 下显式选择每种 mode，但尚未加入使同一路径内两个 mode 产生不同周期行为的完整专用微架构优化。
+paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用同一个 `TrIpTileController` 调度和 PE 数据通路；`TrGt`/`TrGs` 通过 `GustavsonRowScheduler` 使用 128 个 paper PE row，但底层仍共用同一种 `GustavsonTileEngine` merge 路径。接口已经允许任意 density 下显式选择每种 mode，但尚未加入使同一路径内两个 mode 产生不同周期行为的完整专用微架构优化。
 
 ### 3.4 当前适用范围
 

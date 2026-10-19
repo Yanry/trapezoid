@@ -57,17 +57,24 @@ case class PERowReducedProduct(cfg: TrapezoidConfig) extends Bundle {
   val value = SInt(cfg.accumulatorWidth bits)
 }
 
+case class TrapezoidPERowIo(cfg: TrapezoidConfig) extends Bundle {
+  val command = slave(Stream(PERowCommand(cfg)))
+  val response = master(Stream(PERowResponse(cfg)))
+}
+
+trait TrapezoidPERowComponent {
+  val io: TrapezoidPERowIo
+}
+
 /** A pipelined Trapezoid PE row.
   *
   * Input, route/distribution, MAC, reduction, and output buffering are
   * separated by elastic Stream stages. Every boundary propagates backpressure,
   * so several commands may be in flight without losing ordering.
   */
-class TrapezoidPERow(cfg: TrapezoidConfig) extends Component {
-  val io = new Bundle {
-    val command = slave(Stream(PERowCommand(cfg)))
-    val response = master(Stream(PERowResponse(cfg)))
-  }
+class TrapezoidPERow(cfg: TrapezoidConfig)
+    extends Component with TrapezoidPERowComponent {
+  val io = TrapezoidPERowIo(cfg)
 
   private def balancedSum(terms: Seq[SInt]): SInt = {
     require(terms.nonEmpty)

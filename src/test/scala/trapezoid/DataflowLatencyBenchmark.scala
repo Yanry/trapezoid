@@ -1,9 +1,13 @@
 package trapezoid
 
+import java.nio.file.{Files, Path, Paths}
+
+import spinal.core._
 import spinal.core.sim._
 import trapezoid.model.{BitmaskFiber, DenseMatrix, MatrixReference}
 
 import scala.collection.mutable
+import scala.sys.process.Process
 import scala.util.Random
 
 /** Paper-scale compute-cycle model for all four explicit dataflow modes.
@@ -14,8 +18,8 @@ import scala.util.Random
   * This model uses the paper's 128 PE rows x 128 MACs and 1 GHz clock on
   * deterministic 256 x 256 matrices.  It reports compute issue cycles and
   * deliberately excludes cache/HBM stalls, pipeline fill/drain, and host
-  * wall-clock time.  The small cycle-accurate RTL benchmark remains available
-  * as SmallRtlDataflowLatencyBenchmark below.
+  * wall-clock time.  The paper-configured cycle-accurate RTL benchmark remains
+  * available as PaperRtlDataflowLatencyBenchmark below.
   */
 object DataflowLatencyBenchmark extends App {
   private val paperCfg = TrapezoidConfig.paper
@@ -256,38 +260,98 @@ object DataflowLatencyBenchmark extends App {
   println("\nNumbers are compute issue cycles, not cycle-accurate full-system RTL latency.")
 }
 
-/** Reproducible cycle-accurate RTL benchmark for the small configuration.
+object GeneratePaperPERowSimulationRtl extends App {
+  require(args.length == 1, "expected the target RTL directory")
+  SpinalConfig(
+    mode = Verilog,
+    targetDirectory = args.head,
+    oneFilePerComponent = true
+  ).generate(new TrapezoidPERow(TrapezoidConfig.paper))
+}
+
+private[trapezoid] class PaperPERowBlackBox(
+    cfg: TrapezoidConfig,
+    rtlPaths: Seq[Path]
+) extends BlackBox with TrapezoidPERowComponent {
+  val io = TrapezoidPERowIo(cfg)
+  val clk = in Bool()
+  val reset = in Bool()
+
+  setBlackBoxName("TrapezoidPERow")
+  mapCurrentClockDomain(clock = clk, reset = reset)
+  rtlPaths.foreach(path => addRTLPath(path.toString))
+}
+
+/** Reproducible cycle-accurate RTL benchmark for the paper configuration.
   *
   * Run with:
-  *   sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
+  *   sbt -batch 'Test/runMain trapezoid.PaperRtlDataflowLatencyBenchmark'
   *
   * The benchmark measures controller execution cycles after local IP fibers
   * have been loaded.  Gustavson command delivery is part of execution because
   * each command represents one stationary A nonzero and its matching B row.
   * Verilator compilation and host wall-clock time are deliberately excluded.
   */
-object SmallRtlDataflowLatencyBenchmark extends App {
-  private val dimension = 16
+object PaperRtlDataflowLatencyBenchmark extends App {
+  private val cfg = TrapezoidConfig.paper
+  private val dimension = cfg.fiberWidth
   private val samplesPerCategory = 3
-  private val highlySparseNonZeros = 1
-  private val mildlySparseNonZeros = 51
+  private val highlySparseNonZeros =
+    (dimension * dimension * 50 + 5000) / 10000
+  private val mildlySparseNonZeros =
+    (dimension * dimension * 2000 + 5000) / 10000
   private val denseNonZeros = dimension * dimension
 
-  private val cfg = TrapezoidConfig(
-    dataWidth = 8,
-    accumulatorWidth = 24,
-    coordinateWidth = 8,
-    fiberWidth = dimension,
-    maxFibers = 2,
-    macLanes = 16,
-    cacheLineWords = 4,
-    outputLanes = 4,
-    peRows = 8,
-    localDepthPerBank = 8
+  private val ipCfg = TrIpTileConfig(cfg, maxColumns = dimension,
+    maxRowsOverride = dimension)
+  private val gustCfg = GustavsonTileConfig(cfg)
+
+  private val kernelDirectory = Paths.get("simWorkspace", "paper-pe-row-kernel")
+    .toAbsolutePath.normalize()
+  private val kernelSources = Vector(
+    kernelDirectory.resolve("TrapezoidPERow.v"),
+    kernelDirectory.resolve("MultiFiberIntersection.v"),
+    kernelDirectory.resolve("DynamicColumnPacker.v")
   )
-  private val ipCfg = TrIpTileConfig(cfg, maxColumns = dimension)
-  private val gustCfg = GustavsonTileConfig(cfg, accumulatorEntries = dimension,
-    fifoDepthPerSubrow = 2)
+  private val kernelInputs = Vector(
+    Paths.get("src/main/scala/trapezoid/TrapezoidPERow.scala"),
+    Paths.get("src/main/scala/trapezoid/MultiFiberIntersection.scala"),
+    Paths.get("src/main/scala/trapezoid/TrapezoidTypes.scala"),
+    Paths.get("src/main/scala/trapezoid/TrapezoidConfig.scala")
+  ).map(_.toAbsolutePath.normalize())
+
+  private def kernelIsCurrent: Boolean = {
+    kernelSources.forall(Files.isRegularFile(_)) && {
+      val oldestOutput = kernelSources.map(path =>
+        Files.getLastModifiedTime(path).toMillis).min
+      val newestInput = kernelInputs.map(path =>
+        Files.getLastModifiedTime(path).toMillis).max
+      oldestOutput >= newestInput
+    }
+  }
+
+  private def generateKernel(): Unit = {
+    Files.createDirectories(kernelDirectory)
+    val java = Paths.get(System.getProperty("java.home"), "bin", "java").toString
+    val status = Process(Seq(
+      java,
+      "-Xms1G",
+      "-Xmx12G",
+      "-XX:+UseG1GC",
+      "-cp",
+      System.getProperty("java.class.path"),
+      "trapezoid.GeneratePaperPERowSimulationRtl",
+      kernelDirectory.toString
+    )).!
+    require(status == 0, s"paper PE-row RTL generation failed with status $status")
+    require(kernelSources.forall(Files.isRegularFile(_)),
+      s"paper PE-row RTL is incomplete in $kernelDirectory")
+  }
+
+  if (!kernelIsCurrent) generateKernel()
+
+  private def paperPe(paths: Seq[Path]): TrapezoidConfig => TrapezoidPERowComponent =
+    core => new PaperPERowBlackBox(core, paths)
 
   private val simConfig = SimConfig.withVerilator
     .addSimulatorFlag("-CFLAGS -std=c++14")
@@ -383,7 +447,8 @@ object SmallRtlDataflowLatencyBenchmark extends App {
   private val measurements = mutable.ArrayBuffer.empty[Measurement]
 
   simConfig.compile {
-    val dut = new TrIpTileController(ipCfg)
+    val dut = new TrIpTileController(ipCfg,
+      paperPe(kernelSources.take(2)))
     dut.batchColumns.simPublic()
     dut.pes.foreach { pe =>
       pe.io.command.valid.simPublic()
@@ -457,7 +522,7 @@ object SmallRtlDataflowLatencyBenchmark extends App {
       var packedColumns = 0L
       var observedMacs = 0L
       val observed = mutable.Map.empty[(Int, Int), Long]
-      while (!dut.io.done.toBoolean && executionCycles < 10000) {
+      while (!dut.io.done.toBoolean && executionCycles < 1000000) {
         sleep(1)
         val commandFire = dut.pes.forall(pe =>
           pe.io.command.valid.toBoolean && pe.io.command.ready.toBoolean)
@@ -503,7 +568,8 @@ object SmallRtlDataflowLatencyBenchmark extends App {
     }
   }
 
-  simConfig.compile(new GustavsonTileEngine(gustCfg)).doSim { dut =>
+  simConfig.compile(new GustavsonRowScheduler(gustCfg,
+    paperPe(kernelSources))).doSim { dut =>
     dut.clockDomain.forkStimulus(10)
     dut.io.clear #= false
     dut.io.command.valid #= false
@@ -559,6 +625,16 @@ object SmallRtlDataflowLatencyBenchmark extends App {
       var observedMacs = 0L
       var issueCount = 0L
 
+      def sampleCycle(): Unit = {
+        sleep(1)
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt)) = dut.io.result.payload.value.toLong
+        }
+        dut.clockDomain.waitSampling()
+        cycles += 1
+      }
+
       for (row <- 0 until dimension) {
         val rowCommands = commandsForRow(workload, row)
         for (((k, aValue, columnBase), commandIndex) <- rowCommands.zipWithIndex) {
@@ -583,7 +659,7 @@ object SmallRtlDataflowLatencyBenchmark extends App {
           }
           dut.io.command.valid #= true
           var accepted = false
-          while (!accepted && cycles < 100000) {
+          while (!accepted && cycles < 10000000) {
             sleep(1)
             accepted = dut.io.command.ready.toBoolean
             if (accepted) {
@@ -591,27 +667,25 @@ object SmallRtlDataflowLatencyBenchmark extends App {
               observedMacs += (0 until cfg.cacheLineWords).count(lane =>
                 dut.io.command.payload.gustavson.b(lane).valid.toBoolean)
             }
+            if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+              observed((dut.io.result.payload.row.toInt,
+                dut.io.result.payload.column.toInt)) = dut.io.result.payload.value.toLong
+            }
             dut.clockDomain.waitSampling()
             cycles += 1
           }
           dut.io.command.valid #= false
           assert(accepted, s"${modeName(mode)} command timed out")
         }
-
-        while (!dut.io.done.toBoolean && cycles < 100000) {
-          sleep(1)
-          if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
-            observed((dut.io.result.payload.row.toInt,
-              dut.io.result.payload.column.toInt)) = dut.io.result.payload.value.toLong
-          }
-          dut.clockDomain.waitSampling()
-          cycles += 1
-        }
-        assert(dut.io.done.toBoolean, s"${modeName(mode)} row $row timed out")
-        assert(!dut.io.overflow.toBoolean,
-          s"${modeName(mode)} accumulator overflow for ${workload.category.name}, row $row")
       }
-      assert(!dut.io.unsupportedMode.toBoolean)
+      while (dut.io.completedTiles.toLong < dimension && cycles < 10000000) {
+        sampleCycle()
+      }
+      assert(dut.io.completedTiles.toLong == dimension,
+        s"${modeName(mode)} timed out after ${dut.io.completedTiles.toLong} rows")
+      assert(dut.io.overflow.toBigInt == 0,
+        s"${modeName(mode)} accumulator overflow for ${workload.category.name}")
+      assert(dut.io.unsupportedMode.toBigInt == 0)
       val expected = expectedEntries(MatrixReference.multiply(workload.a, workload.b))
       assert(observed.toMap == expected,
         s"${modeName(mode)} ${workload.category.name} " +
@@ -635,8 +709,9 @@ object SmallRtlDataflowLatencyBenchmark extends App {
   private def densityText(nonZeros: Int): String =
     f"${100.0 * nonZeros / (dimension * dimension)}%.2f%%"
 
-  println("\nTrapezoid dataflow execution latency (cycles)")
+  println("\nTrapezoid paper-configuration RTL execution latency (cycles)")
   println(s"Matrix: ${dimension}x${dimension} * ${dimension}x${dimension}; " +
+    s"array: ${cfg.peRows}x${cfg.macLanes} MACs; " +
     s"samples/category: $samplesPerCategory; result.ready: always true")
   println(s"HS=${densityText(highlySparseNonZeros)}, " +
     s"MS=${densityText(mildlySparseNonZeros)}, D=${densityText(denseNonZeros)}")

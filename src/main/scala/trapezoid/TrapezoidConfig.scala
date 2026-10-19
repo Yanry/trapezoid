@@ -81,14 +81,21 @@ object TrapezoidDataflow extends SpinalEnum {
   * Dataflow selection remains a runtime input.  This configuration describes
   * capacity only and never infers a mode from operand density.
   */
-case class TrIpTileConfig(core: TrapezoidConfig, maxColumns: Int = 16) {
-  val maxRows: Int = core.peRows * core.maxFibers
+case class TrIpTileConfig(
+    core: TrapezoidConfig,
+    maxColumns: Int = 16,
+    maxRowsOverride: Int = 0
+) {
+  val maxRows: Int = if (maxRowsOverride == 0) core.peRows * core.maxFibers
+    else maxRowsOverride
 
   require(maxColumns >= core.maxFibers)
   require((maxColumns & (maxColumns - 1)) == 0,
     "maxColumns must be a power of two for compact circular indexing")
   require(core.macLanes >= core.fiberWidth,
     "one A fiber and one B fiber must always fit without overflow")
+  require(maxRowsOverride >= 0 && maxRows <= core.peRows * core.maxFibers,
+    "tile rows must fit the configured PE-row fiber capacity")
   require(core.localDepthPerBank * core.localWordsPerBank >= maxColumns,
     "each PE-row buffer bank must hold one output row")
 

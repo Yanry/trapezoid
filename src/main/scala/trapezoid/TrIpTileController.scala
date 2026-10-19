@@ -19,7 +19,11 @@ object TrIpTileState extends SpinalEnum {
   * DenseIp and TrIp are both accepted at any input density; mode selection is
   * always controlled by the caller.
   */
-class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
+class TrIpTileController(
+    tileCfg: TrIpTileConfig,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent =
+      cfg => new TrapezoidPERow(cfg)
+) extends Component {
   private val cfg = tileCfg.core
   private val fiberCounterWidth = log2Up(cfg.maxFibers + 1)
   private val peIndexWidth = scala.math.max(1, log2Up(cfg.peRows))
@@ -119,7 +123,7 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
     }
   }
 
-  val pes = Array.fill(cfg.peRows)(new TrapezoidPERow(cfg))
+  val pes = Array.fill(cfg.peRows)(peFactory(cfg))
   val packers = Array.fill(cfg.peRows)(new DynamicColumnPacker(cfg))
 
   val candidateColumns = UInt(fiberCounterWidth bits)
@@ -140,19 +144,25 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
       val globalRow = pe * cfg.maxFibers + fiber
       val inGroup = U(fiber, fiberCounterWidth bits) >= aOffset &&
         U(fiber, fiberCounterWidth bits) < (aOffset + groupSize).resized
-      val validA = inGroup && U(globalRow, tileCfg.rowCountWidth bits) < rowCount &&
-        aLoaded(globalRow) && aStorage(globalRow).valid
+      if (globalRow < tileCfg.maxRows) {
+        val validA = inGroup && U(globalRow, tileCfg.rowCountWidth bits) < rowCount &&
+          aLoaded(globalRow) && aStorage(globalRow).valid
 
-      packers(pe).io.aValid(fiber) := validA
-      packers(pe).io.aMask(fiber) := aStorage(globalRow).mask
-      when(validA) { rowActive(pe) := True }
+        packers(pe).io.aValid(fiber) := validA
+        packers(pe).io.aMask(fiber) := aStorage(globalRow).mask
+        when(validA) { rowActive(pe) := True }
 
-      pes(pe).io.command.payload.trip.a(fiber).valid := validA
-      pes(pe).io.command.payload.trip.a(fiber).tag := aStorage(globalRow).tag
-      pes(pe).io.command.payload.trip.a(fiber).mask := aStorage(globalRow).mask
-      for (value <- 0 until cfg.fiberWidth) {
-        pes(pe).io.command.payload.trip.a(fiber).values(value) :=
-          aStorage(globalRow).values(value)
+        pes(pe).io.command.payload.trip.a(fiber).valid := validA
+        pes(pe).io.command.payload.trip.a(fiber).tag := aStorage(globalRow).tag
+        pes(pe).io.command.payload.trip.a(fiber).mask := aStorage(globalRow).mask
+        for (value <- 0 until cfg.fiberWidth) {
+          pes(pe).io.command.payload.trip.a(fiber).values(value) :=
+            aStorage(globalRow).values(value)
+        }
+      } else {
+        packers(pe).io.aValid(fiber) := False
+        packers(pe).io.aMask(fiber) := 0
+        pes(pe).io.command.payload.trip.a(fiber) := CompressedFiber(cfg).getZero
       }
 
       val columnIndex = (bBase + fiber).resized
@@ -225,26 +235,35 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
     val wordSelected = columnWide >= bBase.resize(tileCfg.columnCountWidth + 1) &&
       columnWide < (bBase.resize(tileCfg.columnCountWidth + 1) +
         batchColumns.resize(tileCfg.columnCountWidth + 1))
-    val rowAvailable = U(globalRow, tileCfg.rowCountWidth bits) < rowCount &&
-      aLoaded(globalRow) && aStorage(globalRow).valid
+    val rowAvailable = Bool()
+    if (globalRow < tileCfg.maxRows) {
+      rowAvailable := U(globalRow, tileCfg.rowCountWidth bits) < rowCount &&
+        aLoaded(globalRow) && aStorage(globalRow).valid
+    } else {
+      rowAvailable := False
+    }
     val columnAvailable = columnWide < columnCount.resize(tileCfg.columnCountWidth + 1) &&
       bLoaded(columnIndex) && bStorage(columnIndex).valid
 
-    for (lane <- 0 until cfg.outputLanes) {
-      val result = responseRegs(pe).results(lane)
-      when(state === TrIpTileState.Scatter && wordSelected && rowAvailable &&
-          columnAvailable && result.valid && result.row === aStorage(globalRow).tag &&
-          result.column === bStorage(columnIndex).tag) {
-        scatterWordValid(slot) := True
-        scatterWordValue(slot) := result.value
+    if (globalRow < tileCfg.maxRows) {
+      for (lane <- 0 until cfg.outputLanes) {
+        val result = responseRegs(pe).results(lane)
+        when(state === TrIpTileState.Scatter && wordSelected && rowAvailable &&
+            columnAvailable && result.valid && result.row === aStorage(globalRow).tag &&
+            result.column === bStorage(columnIndex).tag) {
+          scatterWordValid(slot) := True
+          scatterWordValue(slot) := result.value
+        }
       }
-    }
 
-    val globalCell = U(globalRow * tileCfg.maxColumns, cellIndexWidth bits) +
-      columnIndex.resize(cellIndexWidth)
-    scatterWordExisting(slot) := scatterWordValid(slot) && resultValid(globalCell)
-    when(scatterWordValid(slot)) {
-      resultValid(globalCell) := True
+      val globalCell = U(globalRow * tileCfg.maxColumns, cellIndexWidth bits) +
+        columnIndex.resize(cellIndexWidth)
+      scatterWordExisting(slot) := scatterWordValid(slot) && resultValid(globalCell)
+      when(scatterWordValid(slot)) {
+        resultValid(globalCell) := True
+      }
+    } else {
+      scatterWordExisting(slot) := False
     }
   }
   for (pe <- 0 until cfg.peRows; bank <- cfg.maxFibers until cfg.localBanks;

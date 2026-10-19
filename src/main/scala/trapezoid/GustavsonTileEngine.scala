@@ -14,7 +14,11 @@ object GustavsonTileState extends SpinalEnum {
   * The command carrying endOfTile closes the tile and streams the sorted prefix
   * directly. TrGT and TrGS are both legal at every lane density.
   */
-class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
+class GustavsonTileEngine(
+    tileCfg: GustavsonTileConfig,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent =
+      cfg => new TrapezoidPERow(cfg)
+) extends Component {
   private val cfg = tileCfg.core
   private val responseIndexWidth = scala.math.max(1, log2Up(cfg.outputLanes))
 
@@ -63,7 +67,7 @@ class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
 
   val supportedMode = io.command.payload.mode === TrapezoidDataflow.TrGt ||
     io.command.payload.mode === TrapezoidDataflow.TrGs
-  val pe = new TrapezoidPERow(cfg)
+  val pe = peFactory(cfg)
   pe.io.command.payload := io.command.payload
   pe.io.command.valid := !io.clear && state === GustavsonTileState.Accept &&
     io.command.valid && supportedMode
@@ -234,7 +238,11 @@ class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
   * rows can execute TrGT or TrGS concurrently with independent backpressure.
   * Work assignment and load balancing remain explicit scheduler policies.
   */
-class GustavsonArray(tileCfg: GustavsonTileConfig) extends Component {
+class GustavsonArray(
+    tileCfg: GustavsonTileConfig,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent =
+      cfg => new TrapezoidPERow(cfg)
+) extends Component {
   private val cfg = tileCfg.core
 
   val io = new Bundle {
@@ -248,7 +256,7 @@ class GustavsonArray(tileCfg: GustavsonTileConfig) extends Component {
     val activeEntries = out Vec(UInt(tileCfg.entryCountWidth bits), cfg.peRows)
   }
 
-  val engines = Array.fill(cfg.peRows)(new GustavsonTileEngine(tileCfg))
+  val engines = Array.fill(cfg.peRows)(new GustavsonTileEngine(tileCfg, peFactory))
   for (row <- 0 until cfg.peRows) {
     engines(row).io.clear := io.clear
     engines(row).io.command <> io.commands(row)
@@ -268,7 +276,11 @@ class GustavsonArray(tileCfg: GustavsonTileConfig) extends Component {
   * row flushes.  Result arbitration remains locked through `endOfTile`, so two
   * concurrently executing tiles never interleave on the shared output.
   */
-class GustavsonRowScheduler(tileCfg: GustavsonTileConfig) extends Component {
+class GustavsonRowScheduler(
+    tileCfg: GustavsonTileConfig,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent =
+      cfg => new TrapezoidPERow(cfg)
+) extends Component {
   private val cfg = tileCfg.core
   private val rowIndexWidth = scala.math.max(1, log2Up(cfg.peRows))
 
@@ -284,7 +296,7 @@ class GustavsonRowScheduler(tileCfg: GustavsonTileConfig) extends Component {
     val completedTiles = out UInt(32 bits)
   }
 
-  val array = new GustavsonArray(tileCfg)
+  val array = new GustavsonArray(tileCfg, peFactory)
   array.io.clear := io.clear
   io.busy := array.io.busy
   io.overflow := array.io.overflow

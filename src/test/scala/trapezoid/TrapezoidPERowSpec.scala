@@ -301,6 +301,9 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       }
 
       dut.io.response.ready #= true
+      sleep(1)
+      assert(dut.io.response.valid.toBoolean)
+      assert(dut.io.response.payload.results(0).row.toInt == 1)
       dut.clockDomain.waitSampling()
       dut.io.response.ready #= false
       sleep(1)

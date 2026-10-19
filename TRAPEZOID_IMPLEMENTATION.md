@@ -115,7 +115,7 @@ PE row 已拆分为五个逻辑阶段：
 
 `TrIpTileController` 为每个 PE row 例化独立的四 bank buffer，使用 `A fiber/subrow -> bank`、`B column / 4 -> address`、`B column % 4 -> word` 的映射。一个 `PERowResponse` 的最多 `4 x 4` 个 TrIP 结果会组合匹配到四个 bank 的四个 word，并在一个 scatter 阶段并行掩码写入；跨 K tile 时则并行读出相关 bank line、逐 word 累加后写回。结果最终仍按 row-major 顺序从对应 PE buffer 读回。
 
-该组织在 bank 数、word 数和深度上对应论文的 `4 banks x 4 words x 128 lines`。当前整数验证配置的 word 宽度是 `accumulatorWidth`，paper 配置仍为 72-bit 整数累加值；只有替换成 FP32 数据通路后，物理容量才严格等于论文的 8KB/PE row。论文中 TrGT 的四个 B-row FIFO 也复用这组本地 SRAM；当前 `GustavsonBFifo` 仍是独立 SRAM，尚未与 TrIP scatter buffer 统一到同一物理实例。
+该组织在 bank 数、word 数和深度上对应论文的 `4 banks x 4 words x 128 lines`。当前整数验证配置的 word 宽度是 `accumulatorWidth`，paper 配置仍为 72-bit 整数累加值；只有替换成 FP32 数据通路后，物理容量才严格等于论文的 8KB/PE row。TrGT 的四个 subrow FIFO 已通过一个 `BankedGustavsonBFifo` 共同使用单个四 bank `BankedLocalBuffer`，不再为四个 subrow 分别例化 typed `Mem`。当前 TrIP controller 和 TrGT frontend 仍是独立执行顶层，因此两者尚未通过 mode 所有权仲裁共享同一个物理实例。
 
 ### 2.7 顶层阵列和 RTL 生成
 
@@ -268,7 +268,7 @@ sbt -batch 'runMain trapezoid.GeneratePaperGustavsonTileEngine'
 按照论文 Fig. 15--17 的数据移动方式，新增了：
 
 - `TrGtSubrowScheduler`：将一个 PE row 划分为 4 个逻辑 subrow，每个 subrow 配置独立 B FIFO，每次最多从每个 FIFO 发出一个元素；
-- `GustavsonBFifo`：使用同步 `Mem` 推断本地 SRAM bank，支持预取 head、独立 Stream 背压、occupancy、满队列停顿和环回；
+- `BankedGustavsonBFifo`：四个 subrow queue 共同例化一个 `BankedLocalBuffer`，每个 queue 固定占用一个 bank，并支持同步预取 head、独立 Stream 背压、occupancy、满队列停顿和环回；
 - `TrGsSpatialEngine`：把一个 A 非零值广播到 cache-line 内所有有效 B lane，并使用按输出列索引的 spatial accumulator；一个 PE response 的最多 16 个结果可以在同一周期写入不同列槽，连续 cache line 可以无空拍进入 PE 流水线；结束时可通过 `MatrixResultLine` 每拍并行排出最多 `cacheLineWords` 个有序结果；
 - `TrGsSpatialArray` / `TrGsSpatialRowScheduler`：为每个物理 PE row 配置独立 spatial accumulator，按 tile first-free 分配 PE row；一个 tile 的输出流在共享端口保持锁定到 `endOfTile`，其他 PE row 可并行计算或等待输出；通过编译期参数在兼容的 scalar 结果流与 cache-line 宽结果流之间选择，不会同时实例化两套排空数据通路；
 - `GustavsonArray`：为每个 PE row 复制独立的 Gustavson accumulator、命令/结果 Stream 和状态接口；
@@ -283,7 +283,7 @@ sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialEngine'
 sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 ```
 
-这些模块已经实现论文数据移动方式的功能等价路径。paper 生成入口启用 16-result 宽写回：128 个 accumulator 槽被划分为 8 个对齐 line，全空 line 会被跳过，每个非空 line 使用一拍排空，满 C row 从 128 拍降为 8 拍。该结构避免了把任意 128 个槽全局压缩到 16 lane 所需的大型 compactor，更接近本地 bank/line 读取。TrGT FIFO 已使用四个同步 memory bank，但由于 B 元素包含 `aIndex/k/column/value`，其 typed word 宽度不同于当前结果 buffer；两种用途尚未统一成同一个可切换的 `BankedLocalBuffer` 实例。TrGS 已删除通用 Gustavson accumulator 对 PE response 逐项串行插入和逐项输出的周期瓶颈，其列槽对应论文中每个乘法器负责一个 C-row 位置的空间累加方式；当前仍通过带坐标的组合适配完成分发，尚未替换为流水化物理分发网络。
+这些模块已经实现论文数据移动方式的功能等价路径。paper 生成入口启用 16-result 宽写回：128 个 accumulator 槽被划分为 8 个对齐 line，全空 line 会被跳过，每个非空 line 使用一拍排空，满 C row 从 128 拍降为 8 拍。该结构避免了把任意 128 个槽全局压缩到 16 lane 所需的大型 compactor，更接近本地 bank/line 读取。TrGT 的四路 FIFO 已统一到一个四 bank `BankedLocalBuffer`，但该实例还没有与 TrIP controller 的结果 buffer 进行 mode 级共享。TrGS accumulator 现在只为每个 slot 保存 valid/value，整行共享一个 row 和对齐 column-block 基址，删除了 128 份重复 row/column 寄存器及其翻转；跨 row 或跨 column block 的输入会置 overflow。当前仍通过带坐标的组合适配完成分发，尚未替换为流水化物理分发网络。
 
 ### 2.12 矩阵描述符与外层 M/N/K 循环
 
@@ -524,7 +524,7 @@ paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用�
 
 当前 TrGT/TrGS 已能在任意 lane density 下完成命令内归约、跨命令累加、有序 flush、SRAM subrow FIFO 调度、多 PE row 分配和共享结果仲裁，但尚未完成：
 
-- 将 TrGT typed FIFO bank 与 TrIP 结果 buffer 统一成可按 mode 切换的同一组物理 SRAM；
+- 在统一执行顶层中增加 mode 所有权仲裁，让 TrGT 的 `BankedLocalBuffer` 与 TrIP 结果 buffer 共享同一个物理实例；
 - 将当前有序寄存器 accumulator 替换为可扩展的本地 buffer/双流 merge tree；
 - 在 first-free 分配之上增加 row 成本估计、公平仲裁和描述符驱动的负载均衡；
 - 从 CSR row pointer 自动生成 B-row cache 区间，以及 DMA/HBM refill 流程。

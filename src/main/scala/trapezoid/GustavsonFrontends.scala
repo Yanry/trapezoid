@@ -3,66 +3,89 @@ package trapezoid
 import spinal.core._
 import spinal.lib._
 
-/** SRAM-backed synchronous FIFO used by one TrGT PE subrow.
+/** Four independent TrGT queues stored in one physical PE-local buffer.
   *
-  * The memory models one bank of the PE-local buffer.  One prefetched head
-  * element keeps the Stream payload stable while the consumer is stalled.
+  * Each subrow owns one bank. One prefetched element per bank keeps Stream
+  * payloads stable under backpressure while preserving one pop per subrow and
+  * cycle, as required by TrGT.
   */
-class GustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
+class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
   private val pointerWidth = scala.math.max(1, log2Up(depth))
   private val countWidth = log2Up(depth + 1)
+  private val recordWidth = 1 + cfg.aRegisterIndexWidth +
+    2 * cfg.coordinateWidth + cfg.dataWidth
+  require(depth <= cfg.localDepthPerBank)
+  require(recordWidth <= cfg.localLineWidth,
+    "one local-buffer line must hold one packed TrGT B element")
 
   val io = new Bundle {
     val clear = in Bool()
-    val push = slave(Stream(GustavsonB(cfg)))
-    val pop = master(Stream(GustavsonB(cfg)))
-    val occupancy = out UInt(countWidth bits)
+    val pushes = Vec(slave(Stream(GustavsonB(cfg))), cfg.localBanks)
+    val pops = Vec(master(Stream(GustavsonB(cfg))), cfg.localBanks)
+    val occupancy = out Vec(UInt(countWidth bits), cfg.localBanks)
   }
 
-  val storage = Mem(GustavsonB(cfg), depth)
-  val readPointer = Reg(UInt(pointerWidth bits)) init 0
-  val writePointer = Reg(UInt(pointerWidth bits)) init 0
-  val occupancy = Reg(UInt(countWidth bits)) init 0
-  val storedCount = Reg(UInt(countWidth bits)) init 0
-  val outputValid = RegInit(False)
+  val storage = new BankedLocalBuffer(cfg)
+  val readPointers = Vec((0 until cfg.localBanks).map(_ =>
+    Reg(UInt(pointerWidth bits)) init 0))
+  val writePointers = Vec((0 until cfg.localBanks).map(_ =>
+    Reg(UInt(pointerWidth bits)) init 0))
+  val occupancies = Vec((0 until cfg.localBanks).map(_ =>
+    Reg(UInt(countWidth bits)) init 0))
+  val storedCounts = Vec((0 until cfg.localBanks).map(_ =>
+    Reg(UInt(countWidth bits)) init 0))
+  val outputValids = Vec((0 until cfg.localBanks).map(_ => RegInit(False)))
 
-  // Conservatively stop writes while full so a bank never depends on a
-  // particular read-during-write behavior from the target SRAM.
-  io.push.ready := !io.clear && occupancy =/= depth
-  io.pop.valid := !io.clear && outputValid
-  io.occupancy := occupancy
+  for (bank <- 0 until cfg.localBanks) {
+    io.pushes(bank).ready := !io.clear && occupancies(bank) =/= depth
+    io.pops(bank).valid := !io.clear && outputValids(bank)
+    io.pops(bank).payload.assignFromBits(
+      storage.io.bus.readResponses(bank).payload(recordWidth - 1 downto 0))
+    io.occupancy(bank) := occupancies(bank)
 
-  when(io.push.fire) {
-    storage.write(writePointer, io.push.payload)
-    when(writePointer === depth - 1) { writePointer := 0 }
-      .otherwise { writePointer := writePointer + 1 }
-  }
+    val writeData = Bits(cfg.localLineWidth bits)
+    writeData := 0
+    writeData(recordWidth - 1 downto 0) := io.pushes(bank).payload.asBits
+    storage.io.bus.writes(bank).valid := io.pushes(bank).fire
+    storage.io.bus.writes(bank).payload.address :=
+      writePointers(bank).resize(cfg.localAddressWidth)
+    storage.io.bus.writes(bank).payload.data := writeData
+    storage.io.bus.writes(bank).payload.mask.setAll()
 
-  val issueRead = !io.clear && storedCount =/= 0 && (!outputValid || io.pop.fire)
-  val readPayload = storage.readSync(readPointer, issueRead)
-  io.pop.payload := readPayload
-  when(issueRead) {
-    when(readPointer === depth - 1) { readPointer := 0 }
-      .otherwise { readPointer := readPointer + 1 }
-  }
+    val issueRead = !io.clear && storedCounts(bank) =/= 0 &&
+      (!outputValids(bank) || io.pops(bank).fire)
+    storage.io.bus.readCommands(bank).valid := issueRead
+    storage.io.bus.readCommands(bank).payload :=
+      readPointers(bank).resize(cfg.localAddressWidth)
 
-  switch(io.push.fire ## issueRead) {
-    is(B"10") { storedCount := storedCount + 1 }
-    is(B"01") { storedCount := storedCount - 1 }
-  }
-  outputValid := (outputValid && !io.pop.fire) || issueRead
+    when(io.pushes(bank).fire) {
+      when(writePointers(bank) === depth - 1) { writePointers(bank) := 0 }
+        .otherwise { writePointers(bank) := writePointers(bank) + 1 }
+    }
+    when(issueRead) {
+      when(readPointers(bank) === depth - 1) { readPointers(bank) := 0 }
+        .otherwise { readPointers(bank) := readPointers(bank) + 1 }
+    }
 
-  switch(io.push.fire ## io.pop.fire) {
-    is(B"10") { occupancy := occupancy + 1 }
-    is(B"01") { occupancy := occupancy - 1 }
-  }
+    switch(io.pushes(bank).fire ## issueRead) {
+      is(B"10") { storedCounts(bank) := storedCounts(bank) + 1 }
+      is(B"01") { storedCounts(bank) := storedCounts(bank) - 1 }
+    }
+    outputValids(bank) :=
+      (outputValids(bank) && !io.pops(bank).fire) || issueRead
 
-  when(io.clear) {
-    readPointer := 0
-    writePointer := 0
-    occupancy := 0
-    storedCount := 0
-    outputValid := False
+    switch(io.pushes(bank).fire ## io.pops(bank).fire) {
+      is(B"10") { occupancies(bank) := occupancies(bank) + 1 }
+      is(B"01") { occupancies(bank) := occupancies(bank) - 1 }
+    }
+
+    when(io.clear) {
+      readPointers(bank) := 0
+      writePointers(bank) := 0
+      occupancies(bank) := 0
+      storedCounts(bank) := 0
+      outputValids(bank) := False
+    }
   }
 }
 
@@ -104,13 +127,13 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
   io.acceptedBElements := acceptedBElements
   io.issuedBElements := issuedBElements
 
-  val fifos = Array.fill(subrows)(new GustavsonBFifo(cfg, tileCfg.fifoDepthPerSubrow))
+  val fifos = new BankedGustavsonBFifo(cfg, tileCfg.fifoDepthPerSubrow)
+  fifos.io.clear := io.clear
   for (subrow <- 0 until subrows) {
-    fifos(subrow).io.clear := io.clear
-    fifos(subrow).io.push.valid := io.bPush(subrow).valid && running && !finishSeen
-    fifos(subrow).io.push.payload := io.bPush(subrow).payload
-    io.bPush(subrow).ready := fifos(subrow).io.push.ready && running && !finishSeen
-    io.fifoOccupancy(subrow) := fifos(subrow).io.occupancy
+    fifos.io.pushes(subrow).valid := io.bPush(subrow).valid && running && !finishSeen
+    fifos.io.pushes(subrow).payload := io.bPush(subrow).payload
+    io.bPush(subrow).ready := fifos.io.pushes(subrow).ready && running && !finishSeen
+    io.fifoOccupancy(subrow) := fifos.io.occupancy(subrow)
   }
 
   val engine = new GustavsonTileEngine(tileCfg)
@@ -150,14 +173,14 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
   val issuedBits = Bits(subrows bits)
   for (subrow <- 0 until subrows) {
     acceptedBits(subrow) := io.bPush(subrow).fire
-    issuedBits(subrow) := fifos(subrow).io.pop.fire
+    issuedBits(subrow) := fifos.io.pops(subrow).fire
   }
   val acceptedThisCycle = CountOne(acceptedBits).resize(32)
   when(acceptedThisCycle =/= 0) {
     acceptedBElements := acceptedBElements + acceptedThisCycle
   }
 
-  val anyFifoValid = fifos.map(_.io.pop.valid).reduce(_ || _)
+  val anyFifoValid = fifos.io.pops.map(_.valid).reduce(_ || _)
   val issueFinal = running && finishSeen && !anyFifoValid
   val scheduledCommand = PERowCommand(cfg)
   scheduledCommand.mode := TrapezoidDataflow.TrGt
@@ -171,11 +194,11 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
   }
   for (lane <- 0 until cfg.cacheLineWords) {
     if (lane < subrows) {
-      scheduledCommand.gustavson.b(lane).valid := fifos(lane).io.pop.valid
-      scheduledCommand.gustavson.b(lane).aIndex := fifos(lane).io.pop.payload.aIndex
-      scheduledCommand.gustavson.b(lane).k := fifos(lane).io.pop.payload.k
-      scheduledCommand.gustavson.b(lane).column := fifos(lane).io.pop.payload.column
-      scheduledCommand.gustavson.b(lane).value := fifos(lane).io.pop.payload.value
+      scheduledCommand.gustavson.b(lane).valid := fifos.io.pops(lane).valid
+      scheduledCommand.gustavson.b(lane).aIndex := fifos.io.pops(lane).payload.aIndex
+      scheduledCommand.gustavson.b(lane).k := fifos.io.pops(lane).payload.k
+      scheduledCommand.gustavson.b(lane).column := fifos.io.pops(lane).payload.column
+      scheduledCommand.gustavson.b(lane).value := fifos.io.pops(lane).payload.value
     } else {
       scheduledCommand.gustavson.b(lane) := GustavsonB(cfg).getZero
     }
@@ -184,7 +207,7 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
   engine.io.command.valid := !io.clear && running && (anyFifoValid || issueFinal)
   engine.io.command.payload := scheduledCommand
   for (subrow <- 0 until subrows) {
-    fifos(subrow).io.pop.ready := engine.io.command.fire && anyFifoValid
+    fifos.io.pops(subrow).ready := engine.io.command.fire && anyFifoValid
   }
   val issuedThisCycle = CountOne(issuedBits).resize(32)
   when(issuedThisCycle =/= 0) {
@@ -249,12 +272,11 @@ class TrGsSpatialEngine(
   val inFlight = Reg(UInt(inFlightWidth bits)) init 0
   val outputCursor = Reg(UInt(tileCfg.entryIndexWidth bits)) init 0
   val outputGroupCursor = Reg(UInt(writebackGroupIndexWidth bits)) init 0
+  val tileRow = Reg(UInt(cfg.coordinateWidth bits)) init 0
+  val tileColumnBase = Reg(UInt(cfg.coordinateWidth bits)) init 0
+  val columnBlockValid = RegInit(False)
 
   val slotValid = Vec((0 until slots).map(_ => RegInit(False)))
-  val slotRow = Vec((0 until slots).map(_ =>
-    Reg(UInt(cfg.coordinateWidth bits)) init 0))
-  val slotColumn = Vec((0 until slots).map(_ =>
-    Reg(UInt(cfg.coordinateWidth bits)) init 0))
   val slotValue = Vec((0 until slots).map(_ =>
     Reg(SInt(cfg.accumulatorWidth bits)) init 0))
 
@@ -296,6 +318,33 @@ class TrGsSpatialEngine(
     (state === TrGsSpatialState.Run || state === TrGsSpatialState.AbortDrain)
 
   val response = pe.io.response.payload
+  val commandColumnChoices = Vec(Bool(), cfg.cacheLineWords)
+  var earlierCommandColumn: Bool = False
+  for (lane <- 0 until cfg.cacheLineWords) {
+    commandColumnChoices(lane) := io.command.payload.b(lane).valid &&
+      !earlierCommandColumn
+    earlierCommandColumn = earlierCommandColumn || io.command.payload.b(lane).valid
+  }
+  val commandHasColumn = commandColumnChoices.asBits.orR
+  val commandFirstColumn = UInt(cfg.coordinateWidth bits)
+  commandFirstColumn := 0
+  for (lane <- 0 until cfg.cacheLineWords) {
+    when(commandColumnChoices(lane)) {
+      commandFirstColumn := io.command.payload.b(lane).column
+    }
+  }
+  val commandColumnBase = UInt(cfg.coordinateWidth bits)
+  commandColumnBase := commandFirstColumn
+  commandColumnBase(tileCfg.entryIndexWidth - 1 downto 0) := 0
+  var commandColumnMismatch: Bool = False
+  for (lane <- 0 until cfg.cacheLineWords) {
+    val laneColumnBase = UInt(cfg.coordinateWidth bits)
+    laneColumnBase := io.command.payload.b(lane).column
+    laneColumnBase(tileCfg.entryIndexWidth - 1 downto 0) := 0
+    commandColumnMismatch = commandColumnMismatch ||
+      (io.command.payload.b(lane).valid && laneColumnBase =/= commandColumnBase)
+  }
+
   var responseConflict: Bool = False
   for (lane <- 0 until cfg.outputLanes;
        earlier <- 0 until lane) {
@@ -311,9 +360,12 @@ class TrGsSpatialEngine(
   for (lane <- 0 until cfg.outputLanes) {
     val result = response.results(lane)
     val slot = result.column(tileCfg.entryIndexWidth - 1 downto 0)
-    val coordinateCollision = slotValid(slot) &&
-      (slotRow(slot) =/= result.row || slotColumn(slot) =/= result.column)
-    newEntry(lane) := result.valid && !slotValid(slot)
+    val expectedColumn = UInt(cfg.coordinateWidth bits)
+    expectedColumn := tileColumnBase |
+      slot.resize(cfg.coordinateWidth)
+    val coordinateCollision = tileRow =/= result.row ||
+      expectedColumn =/= result.column
+    newEntry(lane) := result.valid && !coordinateCollision && !slotValid(slot)
     when(accumulateResponse && result.valid && !responseConflict) {
       when(coordinateCollision) {
         overflowReg := True
@@ -324,8 +376,6 @@ class TrGsSpatialEngine(
               slotValue(entry) := (slotValue(entry) + result.value).resized
             } otherwise {
               slotValid(entry) := True
-              slotRow(entry) := result.row
-              slotColumn(entry) := result.column
               slotValue(entry) := result.value
             }
           }
@@ -354,8 +404,9 @@ class TrGsSpatialEngine(
   }
 
   io.result.payload.valid := True
-  io.result.payload.row := slotRow(outputSlot)
-  io.result.payload.column := slotColumn(outputSlot)
+  io.result.payload.row := tileRow
+  io.result.payload.column := tileColumnBase |
+    outputSlot.resize(cfg.coordinateWidth)
   io.result.payload.value := slotValue(outputSlot)
   io.result.payload.endOfTile := !laterOutput.asBits.orR
 
@@ -397,8 +448,9 @@ class TrGsSpatialEngine(
       when(lineGroup === group) {
         lineValids(lane) := slotValid(entry)
         io.resultLine.payload.results(lane).valid := slotValid(entry)
-        io.resultLine.payload.results(lane).row := slotRow(entry)
-        io.resultLine.payload.results(lane).column := slotColumn(entry)
+        io.resultLine.payload.results(lane).row := tileRow
+        io.resultLine.payload.results(lane).column := tileColumnBase |
+          U(entry, cfg.coordinateWidth bits)
         io.resultLine.payload.results(lane).value := slotValue(entry)
       }
     }
@@ -430,7 +482,10 @@ class TrGsSpatialEngine(
         doneReg := False
         when(supportedMode) {
           for (entry <- 0 until slots) slotValid(entry) := False
-          overflowReg := False
+          tileRow := io.command.payload.a.row
+          tileColumnBase := commandColumnBase
+          columnBlockValid := commandHasColumn
+          overflowReg := commandColumnMismatch
           modeErrorReg := False
           inputClosed := io.command.payload.endOfTile
           state := TrGsSpatialState.Run
@@ -442,6 +497,17 @@ class TrGsSpatialEngine(
     }
 
     is(TrGsSpatialState.Run) {
+      when(commandFire) {
+        when(io.command.payload.a.row =/= tileRow || commandColumnMismatch ||
+            (columnBlockValid && commandHasColumn &&
+              commandColumnBase =/= tileColumnBase)) {
+          overflowReg := True
+        }
+        when(!columnBlockValid && commandHasColumn) {
+          tileColumnBase := commandColumnBase
+          columnBlockValid := True
+        }
+      }
       when(commandFire && io.command.payload.endOfTile) {
         inputClosed := True
       }
@@ -495,6 +561,7 @@ class TrGsSpatialEngine(
 
   when(io.clear) {
     for (entry <- 0 until slots) slotValid(entry) := False
+    columnBlockValid := False
     inputClosed := False
     doneReg := False
     overflowReg := False

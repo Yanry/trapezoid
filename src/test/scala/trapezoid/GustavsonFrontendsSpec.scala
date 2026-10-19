@@ -26,54 +26,63 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     .addSimulatorFlag("-CFLAGS -std=c++14")
     .addSimulatorFlag("-LDFLAGS -std=c++14")
 
-  test("SRAM-backed Gustavson FIFO preserves order across full stalls and wrap-around") {
-    simConfig.compile(new GustavsonBFifo(cfg, depth = 2)).doSim { dut =>
+  test("banked Gustavson FIFO preserves independent order across stalls and wrap-around") {
+    simConfig.compile(new BankedGustavsonBFifo(cfg, depth = 2)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       dut.io.clear #= false
-      dut.io.push.valid #= false
-      dut.io.pop.ready #= false
-
-      def drivePush(column: Int, value: Int): Unit = {
-        dut.io.push.payload.valid #= true
-        dut.io.push.payload.aIndex #= 0
-        dut.io.push.payload.k #= 0
-        dut.io.push.payload.column #= column
-        dut.io.push.payload.value #= value
-        dut.io.push.valid #= true
-        sleep(1)
-        while (!dut.io.push.ready.toBoolean) dut.clockDomain.waitSampling()
-        dut.clockDomain.waitSampling()
-        sleep(1)
-        dut.io.push.valid #= false
+      for (bank <- 0 until cfg.localBanks) {
+        dut.io.pushes(bank).valid #= false
+        dut.io.pops(bank).ready #= false
       }
 
-      def popOne(): (Int, Int) = {
-        dut.io.pop.ready #= true
+      def drivePush(bank: Int, column: Int, value: Int): Unit = {
+        val push = dut.io.pushes(bank)
+        push.payload.valid #= true
+        push.payload.aIndex #= bank
+        push.payload.k #= bank
+        push.payload.column #= column
+        push.payload.value #= value
+        push.valid #= true
         sleep(1)
-        while (!dut.io.pop.valid.toBoolean) dut.clockDomain.waitSampling()
-        val result = (dut.io.pop.payload.column.toInt, dut.io.pop.payload.value.toInt)
+        while (!push.ready.toBoolean) dut.clockDomain.waitSampling()
         dut.clockDomain.waitSampling()
         sleep(1)
-        dut.io.pop.ready #= false
+        push.valid #= false
+      }
+
+      def popOne(bank: Int): (Int, Int, Int) = {
+        val pop = dut.io.pops(bank)
+        pop.ready #= true
+        sleep(1)
+        while (!pop.valid.toBoolean) dut.clockDomain.waitSampling()
+        val result = (pop.payload.aIndex.toInt, pop.payload.column.toInt,
+          pop.payload.value.toInt)
+        dut.clockDomain.waitSampling()
+        sleep(1)
+        pop.ready #= false
         result
       }
 
-      drivePush(1, 11)
-      drivePush(2, 22)
-      assert(dut.io.occupancy.toInt == 2)
+      drivePush(0, 1, 11)
+      drivePush(0, 2, 22)
+      drivePush(1, 7, 77)
+      assert(dut.io.occupancy(0).toInt == 2)
+      assert(dut.io.occupancy(1).toInt == 1)
 
-      dut.io.push.payload.column #= 3
-      dut.io.push.payload.value #= 33
-      dut.io.push.valid #= true
+      dut.io.pushes(0).payload.column #= 3
+      dut.io.pushes(0).payload.value #= 33
+      dut.io.pushes(0).valid #= true
       sleep(1)
-      assert(!dut.io.push.ready.toBoolean)
-      dut.io.push.valid #= false
+      assert(!dut.io.pushes(0).ready.toBoolean)
+      dut.io.pushes(0).valid #= false
 
-      assert(popOne() == (1, 11))
-      drivePush(3, 33)
-      assert(popOne() == (2, 22))
-      assert(popOne() == (3, 33))
-      assert(dut.io.occupancy.toInt == 0)
+      assert(popOne(1) == (1, 7, 77))
+      assert(popOne(0) == (0, 1, 11))
+      drivePush(0, 3, 33)
+      assert(popOne(0) == (0, 2, 22))
+      assert(popOne(0) == (0, 3, 33))
+      assert(dut.io.occupancy(0).toInt == 0)
+      assert(dut.io.occupancy(1).toInt == 0)
     }
   }
 
@@ -283,6 +292,35 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
         (7, 0, 6L), (7, 1, 12L), (7, 2, 18L), (7, 3, 24L)))
       assert(!dut.io.overflow.toBoolean)
       assert(!dut.io.unsupportedMode.toBoolean)
+    }
+  }
+
+  test("TrGS rejects coordinates from more than one accumulator column block") {
+    simConfig.compile(new TrGsSpatialEngine(tileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      initializeTrGs(dut)
+      dut.io.result.ready #= true
+
+      issueTrGs(dut, k = 0, aValue = 2,
+        Seq(Some(0 -> 1), Some(1 -> 2), None, None), endOfTile = false)
+      issueTrGs(dut, k = 1, aValue = 3,
+        Seq(None, None, None, Some(11 -> 5)), endOfTile = true)
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 200) {
+        sleep(1)
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(dut.io.done.toBoolean)
+      assert(dut.io.overflow.toBoolean)
+      assert(observed == Seq((6, 0, 2L), (6, 1, 4L)))
     }
   }
 

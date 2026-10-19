@@ -504,6 +504,29 @@ paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用�
 - 研究 MFIU、动态列打包和 merge/reduction 行为；
 - 作为后续调度器、cache 层次和 FPGA/ASIC 综合工作的基础。
 
+### 3.5 Cache-to-result 端到端 RTL 周期仿真
+
+`EndToEndCycleSimulation` 使用同一个确定性 `16 x 16` 矩阵分别运行四种 mode，逐元素检查 RTL 输出，并从任务边界持续计数到最后结果握手。该入口使用显式的 4 PE row、每行 16 MAC 配置而不是 `TrapezoidConfig.small`，同时包含冷 cache lookup、bank 仲裁、固定 12-cycle HBM refill、PE 流水、跨命令或跨 K tile 累加以及结果排空：
+
+```bash
+sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
+```
+
+输出表包含总周期、首结果周期、输入接收完成周期、HBM active 周期、refill/hit/miss 数量、结果数量和 checksum。DenseIp/TrIP 的起点是 cached matrix descriptor 握手；TrGT/TrGS 当前缺少矩阵描述符前端，因此起点是第一条 cached B-row command 握手。终点是最后一个结果完成握手且所有 output tile 完成。测试使用始终 ready 的结果接收端，因此没有人为加入输出背压。
+
+当前固定输入的运行结果如下。四种 mode 均输出 256 个结果并得到相同 checksum `2099851`：
+
+| Mode | 总周期 | 首结果周期 | 输入接收完成周期 | HBM active 周期 | Refill | Hit | Miss |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `DenseIp` | 2219 | 875 | 1 | 611 | 64 | 32 | 64 |
+| `TrIp` | 2283 | 907 | 1 | 611 | 64 | 32 | 64 |
+| `TrGt` | 28842 | 1975 | 28707 | 768 | 64 | 960 | 64 |
+| `TrGs` | 4439 | 1062 | 4403 | 768 | 64 | 960 | 64 |
+
+这里使用全稠密矩阵来保证四种数据流执行完全相同的 MAC 集合。TrGT 的大部分周期来自当前 temporal adapter 逐个发送 B 元素；TrGS 以 cache line 为单位空间展开，因此明显缩短输入阶段。该差异反映当前 RTL 的真实握手行为，但不能直接替代论文在各 mode 推荐稀疏度和完整系统配置下的性能结果。
+
+该数字是当前 RTL 的 cache-to-result 端到端周期，而不是论文完整系统周期。Gustavson A/CSR pointer 读取、四 cluster cache、真实 HBM channel/queue、DMA 和最终 C 写回仍在边界之外；这些模块完成后，应保持同一个计时接口，将起点前移到统一矩阵描述符，将终点后移到最后一次 C 写响应。
+
 它目前还不是可以直接连接 HBM 并独立执行完整矩阵乘法的加速器系统。
 
 ## 4. 当前限制

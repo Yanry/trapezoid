@@ -14,7 +14,8 @@ object TrIpTileState extends SpinalEnum {
   * partitions A fibers when necessary, finds a B-column prefix that fits every
   * active PE row, dispatches all rows atomically, scatters results into the
   * PE-row-private four-bank local buffers, and reads them back in row-major
-  * load order. All PE rows scatter the same response lane in parallel.
+  * load order. Every PE row matches all response lanes to the four banks at
+  * one line address and scatters all four-word lines in one controller stage.
   * DenseIp and TrIp are both accepted at any input density; mode selection is
   * always controlled by the caller.
   */
@@ -22,10 +23,11 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
   private val cfg = tileCfg.core
   private val fiberCounterWidth = log2Up(cfg.maxFibers + 1)
   private val peIndexWidth = scala.math.max(1, log2Up(cfg.peRows))
-  private val outputIndexWidth = scala.math.max(1, log2Up(cfg.outputLanes))
   private val cellCount = tileCfg.maxRows * tileCfg.maxColumns
   private val cellIndexWidth = scala.math.max(1, log2Up(cellCount))
   private val bankIndexWidth = log2Up(cfg.localBanks)
+  private val pendingLineCount = cfg.peRows * cfg.localBanks
+  private val pendingWordCount = pendingLineCount * cfg.localWordsPerBank
 
   val io = new Bundle {
     val clear = in Bool()
@@ -62,18 +64,18 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
   val groupSize = Reg(UInt(fiberCounterWidth bits)) init cfg.maxFibers
   val bBase = Reg(UInt(tileCfg.columnIndexWidth bits)) init 0
   val batchColumns = Reg(UInt(fiberCounterWidth bits)) init 1
-  val scatterLane = Reg(UInt(outputIndexWidth bits)) init 0
   val outputCell = Reg(UInt(cellIndexWidth bits)) init 0
   val modeError = RegInit(False)
   val doneReg = RegInit(False)
   val commandInFlight = RegInit(False)
   val accumulationOpen = RegInit(False)
   val lastKTile = RegInit(True)
-  val pendingValid = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
-  val pendingBank = Vec((0 until cfg.peRows).map(_ => Reg(UInt(bankIndexWidth bits)) init 0))
-  val pendingAddress = Vec((0 until cfg.peRows).map(_ =>
+  val pendingValid = Vec((0 until pendingLineCount).map(_ => RegInit(False)))
+  val pendingAddress = Vec((0 until pendingLineCount).map(_ =>
     Reg(UInt(cfg.localAddressWidth bits)) init 0))
-  val pendingValue = Vec((0 until cfg.peRows).map(_ =>
+  val pendingWordValid = Vec((0 until pendingWordCount).map(_ => RegInit(False)))
+  val pendingWordExisting = Vec((0 until pendingWordCount).map(_ => RegInit(False)))
+  val pendingWordValue = Vec((0 until pendingWordCount).map(_ =>
     Reg(SInt(cfg.accumulatorWidth bits)) init 0))
   val outputReg = Reg(MatrixResult(cfg))
   val resultValid = Vec((0 until cellCount).map(_ => RegInit(False)))
@@ -94,7 +96,7 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
   when(io.clear) {
     for (index <- 0 until tileCfg.maxRows) aLoaded(index) := False
     for (index <- 0 until tileCfg.maxColumns) bLoaded(index) := False
-    for (pe <- 0 until cfg.peRows) pendingValid(pe) := False
+    for (line <- 0 until pendingLineCount) pendingValid(line) := False
     modeError := False
     doneReg := False
     for (cell <- 0 until cellCount) resultValid(cell) := False
@@ -123,8 +125,13 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
   val candidateColumns = UInt(fiberCounterWidth bits)
   val remainingColumns = UInt(tileCfg.columnCountWidth bits)
   remainingColumns := columnCount - bBase.resize(tileCfg.columnCountWidth)
-  candidateColumns := Mux(remainingColumns > cfg.maxFibers,
+  val fiberLimitedColumns = Mux(remainingColumns > cfg.maxFibers,
     U(cfg.maxFibers, fiberCounterWidth bits), remainingColumns.resize(fiberCounterWidth))
+  val lineOffset = bBase.resize(cfg.localWordIndexWidth)
+  val lineRemaining = U(cfg.localWordsPerBank, cfg.localWordIndexWidth + 1 bits) -
+    lineOffset.resize(cfg.localWordIndexWidth + 1)
+  candidateColumns := Mux(fiberLimitedColumns.resize(cfg.localWordIndexWidth + 1) >
+    lineRemaining, lineRemaining.resize(fiberCounterWidth), fiberLimitedColumns)
 
   val rowActive = Vec(Bool(), cfg.peRows)
   for (pe <- 0 until cfg.peRows) {
@@ -194,52 +201,66 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
         state === TrIpTileState.AbortDrain
   }
 
-  val maxResponseCount = responseRegs.map(_.count)
-    .reduce((left, right) => Mux(left > right, left, right))
-
   val localBuffers = Array.fill(cfg.peRows)(new BankedLocalBuffer(cfg))
-  val currentResults = Vec((0 until cfg.peRows).map(pe =>
-    responseRegs(pe).results(scatterLane)))
-  val scatterRowFound = Vec(Bool(), cfg.peRows)
-  val scatterLocalRow = Vec(UInt(cfg.fiberIndexWidth bits), cfg.peRows)
-  val scatterColumnFound = Vec(Bool(), cfg.peRows)
-  val scatterColumn = Vec(UInt(tileCfg.columnIndexWidth bits), cfg.peRows)
-  val scatterGlobalCell = Vec(UInt(cellIndexWidth bits), cfg.peRows)
-  val scatterBank = Vec(UInt(bankIndexWidth bits), cfg.peRows)
-  val scatterAddress = Vec(UInt(cfg.localAddressWidth bits), cfg.peRows)
-  val scatterNeedsAccumulation = Vec(Bool(), cfg.peRows)
+  val scatterWordValid = Vec(Bool(), pendingWordCount)
+  val scatterWordExisting = Vec(Bool(), pendingWordCount)
+  val scatterWordValue = Vec(SInt(cfg.accumulatorWidth bits), pendingWordCount)
+  for (word <- 0 until pendingWordCount) {
+    scatterWordValid(word) := False
+    scatterWordValue(word) := 0
+  }
 
-  for (pe <- 0 until cfg.peRows) {
-    scatterRowFound(pe) := False
-    scatterLocalRow(pe) := 0
-    for (fiber <- 0 until cfg.maxFibers) {
-      val globalRow = pe * cfg.maxFibers + fiber
-      when(aLoaded(globalRow) && U(globalRow, tileCfg.rowCountWidth bits) < rowCount &&
-          aStorage(globalRow).tag === currentResults(pe).row) {
-        scatterRowFound(pe) := True
-        scatterLocalRow(pe) := fiber
+  val scatterLineAddress = (bBase >> cfg.localWordIndexWidth)
+    .resize(cfg.localAddressWidth)
+  val scatterLineBase = (bBase.resize(tileCfg.columnCountWidth + 1) >>
+    cfg.localWordIndexWidth) << cfg.localWordIndexWidth
+
+  for (pe <- 0 until cfg.peRows; fiber <- 0 until cfg.maxFibers;
+       word <- 0 until cfg.localWordsPerBank) {
+    val line = pe * cfg.localBanks + fiber
+    val slot = line * cfg.localWordsPerBank + word
+    val globalRow = pe * cfg.maxFibers + fiber
+    val columnWide = scatterLineBase + word
+    val columnIndex = columnWide.resize(tileCfg.columnIndexWidth)
+    val wordSelected = columnWide >= bBase.resize(tileCfg.columnCountWidth + 1) &&
+      columnWide < (bBase.resize(tileCfg.columnCountWidth + 1) +
+        batchColumns.resize(tileCfg.columnCountWidth + 1))
+    val rowAvailable = U(globalRow, tileCfg.rowCountWidth bits) < rowCount &&
+      aLoaded(globalRow) && aStorage(globalRow).valid
+    val columnAvailable = columnWide < columnCount.resize(tileCfg.columnCountWidth + 1) &&
+      bLoaded(columnIndex) && bStorage(columnIndex).valid
+
+    for (lane <- 0 until cfg.outputLanes) {
+      val result = responseRegs(pe).results(lane)
+      when(state === TrIpTileState.Scatter && wordSelected && rowAvailable &&
+          columnAvailable && result.valid && result.row === aStorage(globalRow).tag &&
+          result.column === bStorage(columnIndex).tag) {
+        scatterWordValid(slot) := True
+        scatterWordValue(slot) := result.value
       }
     }
 
-    scatterColumnFound(pe) := False
-    scatterColumn(pe) := 0
-    for (column <- 0 until tileCfg.maxColumns) {
-      when(bLoaded(column) && U(column, tileCfg.columnCountWidth bits) < columnCount &&
-          bStorage(column).tag === currentResults(pe).column) {
-        scatterColumnFound(pe) := True
-        scatterColumn(pe) := column
-      }
+    val globalCell = U(globalRow * tileCfg.maxColumns, cellIndexWidth bits) +
+      columnIndex.resize(cellIndexWidth)
+    scatterWordExisting(slot) := scatterWordValid(slot) && resultValid(globalCell)
+    when(scatterWordValid(slot)) {
+      resultValid(globalCell) := True
     }
+  }
+  for (pe <- 0 until cfg.peRows; bank <- cfg.maxFibers until cfg.localBanks;
+       word <- 0 until cfg.localWordsPerBank) {
+    val slot = (pe * cfg.localBanks + bank) * cfg.localWordsPerBank + word
+    scatterWordExisting(slot) := False
+  }
 
-    val globalRow = (U(pe * cfg.maxFibers, tileCfg.rowIndexWidth bits) +
-      scatterLocalRow(pe).resize(tileCfg.rowIndexWidth)).resized
-    scatterGlobalCell(pe) := ((globalRow.resize(cellIndexWidth) <<
-      tileCfg.columnIndexWidth) + scatterColumn(pe).resize(cellIndexWidth)).resized
-    scatterBank(pe) := scatterLocalRow(pe).resize(bankIndexWidth)
-    scatterAddress(pe) := scatterColumn(pe).resize(cfg.localAddressWidth)
-    scatterNeedsAccumulation(pe) := state === TrIpTileState.Scatter &&
-      currentResults(pe).valid && scatterRowFound(pe) && scatterColumnFound(pe) &&
-      resultValid(scatterGlobalCell(pe))
+  val scatterLineValid = Vec(Bool(), pendingLineCount)
+  val scatterLineExisting = Vec(Bool(), pendingLineCount)
+  for (line <- 0 until pendingLineCount) {
+    val firstWord = line * cfg.localWordsPerBank
+    scatterLineValid(line) := scatterWordValid
+      .slice(firstWord, firstWord + cfg.localWordsPerBank).asBits.orR
+    scatterLineExisting(line) := scatterWordExisting
+      .slice(firstWord, firstWord + cfg.localWordsPerBank).asBits.orR
   }
 
   val outputRowSlot = (outputCell >> tileCfg.columnIndexWidth)
@@ -256,40 +277,67 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
     }
   }
   val outputBank = outputLocalRow.resize(bankIndexWidth)
-  val outputAddress = outputColumnSlot.resize(cfg.localAddressWidth)
-  val fullWriteMask = B((BigInt(1) << (cfg.accumulatorWidth / 8)) - 1,
-    (cfg.accumulatorWidth / 8) bits)
+  val outputWord = outputColumnSlot.resize(cfg.localWordIndexWidth)
+  val outputAddress = (outputColumnSlot >> cfg.localWordIndexWidth)
+    .resize(cfg.localAddressWidth)
 
   for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
     val buffer = localBuffers(pe)
+    val line = pe * cfg.localBanks + bank
+    val directData = Bits(cfg.localLineWidth bits)
+    val directMask = Bits(cfg.localLineBytes bits)
+    val accumulatedData = Bits(cfg.localLineWidth bits)
+    val accumulatedMask = Bits(cfg.localLineBytes bits)
+    directData := 0
+    directMask := 0
+    accumulatedData := 0
+    accumulatedMask := 0
+    for (word <- 0 until cfg.localWordsPerBank) {
+      val slot = line * cfg.localWordsPerBank + word
+      val dataHigh = (word + 1) * cfg.accumulatorWidth - 1
+      val dataLow = word * cfg.accumulatorWidth
+      val maskHigh = (word + 1) * (cfg.accumulatorWidth / 8) - 1
+      val maskLow = word * (cfg.accumulatorWidth / 8)
+      directData(dataHigh downto dataLow) := scatterWordValue(slot).asBits
+      directMask(maskHigh downto maskLow) := Mux(scatterWordValid(slot),
+        B((BigInt(1) << (cfg.accumulatorWidth / 8)) - 1,
+          (cfg.accumulatorWidth / 8) bits), B(0, (cfg.accumulatorWidth / 8) bits))
+
+      val oldWord = buffer.io.bus.readResponses(bank).payload(dataHigh downto dataLow).asSInt
+      val mergedWord = Mux(pendingWordExisting(slot),
+        (oldWord + pendingWordValue(slot)).resized, pendingWordValue(slot))
+      accumulatedData(dataHigh downto dataLow) := mergedWord.asBits
+      accumulatedMask(maskHigh downto maskLow) := Mux(pendingWordValid(slot),
+        B((BigInt(1) << (cfg.accumulatorWidth / 8)) - 1,
+          (cfg.accumulatorWidth / 8) bits), B(0, (cfg.accumulatorWidth / 8) bits))
+    }
+
     buffer.io.bus.writes(bank).valid := False
     buffer.io.bus.writes(bank).payload.address := 0
     buffer.io.bus.writes(bank).payload.data := 0
-    buffer.io.bus.writes(bank).payload.mask := fullWriteMask
+    buffer.io.bus.writes(bank).payload.mask := 0
     buffer.io.bus.readCommands(bank).valid := False
     buffer.io.bus.readCommands(bank).payload := 0
 
-    val directScatterWrite = state === TrIpTileState.Scatter &&
-      currentResults(pe).valid && scatterRowFound(pe) && scatterColumnFound(pe) &&
-      !resultValid(scatterGlobalCell(pe)) && scatterBank(pe) === bank
-    when(directScatterWrite) {
+    when(state === TrIpTileState.Scatter && scatterLineValid(line) &&
+        !scatterLineExisting(line)) {
       buffer.io.bus.writes(bank).valid := True
-      buffer.io.bus.writes(bank).payload.address := scatterAddress(pe)
-      buffer.io.bus.writes(bank).payload.data := currentResults(pe).value.asBits
+      buffer.io.bus.writes(bank).payload.address := scatterLineAddress
+      buffer.io.bus.writes(bank).payload.data := directData
+      buffer.io.bus.writes(bank).payload.mask := directMask
     }
 
-    when(scatterNeedsAccumulation(pe) && scatterBank(pe) === bank) {
+    when(state === TrIpTileState.Scatter && scatterLineExisting(line)) {
       buffer.io.bus.readCommands(bank).valid := True
-      buffer.io.bus.readCommands(bank).payload := scatterAddress(pe)
+      buffer.io.bus.readCommands(bank).payload := scatterLineAddress
     }
 
-    when(state === TrIpTileState.ScatterAccumWait && pendingValid(pe) &&
-        pendingBank(pe) === bank && buffer.io.bus.readResponses(bank).valid) {
+    when(state === TrIpTileState.ScatterAccumWait && pendingValid(line) &&
+        buffer.io.bus.readResponses(bank).valid) {
       buffer.io.bus.writes(bank).valid := True
-      buffer.io.bus.writes(bank).payload.address := pendingAddress(pe)
-      buffer.io.bus.writes(bank).payload.data :=
-        (buffer.io.bus.readResponses(bank).payload.asSInt + pendingValue(pe))
-          .resized.asBits
+      buffer.io.bus.writes(bank).payload.address := pendingAddress(line)
+      buffer.io.bus.writes(bank).payload.data := accumulatedData
+      buffer.io.bus.writes(bank).payload.mask := accumulatedMask
     }
 
     when(state === TrIpTileState.ReadPlan && resultValid(outputCell) &&
@@ -299,11 +347,12 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
     }
   }
 
-  val accumulationIssued = scatterNeedsAccumulation.asBits.orR
+  val accumulationIssued = scatterLineExisting.asBits.orR
   val accumulationReady = Bool()
   accumulationReady := True
   for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
-    when(pendingValid(pe) && pendingBank(pe) === bank &&
+    val line = pe * cfg.localBanks + bank
+    when(pendingValid(line) &&
         !localBuffers(pe).io.bus.readResponses(bank).valid) {
       accumulationReady := False
     }
@@ -316,17 +365,14 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
   for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
     when(outputPe === pe && outputBank === bank) {
       selectedReadValid := localBuffers(pe).io.bus.readResponses(bank).valid
-      selectedReadData := localBuffers(pe).io.bus.readResponses(bank).payload
-    }
-  }
-
-  for (pe <- 0 until cfg.peRows; fiber <- 0 until cfg.maxFibers;
-       column <- 0 until tileCfg.maxColumns) {
-    val cell = (pe * cfg.maxFibers + fiber) * tileCfg.maxColumns + column
-    when(state === TrIpTileState.Scatter && currentResults(pe).valid &&
-        scatterRowFound(pe) && scatterColumnFound(pe) &&
-        scatterLocalRow(pe) === fiber && scatterColumn(pe) === column) {
-      resultValid(cell) := True
+      for (word <- 0 until cfg.localWordsPerBank) {
+        val high = (word + 1) * cfg.accumulatorWidth - 1
+        val low = word * cfg.accumulatorWidth
+        when(outputWord === word) {
+          selectedReadData := localBuffers(pe).io.bus.readResponses(bank)
+            .payload(high downto low)
+        }
+      }
     }
   }
 
@@ -379,15 +425,6 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
     } otherwise {
       bBase := (bBase + batchColumns).resized
       state := TrIpTileState.Plan
-    }
-  }
-
-  def advanceScatter(): Unit = {
-    when(scatterLane.resize(cfg.outputCountWidth) + 1 >= maxResponseCount) {
-      scatterLane := 0
-      advanceSchedule()
-    } otherwise {
-      scatterLane := scatterLane + 1
     }
   }
 
@@ -483,34 +520,35 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
       when(allResponsesValid) {
         for (pe <- 0 until cfg.peRows) responseRegs(pe) := pes(pe).io.response.payload
         commandInFlight := False
-        scatterLane := 0
         state := TrIpTileState.Scatter
       }
     }
 
     is(TrIpTileState.Scatter) {
-      when(maxResponseCount === 0) {
-        advanceSchedule()
-      } elsewhen(accumulationIssued) {
-        for (pe <- 0 until cfg.peRows) {
-          pendingValid(pe) := scatterNeedsAccumulation(pe)
-          when(scatterNeedsAccumulation(pe)) {
-            pendingBank(pe) := scatterBank(pe)
-            pendingAddress(pe) := scatterAddress(pe)
-            pendingValue(pe) := currentResults(pe).value
+      when(accumulationIssued) {
+        for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
+          val line = pe * cfg.localBanks + bank
+          pendingValid(line) := scatterLineExisting(line)
+          when(scatterLineExisting(line)) {
+            pendingAddress(line) := scatterLineAddress
+            for (word <- 0 until cfg.localWordsPerBank) {
+              val slot = line * cfg.localWordsPerBank + word
+              pendingWordValid(slot) := scatterWordValid(slot)
+              pendingWordExisting(slot) := scatterWordExisting(slot)
+              pendingWordValue(slot) := scatterWordValue(slot)
+            }
           }
         }
         state := TrIpTileState.ScatterAccumWait
       } otherwise {
-        advanceScatter()
+        advanceSchedule()
       }
     }
 
     is(TrIpTileState.ScatterAccumWait) {
       when(accumulationReady) {
-        for (pe <- 0 until cfg.peRows) pendingValid(pe) := False
-        state := TrIpTileState.Scatter
-        advanceScatter()
+        for (line <- 0 until pendingLineCount) pendingValid(line) := False
+        advanceSchedule()
       }
     }
 

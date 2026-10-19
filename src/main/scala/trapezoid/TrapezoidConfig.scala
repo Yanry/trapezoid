@@ -19,6 +19,7 @@ case class TrapezoidConfig(
     outputLanes: Int = 16,
     peRows: Int = 4,
     localBanks: Int = 4,
+    localWordsPerBank: Int = 4,
     localDepthPerBank: Int = 128,
     responseFifoDepth: Int = 2
 ) {
@@ -32,6 +33,9 @@ case class TrapezoidConfig(
   require(outputLanes >= math.max(maxFibers * maxFibers, cacheLineWords))
   require(peRows > 0)
   require(localBanks == 4, "the paper's PE row has four local-buffer banks")
+  require(localWordsPerBank >= maxFibers &&
+    (localWordsPerBank & (localWordsPerBank - 1)) == 0,
+    "local buffer width must be a power of two and cover all TrIP fibers")
   require(localDepthPerBank >= 2)
   require(responseFifoDepth >= 1)
   require(accumulatorWidth >= 2 * dataWidth + log2Up(macLanes),
@@ -42,6 +46,9 @@ case class TrapezoidConfig(
   val aRegisterIndexWidth: Int = math.max(1, log2Up(macLanes))
   val matchCountWidth: Int = log2Up(maxFibers * maxFibers * fiberWidth + 1)
   val outputCountWidth: Int = log2Up(outputLanes + 1)
+  val localWordIndexWidth: Int = log2Up(localWordsPerBank)
+  val localLineWidth: Int = accumulatorWidth * localWordsPerBank
+  val localLineBytes: Int = localLineWidth / 8
   val localAddressWidth: Int = log2Up(localDepthPerBank)
 }
 
@@ -59,7 +66,8 @@ object TrapezoidConfig {
     cacheLineWords = 16,
     outputLanes = 16,
     peRows = 128,
-    localDepthPerBank = 512
+    localWordsPerBank = 4,
+    localDepthPerBank = 128
   )
 }
 
@@ -81,7 +89,7 @@ case class TrIpTileConfig(core: TrapezoidConfig, maxColumns: Int = 16) {
     "maxColumns must be a power of two for compact circular indexing")
   require(core.macLanes >= core.fiberWidth,
     "one A fiber and one B fiber must always fit without overflow")
-  require(core.localDepthPerBank >= maxColumns,
+  require(core.localDepthPerBank * core.localWordsPerBank >= maxColumns,
     "each PE-row buffer bank must hold one output row")
 
   val rowIndexWidth: Int = math.max(1, log2Up(maxRows))

@@ -34,8 +34,11 @@ class TrapezoidStructureSpec extends AnyFunSuite {
 
   test("paper configuration uses sixteen result lanes and per-row buffer capacity") {
     assert(TrapezoidConfig.paper.outputLanes == 16)
+    assert(TrapezoidConfig.paper.localWordsPerBank == 4)
+    assert(TrapezoidConfig.paper.localDepthPerBank == 128)
     val paperTile = TrIpTileConfig(TrapezoidConfig.paper)
-    assert(TrapezoidConfig.paper.localDepthPerBank >= paperTile.maxColumns)
+    assert(TrapezoidConfig.paper.localDepthPerBank *
+      TrapezoidConfig.paper.localWordsPerBank >= paperTile.maxColumns)
     assert(GustavsonTileConfig(TrapezoidConfig.paper).accumulatorEntries == 128)
   }
 

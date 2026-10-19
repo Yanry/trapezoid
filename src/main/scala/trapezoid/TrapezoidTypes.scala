@@ -75,15 +75,15 @@ case class IntersectionRoute(cfg: TrapezoidConfig) extends Bundle {
 
 case class LocalBufferWrite(cfg: TrapezoidConfig) extends Bundle {
   val address = UInt(cfg.localAddressWidth bits)
-  val data = Bits(cfg.accumulatorWidth bits)
-  val mask = Bits((cfg.accumulatorWidth / 8) bits)
+  val data = Bits(cfg.localLineWidth bits)
+  val mask = Bits(cfg.localLineBytes bits)
 }
 
 /** Scheduler-facing port of one PE row's four-bank local SRAM. */
 case class LocalBufferBus(cfg: TrapezoidConfig) extends Bundle with IMasterSlave {
   val writes = Vec(Flow(LocalBufferWrite(cfg)), cfg.localBanks)
   val readCommands = Vec(Flow(UInt(cfg.localAddressWidth bits)), cfg.localBanks)
-  val readResponses = Vec(Flow(Bits(cfg.accumulatorWidth bits)), cfg.localBanks)
+  val readResponses = Vec(Flow(Bits(cfg.localLineWidth bits)), cfg.localBanks)
 
   override def asMaster(): Unit = {
     writes.foreach(master(_))

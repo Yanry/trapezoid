@@ -30,6 +30,7 @@
 - cache line 输入宽度和输出 lane 数；
 - PE row 数量；
 - 本地 buffer 的 bank 数和深度；
+- 每个本地 buffer bank 的 line word 数；
 - PE row 响应 FIFO 深度 `responseFifoDepth`。
 
 工程提供两套预定义配置：
@@ -106,12 +107,15 @@ PE row 已拆分为五个逻辑阶段：
 每个 PE row 实际例化一个 `BankedLocalBuffer`，具有：
 
 - 4 个相互独立的 bank；
-- 每个 bank 每周期一次掩码写；
-- 每个 bank 每周期一次同步读；
+- 每个 bank 每行 4 个 word，paper 配置为 128 行；
+- 每个 bank 每周期一次 byte-masked 整行写；
+- 每个 bank 每周期一次同步整行读；
 - 读响应有效信号；
 - 可配置的 bank 深度。
 
-它可以作为 TrIP 输出 scatter buffer 或 TrGT 的 B-row FIFO。通用 `Trapezoid` 顶层仍开放本地 buffer 端口；`TrIpTileController` 为每个 PE row 例化独立的四 bank buffer，使用 `A fiber/subrow -> bank`、`B column -> address` 的映射。所有 PE row 并行处理同一个 response lane，并按 row-major 顺序从对应 PE buffer 读回。scatter 只遍历各 PE 实际 `count` 的最大值，不再固定扫描所有结果槽。
+`TrIpTileController` 为每个 PE row 例化独立的四 bank buffer，使用 `A fiber/subrow -> bank`、`B column / 4 -> address`、`B column % 4 -> word` 的映射。一个 `PERowResponse` 的最多 `4 x 4` 个 TrIP 结果会组合匹配到四个 bank 的四个 word，并在一个 scatter 阶段并行掩码写入；跨 K tile 时则并行读出相关 bank line、逐 word 累加后写回。结果最终仍按 row-major 顺序从对应 PE buffer 读回。
+
+该组织在 bank 数、word 数和深度上对应论文的 `4 banks x 4 words x 128 lines`。当前整数验证配置的 word 宽度是 `accumulatorWidth`，paper 配置仍为 72-bit 整数累加值；只有替换成 FP32 数据通路后，物理容量才严格等于论文的 8KB/PE row。论文中 TrGT 的四个 B-row FIFO 也复用这组本地 SRAM；当前 `GustavsonBFifo` 仍是独立 SRAM，尚未与 TrIP scatter buffer 统一到同一物理实例。
 
 ### 2.7 顶层阵列和 RTL 生成
 
@@ -453,9 +457,9 @@ sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
 | A/B 非零密度 | `DenseIp` | `TrIp` | `TrGt` | `TrGs` |
 | ---: | ---: | ---: | ---: | ---: |
 | 0% | 37.0 | 37.0 | 8.0 | 8.0 |
-| 25% | 40.3 | 40.3 | 34.3 | 34.3 |
-| 50% | 71.3 | 71.3 | 85.3 | 85.3 |
-| 75% | 111.7 | 111.7 | 138.7 | 138.7 |
+| 25% | 39.7 | 39.7 | 34.3 | 34.3 |
+| 50% | 68.3 | 68.3 | 85.3 | 85.3 |
+| 75% | 110.7 | 110.7 | 138.7 | 138.7 |
 | 100% | 122.0 | 122.0 | 193.0 | 193.0 |
 
 这些数字包含当前小 RTL 的 PE pipeline、controller 状态转换、TrIP scatter/读改写/有序读回和 Gustavson merge/flush；不包含外部 HBM，也不能直接与论文 128 x 128 阵列结果比较。

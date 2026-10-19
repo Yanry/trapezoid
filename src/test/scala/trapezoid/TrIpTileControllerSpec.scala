@@ -20,7 +20,7 @@ class TrIpTileControllerSpec extends AnyFunSuite {
     peRows = 2,
     localDepthPerBank = 8
   )
-  private val tileCfg = TrIpTileConfig(cfg, maxColumns = 4)
+  private val tileCfg = TrIpTileConfig(cfg, maxColumns = 8)
 
   private def simConfig = SimConfig.withVerilator
     .addSimulatorFlag("-CFLAGS -std=c++14")
@@ -132,6 +132,7 @@ class TrIpTileControllerSpec extends AnyFunSuite {
         (TrapezoidDataflow.DenseIp, 4, 4, 1.0, 1.0),
         (TrapezoidDataflow.DenseIp, 3, 3, 0.25, 0.5),
         (TrapezoidDataflow.TrIp, 4, 4, 1.0, 1.0),
+        (TrapezoidDataflow.TrIp, 4, 8, 0.6, 0.7),
         (TrapezoidDataflow.TrIp, 3, 2, 0.2, 0.35),
         (TrapezoidDataflow.TrIp, 2, 4, 0.0, 1.0)
       )

@@ -463,9 +463,9 @@ sbt -batch 'Test/runMain trapezoid.DataflowLatencyBenchmark'
 | HS x HS | 0.50% | 0.50% | `TrGt` | 442.3 | 1024.0 | 128.0 | 9.0 | 2.0 |
 | HS x MS | 0.50% | 20.00% | `TrGs` | 16766.3 | 1024.0 | 128.0 | 273.7 | 33.0 |
 | HS x D | 0.50% | 100.00% | `TrGs` | 83968.0 | 1024.0 | 128.0 | 1280.0 | 154.7 |
-| MS x D | 20.00% | 100.00% | `TrIp` | 3355392.0 | 1024.0 | 469.3 | 17834.7 | 2170.7 |
-| MS x MS | 20.00% | 20.00% | `TrIp` | 671825.0 | 1024.0 | 128.0 | 3520.0 | 431.3 |
-| D x D | 100.00% | 100.00% | `DenseIp` | 16777216.0 | 1024.0 | 1024.0 | 65536.0 | 8192.0 |
+| MS x D | 20.00% | 100.00% | `TrIp` | 3355392.0 | 1024.0 | 512.0 | 17834.7 | 2170.7 |
+| MS x MS | 20.00% | 20.00% | `TrIp` | 671825.0 | 1024.0 | 128.7 | 3520.0 | 431.3 |
+| D x D | 100.00% | 100.00% | `DenseIp` | 16777216.0 | 1024.0 | 2048.0 | 65536.0 | 8192.0 |
 
 表中为 3 个样本的算术平均值。该结果没有包含 pipeline fill/drain、cache/HBM 访问、bank 冲突、NoC 争用、结果写回和背压，因此不是当前 RTL 的端到端延迟，也不能替代论文的完整 cycle-level system simulator。尤其是 `HS x HS` 中 compute-only 的 `TrGs` 数字更小，而论文推荐 `TrGt` 是因为它减少存储流量；加入完整存储层次之前不能用本表推翻或复现该结论。
 
@@ -527,6 +527,31 @@ sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
 
 该数字是当前 RTL 的 cache-to-result 端到端周期，而不是论文完整系统周期。Gustavson A/CSR pointer 读取、四 cluster cache、真实 HBM channel/queue、DMA 和最终 C 写回仍在边界之外；这些模块完成后，应保持同一个计时接口，将起点前移到统一矩阵描述符，将终点后移到最后一次 C 写响应。
 
+### 3.6 论文配置的稀疏度端到端周期仿真
+
+`PaperEndToEndCycleSimulation` 使用 `TrapezoidConfig.paper` 和论文方法中的 `1 GHz`、`128 x 128 FP32 MAC`、4 个 cache cluster、每 cluster 32 banks/4 MB、总计 16 MB global cache、1 MB local buffer、64B cache line 和 2 TB/s HBM。测试覆盖 `HS x HS`、`HS x MS`、`HS x D`、`MS x MS`、`MS x D` 和 `D x D`，分别使用论文推荐的 `TrGt`、`TrGs`、`TrGs`、`TrIp`、`TrIp` 和 `DenseIp`：
+
+```bash
+sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
+```
+
+默认矩阵为 `256 x 256`，`HS=0.5%`、`MS=20%`、`D=100%`，每类使用 3 个固定随机样本。HS 输入按 CSR/CSC 的 FP32 value、32-bit coordinate 和 pointer 计算流量，MS 输入按 bitmask fiber 和 FP32 nonzero value 计算流量，D 输入按未压缩 FP32 计算流量；输出根据实际非零密度选择相同的格式规则。计时从矩阵描述符接受且 A/B 位于 HBM 开始，到 C 写回 HBM 结束，包含输入格式流量、global cache/HBM 服务周期、推荐数据流的 issue 周期、五级 PE pipeline fill/drain 和输出写回周期。
+
+固定种子的运行结果如下，均为每类 3 个样本的算术平均值；周期在 1 GHz 下也等于 ns。
+
+| 类别 | A 密度 | B 密度 | mode | 有效 MAC | 输入 KiB | 输出 KiB | HBM 读 | cache 读 | 计算 | 输出 | 流式 E2E | 串行 E2E |
+| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HS x HS | 0.50% | 0.50% | `TrGt` | 421.7 | 7.25 | 4.33 | 4.0 | 1.0 | 10.7 | 3.0 | 17.7 | 21.7 |
+| HS x MS | 0.50% | 20.00% | `TrGs` | 16779.7 | 62.88 | 66.13 | 33.0 | 8.0 | 30.0 | 34.0 | 71.0 | 101.0 |
+| HS x D | 0.50% | 100.00% | `TrGs` | 83968.0 | 259.63 | 195.00 | 133.0 | 33.0 | 160.0 | 100.3 | 264.3 | 397.3 |
+| MS x MS | 20.00% | 20.00% | `TrIp` | 670620.0 | 118.50 | 264.00 | 61.0 | 15.0 | 129.7 | 136.0 | 269.7 | 330.7 |
+| MS x D | 20.00% | 100.00% | `TrIp` | 3355392.0 | 315.25 | 256.00 | 162.0 | 40.0 | 569.3 | 132.0 | 705.3 | 867.3 |
+| D x D | 100.00% | 100.00% | `DenseIp` | 16777216.0 | 512.00 | 256.00 | 263.0 | 64.0 | 1024.0 | 132.0 | 1160.0 | 1423.0 |
+
+输出同时报告两个边界：`E2E streamed` 允许输入传输与执行重叠，是默认端到端周期；`E2E serialized` 将输入、计算和输出完全串行，是无重叠上界。论文没有公开固定 HBM command latency，因此模型使用论文给出的 2 TB/s 带宽，不额外虚构 first-line latency。当前实现是可重复的 paper-configuration cycle model，不是论文模拟器的逐地址复刻，也不是 full-chip Verilator：它尚未模拟 cache 地址级 bank conflict、NoC 仲裁、DMA command latency 和随机背压；full-chip Verilator 在当前机器上仍受 128-row RTL 规模限制。
+
+论文使用 128 个真实 workload，而不是统一的 `256 x 256` 随机矩阵；因此这里遵循的是论文硬件配置、稀疏度分类、存储格式和 mode 映射，不能把表中绝对周期与论文图中的 workload 周期直接逐项比较。要复现论文最终图表，还需要导入论文 Table III/IV 对应矩阵、执行 coordinate/occupancy tiling，并补齐上述逐地址争用模型。
+
 它目前还不是可以直接连接 HBM 并独立执行完整矩阵乘法的加速器系统。
 
 ## 4. 当前限制
@@ -570,7 +595,7 @@ sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
 - FPGA place-and-route；
 - ASIC synthesis；
 - 时序、面积和功耗分析；
-- 包含 cache/HBM/NoC/写回争用的论文规模端到端 RTL 或系统级周期模拟；
+- 包含逐地址 cache/HBM/NoC/写回争用的论文规模端到端 RTL 或完整系统级周期模拟；
 - 与论文 TPU、SIGMA、Flexagon 基线的完整周期级性能比较。
 
 因此当前表格中的 1 GHz 只是论文时钟假设下的时间换算，不能声称本 RTL 已达到论文报告的 1 GHz、32 TFLOP/s 或性能/面积结果。

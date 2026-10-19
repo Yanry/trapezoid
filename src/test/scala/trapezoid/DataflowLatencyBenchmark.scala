@@ -150,7 +150,7 @@ object DataflowLatencyBenchmark extends App {
         kTileMask(Vector.tabulate(dimension)(k => b(k, column)), tile)
       }
       val rowsByPe = Vector.tabulate(peRows) { pe =>
-        Vector.tabulate(maxFibers)(fiber => rowBase + fiber * peRows + pe)
+        Vector.tabulate(maxFibers)(fiber => rowBase + pe * maxFibers + fiber)
       }
 
       def workFits(aOffset: Int, groupSize: Int,

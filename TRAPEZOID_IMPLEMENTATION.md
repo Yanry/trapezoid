@@ -451,19 +451,21 @@ sbt -batch 'Test/runMain trapezoid.DataflowLatencyBenchmark'
 
 表中为 3 个样本的算术平均值。该结果没有包含 pipeline fill/drain、cache/HBM 访问、bank 冲突、NoC 争用、结果写回和背压，因此不是当前 RTL 的端到端延迟，也不能替代论文的完整 cycle-level system simulator。尤其是 `HS x HS` 中 compute-only 的 `TrGs` 数字更小，而论文推荐 `TrGt` 是因为它减少存储流量；加入完整存储层次之前不能用本表推翻或复现该结论。
 
-论文配置的逐周期 Verilator RTL benchmark 为：
+普通工作站上的论文配置周期 benchmark 为：
 
 ```bash
-sbt -batch 'Test/runMain trapezoid.PaperRtlDataflowLatencyBenchmark'
+sbt -batch 'Test/runMain trapezoid.DataflowLatencyBenchmark'
 ```
 
-该测试不再使用 small 配置，而是直接使用 `TrapezoidConfig.paper`：`128 PE rows x 128 MACs`、128-wide fiber、4 条 A/B fiber、16-word cache line、16 个结果 lane、32-bit 输入和 72-bit 累加器。矩阵为 `128 x 128`，对应一个完整的 paper K tile。A、B 的稀疏度独立设置为 `HS=82/16384=0.50%`、`MS=3277/16384=20.00%` 和 `D=100%`，覆盖论文的 `HS x HS`、`HS x MS`、`HS x D`、`MS x MS`、`MS x D`、`D x D` 六类 workload。每个矩阵都保持精确非零数；A、B 固定保留 `(0,0)` 非零点，使极稀疏样本仍至少产生一次有效乘法。
+该测试直接使用 `TrapezoidConfig.paper` 的 `128 PE rows x 128 MACs`、128-wide fiber、4 条 A/B fiber 和 16-word cache line 参数，不使用 small 配置。它运行 `256 x 256` workload 和论文六类 A/B 稀疏度组合，输出完整阵列的 compute issue cycle；该结果是论文配置调度模型，不是 full-array Verilator 周期。
 
-paper RTL benchmark 同时输出两组数据。第一张表保留 `start/first command -> done` execution cycle；第二张详细表增加 IP fiber 本地装载周期、boundary 总周期、实际接受的 batch/command 数、TrIP 平均 B-column packing 数、useful MAC/cycle 和 issue-slot utilization。TrIP 的 issue 数、packed column 和 effectual MAC 均从内部 PE Stream 握手直接采样；TrGT/TrGS 的 effectual MAC 从实际接受命令的 valid B lane 采样，并分别与软件参考工作量核对。因此详细表可以区分控制开销、dynamic-column packing 不足和 lane 空闲，但仍不包含 cache、HBM 或 DMA 延迟。
+完整 paper RTL 实验入口保留为：
 
-每类运行 3 个确定性样本。IP 从 `start` 握手计到 `done`，本地 A/B fiber 装载单独列为 setup cycle；Gustavson 从第一条 command 计时，并包括后续 command、merge、flush 和逐行 tile 边界。结果输出保持 `ready=true`。测试会输出 execution cycle、boundary cycle、issue 数、B-column packing、useful MAC/cycle 和 issue-slot utilization，并将硬件结果及有效 MAC 数与 Scala 参考模型逐项核对。
+```bash
+sbt -batch 'Test/runMain trapezoid.FullPaperRtlDataflowLatencyBenchmark'
+```
 
-paper 配置的 elaboration、Verilator 编译和仿真资源消耗很高，因此不放入默认 `sbt test`；需要通过上述 `runMain` 命令显式运行。测量仍不包含 cache、HBM、DMA 和主机装载周期。
+该入口保持 `128 x 128` paper PE/MAC 配置，并通过层次化 blackbox 只生成一次 paper PE-row 内核；但当前 TrIP controller 生成的顶层 Verilog仍约 767MB。在 30GiB 主机上 Spinal elaboration 可以完成，Verilator translation 会被系统以 `SIGKILL(9)` 终止，因此该入口只适合更高内存的机器，不应作为本机默认测试。`PaperRtlDataflowLatencyBenchmark` 作为兼容入口会打印说明并转到可运行的 paper cycle model，不再触发 OOM。
 
 paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用同一个 `TrIpTileController` 调度和 PE 数据通路；`TrGt`/`TrGs` 通过 `GustavsonRowScheduler` 使用 128 个 paper PE row，但底层仍共用同一种 `GustavsonTileEngine` merge 路径。接口已经允许任意 density 下显式选择每种 mode，但尚未加入使同一路径内两个 mode 产生不同周期行为的完整专用微架构优化。
 

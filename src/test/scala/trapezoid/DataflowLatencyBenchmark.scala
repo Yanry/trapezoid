@@ -282,17 +282,30 @@ private[trapezoid] class PaperPERowBlackBox(
   rtlPaths.foreach(path => addRTLPath(path.toString))
 }
 
-/** Reproducible cycle-accurate RTL benchmark for the paper configuration.
+/** Compatibility entry point for paper-scale latency measurements on normal
+  * workstations.  The full-array RTL entry point below requires substantially
+  * more memory during Verilator translation.
   *
   * Run with:
   *   sbt -batch 'Test/runMain trapezoid.PaperRtlDataflowLatencyBenchmark'
+  */
+object PaperRtlDataflowLatencyBenchmark extends App {
+  println("Full paper-array RTL exceeds workstation Verilator memory; " +
+    "running the paper-configuration cycle model instead.")
+  DataflowLatencyBenchmark.main(args)
+}
+
+/** Full-array cycle-accurate RTL benchmark for the paper configuration.
+  *
+  * Run only on a high-memory machine with:
+  *   sbt -batch 'Test/runMain trapezoid.FullPaperRtlDataflowLatencyBenchmark'
   *
   * The benchmark measures controller execution cycles after local IP fibers
   * have been loaded.  Gustavson command delivery is part of execution because
   * each command represents one stationary A nonzero and its matching B row.
   * Verilator compilation and host wall-clock time are deliberately excluded.
   */
-object PaperRtlDataflowLatencyBenchmark extends App {
+object FullPaperRtlDataflowLatencyBenchmark extends App {
   private val cfg = TrapezoidConfig.paper
   private val dimension = cfg.fiberWidth
   private val samplesPerCategory = 3

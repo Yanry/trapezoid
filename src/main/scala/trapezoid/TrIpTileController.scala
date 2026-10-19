@@ -256,14 +256,26 @@ class TrIpTileController(
         }
       }
 
-      val globalCell = U(globalRow * tileCfg.maxColumns, cellIndexWidth bits) +
-        columnIndex.resize(cellIndexWidth)
-      scatterWordExisting(slot) := scatterWordValid(slot) && resultValid(globalCell)
-      when(scatterWordValid(slot)) {
-        resultValid(globalCell) := True
-      }
+      val rowResultValid = Vec((0 until tileCfg.maxColumns).map(column =>
+        resultValid(globalRow * tileCfg.maxColumns + column)))
+      scatterWordExisting(slot) := scatterWordValid(slot) &&
+        rowResultValid(columnIndex)
     } else {
       scatterWordExisting(slot) := False
+    }
+  }
+  for (row <- 0 until tileCfg.maxRows; column <- 0 until tileCfg.maxColumns) {
+    val pe = row / cfg.maxFibers
+    val fiber = row % cfg.maxFibers
+    val writesCoordinate = Vec(Bool(), cfg.localWordsPerBank)
+    for (word <- 0 until cfg.localWordsPerBank) {
+      val slot = (pe * cfg.localBanks + fiber) * cfg.localWordsPerBank + word
+      val columnWide = scatterLineBase + word
+      writesCoordinate(word) := scatterWordValid(slot) &&
+        columnWide === column
+    }
+    when(writesCoordinate.asBits.orR) {
+      resultValid(row * tileCfg.maxColumns + column) := True
     }
   }
   for (pe <- 0 until cfg.peRows; bank <- cfg.maxFibers until cfg.localBanks;
@@ -289,10 +301,10 @@ class TrIpTileController(
   val outputLocalRow = UInt(cfg.fiberIndexWidth bits)
   outputPe := 0
   outputLocalRow := 0
-  for (pe <- 0 until cfg.peRows; fiber <- 0 until cfg.maxFibers) {
-    when(outputRowSlot === pe * cfg.maxFibers + fiber) {
-      outputPe := pe
-      outputLocalRow := fiber
+  for (row <- 0 until tileCfg.maxRows) {
+    when(outputRowSlot === row) {
+      outputPe := row / cfg.maxFibers
+      outputLocalRow := row % cfg.maxFibers
     }
   }
   val outputBank = outputLocalRow.resize(bankIndexWidth)

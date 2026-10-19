@@ -712,9 +712,128 @@ object FullPaperRtlDataflowLatencyBenchmark extends App {
         packedColumns = 0)
     }
 
-    for (workload <- workloads;
-         mode <- Vector(TrapezoidDataflow.TrGt, TrapezoidDataflow.TrGs)) {
-      measurements += run(workload, mode)
+    for (workload <- workloads) {
+      measurements += run(workload, TrapezoidDataflow.TrGt)
+    }
+  }
+
+  simConfig.compile(new TrGsSpatialRowScheduler(gustCfg,
+    paperPe(kernelSources))).doSim { dut =>
+    dut.clockDomain.forkStimulus(10)
+    dut.io.clear #= false
+    dut.io.command.valid #= false
+    dut.io.result.ready #= true
+
+    def clearPayload(): Unit = {
+      dut.io.command.payload.mode #= TrapezoidDataflow.TrGs
+      dut.io.command.payload.endOfTile #= false
+      dut.io.command.payload.a.valid #= false
+      dut.io.command.payload.a.row #= 0
+      dut.io.command.payload.a.k #= 0
+      dut.io.command.payload.a.value #= 0
+      for (lane <- 0 until cfg.cacheLineWords) {
+        dut.io.command.payload.b(lane).valid #= false
+        dut.io.command.payload.b(lane).k #= 0
+        dut.io.command.payload.b(lane).column #= 0
+        dut.io.command.payload.b(lane).value #= 0
+      }
+    }
+
+    def commandsForRow(workload: Workload, row: Int): Vector[(Int, Long, Int)] = {
+      val commands = for {
+        k <- 0 until dimension
+        aValue = workload.a(row, k)
+        if aValue != 0
+        columnBase <- 0 until dimension by cfg.cacheLineWords
+      } yield (k, aValue, columnBase)
+      if (commands.nonEmpty) commands.toVector else Vector((0, 0L, 0))
+    }
+
+    def run(workload: Workload): Measurement = {
+      dut.io.clear #= true
+      dut.clockDomain.waitSampling()
+      dut.io.clear #= false
+      clearPayload()
+
+      val observed = mutable.Map.empty[(Int, Int), Long]
+      var cycles = 0L
+      var observedMacs = 0L
+      var issueCount = 0L
+
+      def sampleCycle(): Unit = {
+        sleep(1)
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt)) = dut.io.result.payload.value.toLong
+        }
+        dut.clockDomain.waitSampling()
+        cycles += 1
+      }
+
+      for (row <- 0 until dimension) {
+        val rowCommands = commandsForRow(workload, row)
+        for (((k, aValue, columnBase), commandIndex) <- rowCommands.zipWithIndex) {
+          clearPayload()
+          dut.io.command.payload.endOfTile #=
+            (commandIndex == rowCommands.size - 1)
+          if (aValue != 0) {
+            dut.io.command.payload.a.valid #= true
+            dut.io.command.payload.a.row #= row
+            dut.io.command.payload.a.k #= k
+            dut.io.command.payload.a.value #= aValue
+            for (lane <- 0 until cfg.cacheLineWords) {
+              val column = columnBase + lane
+              val bValue = workload.b(k, column)
+              dut.io.command.payload.b(lane).valid #= (bValue != 0)
+              dut.io.command.payload.b(lane).k #= k
+              dut.io.command.payload.b(lane).column #= column
+              dut.io.command.payload.b(lane).value #= bValue
+            }
+          }
+          dut.io.command.valid #= true
+          var accepted = false
+          while (!accepted && cycles < 10000000) {
+            sleep(1)
+            accepted = dut.io.command.ready.toBoolean
+            if (accepted) {
+              issueCount += 1
+              observedMacs += (0 until cfg.cacheLineWords).count(lane =>
+                dut.io.command.payload.b(lane).valid.toBoolean)
+            }
+            if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+              observed((dut.io.result.payload.row.toInt,
+                dut.io.result.payload.column.toInt)) = dut.io.result.payload.value.toLong
+            }
+            dut.clockDomain.waitSampling()
+            cycles += 1
+          }
+          dut.io.command.valid #= false
+          assert(accepted, "TrGs command timed out")
+        }
+      }
+      while (dut.io.completedTiles.toLong < dimension && cycles < 10000000) {
+        sampleCycle()
+      }
+      assert(dut.io.completedTiles.toLong == dimension,
+        s"TrGs timed out after ${dut.io.completedTiles.toLong} rows")
+      assert(dut.io.overflow.toBigInt == 0,
+        s"TrGs accumulator overflow for ${workload.category.name}")
+      assert(dut.io.unsupportedMode.toBigInt == 0)
+      val expected = expectedEntries(MatrixReference.multiply(workload.a, workload.b))
+      assert(observed.toMap == expected,
+        s"TrGs ${workload.category.name} sample=${workload.sample}: " +
+          s"observed=$observed expected=$expected")
+      val expectedMacs = effectualMacs(workload)
+      assert(observedMacs == expectedMacs,
+        s"TrGs reported $observedMacs MACs, expected $expectedMacs")
+      Measurement(workload.category, workload.sample, "TrGs",
+        setupCycles = 0, executionCycles = cycles, effectualMacs = observedMacs,
+        issueCount = issueCount, issueSlots = issueCount * cfg.cacheLineWords,
+        packedColumns = 0)
+    }
+
+    for (workload <- workloads) {
+      measurements += run(workload)
     }
   }
 

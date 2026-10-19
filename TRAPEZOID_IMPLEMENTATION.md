@@ -268,6 +268,7 @@ sbt -batch 'runMain trapezoid.GeneratePaperGustavsonTileEngine'
 - `TrGtSubrowScheduler`：将一个 PE row 划分为 4 个逻辑 subrow，每个 subrow 配置独立 B FIFO，每次最多从每个 FIFO 发出一个元素；
 - `GustavsonBFifo`：使用同步 `Mem` 推断本地 SRAM bank，支持预取 head、独立 Stream 背压、occupancy、满队列停顿和环回；
 - `TrGsSpatialEngine`：把一个 A 非零值广播到 cache-line 内所有有效 B lane，并使用按输出列索引的 spatial accumulator；一个 PE response 的最多 16 个结果可以在同一周期写入不同列槽，连续 cache line 可以无空拍进入 PE 流水线；
+- `TrGsSpatialArray` / `TrGsSpatialRowScheduler`：为每个物理 PE row 配置独立 spatial accumulator，按 tile first-free 分配 PE row；一个 tile 的输出流在共享端口保持锁定到 `endOfTile`，其他 PE row 可并行计算或等待输出；
 - `GustavsonArray`：为每个 PE row 复制独立的 Gustavson accumulator、命令/结果 Stream 和状态接口；
 - `GustavsonRowScheduler`：把共享命令流按 tile 分配给空闲 PE row，同一 tile 固定在同一 row，最终命令送出后可重叠执行下一个 tile，并将共享结果端口锁定到当前 tile 的 `endOfTile`。
 
@@ -277,6 +278,7 @@ paper 参数的 TrGS 专用路径可以独立生成：
 
 ```bash
 sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialEngine'
+sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 ```
 
 这些模块已经实现论文数据移动方式的功能等价路径。TrGT FIFO 已使用四个同步 memory bank，但由于 B 元素包含 `aIndex/k/column/value`，其 typed word 宽度不同于当前结果 buffer；两种用途尚未统一成同一个可切换的 `BankedLocalBuffer` 实例。TrGS 已删除通用 Gustavson accumulator 对 PE response 逐项串行插入的周期瓶颈，其列槽对应论文中每个乘法器负责一个 C-row 位置的空间累加方式；当前仍通过带坐标的组合适配完成分发，尚未替换为流水化物理分发网络。
@@ -473,7 +475,7 @@ sbt -batch 'Test/runMain trapezoid.FullPaperRtlDataflowLatencyBenchmark'
 
 该入口保持 `128 x 128` paper PE/MAC 配置，并通过层次化 blackbox 只生成一次 paper PE-row 内核；但当前 TrIP controller 生成的顶层 Verilog仍约 767MB。在 30GiB 主机上 Spinal elaboration 可以完成，Verilator translation 会被系统以 `SIGKILL(9)` 终止，因此该入口只适合更高内存的机器，不应作为本机默认测试。`PaperRtlDataflowLatencyBenchmark` 作为兼容入口会打印说明并转到可运行的 paper cycle model，不再触发 OOM。
 
-paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用同一个 `TrIpTileController` 调度和 PE 数据通路；`TrGt`/`TrGs` 通过 `GustavsonRowScheduler` 使用 128 个 paper PE row，但底层仍共用同一种 `GustavsonTileEngine` merge 路径。接口已经允许任意 density 下显式选择每种 mode，但尚未加入使同一路径内两个 mode 产生不同周期行为的完整专用微架构优化。
+paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用同一个 `TrIpTileController` 调度和 PE 数据通路。`TrGt` 仍通过通用 `GustavsonRowScheduler` 的有序 merge accumulator 执行；`TrGs` 已切换到 `TrGsSpatialRowScheduler`，使用 128 个 paper PE row、连续 cache-line 发射和按列空间累加，因此两种 Gustavson mode 的 RTL 周期不再被同一个逐项 merge 状态机人为拉齐。完整 cache/HBM 流量和写回争用仍未包含。
 
 ### 3.4 当前适用范围
 

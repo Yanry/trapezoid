@@ -339,4 +339,69 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
       assert(dut.io.done.toBoolean)
     }
   }
+
+  test("TrGS spatial scheduler overlaps tiles across PE rows") {
+    val arrayCfg = cfg.copy(peRows = 2)
+    val arrayTileCfg = tileCfg.copy(core = arrayCfg)
+    simConfig.compile(new TrGsSpatialRowScheduler(arrayTileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.command.valid #= false
+      dut.io.result.ready #= false
+
+      def issue(row: Int, column: Int, aValue: Int, bValue: Int): Unit = {
+        dut.io.command.payload.mode #= TrapezoidDataflow.TrGs
+        dut.io.command.payload.endOfTile #= true
+        dut.io.command.payload.a.valid #= true
+        dut.io.command.payload.a.row #= row
+        dut.io.command.payload.a.k #= 0
+        dut.io.command.payload.a.value #= aValue
+        for (lane <- 0 until arrayCfg.cacheLineWords) {
+          val b = dut.io.command.payload.b(lane)
+          b.valid #= lane == 0
+          b.k #= 0
+          b.column #= column
+          b.value #= bValue
+        }
+        dut.io.command.valid #= true
+        sleep(1)
+        while (!dut.io.command.ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        sleep(1)
+        dut.io.command.valid #= false
+      }
+
+      issue(row = 10, column = 1, aValue = 2, bValue = 3)
+      issue(row = 20, column = 2, aValue = 4, bValue = 5)
+
+      assert(dut.io.assignedTiles.toLong == 2)
+      assert(dut.io.allocated.toBigInt == 3,
+        "both spatial rows must remain allocated while output is backpressured")
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long, Boolean)]
+      dut.io.result.ready #= true
+      var timeout = 0
+      while (observed.size < 2 && timeout < 300) {
+        sleep(1)
+        if (dut.io.result.valid.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong,
+            dut.io.result.payload.endOfTile.toBoolean))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+
+      assert(observed == Seq((10, 1, 6L, true), (20, 2, 20L, true)))
+      while (dut.io.completedTiles.toLong != 2 && timeout < 320) {
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(dut.io.completedTiles.toLong == 2)
+      assert(dut.io.allocated.toBigInt == 0)
+      assert(dut.io.overflow.toBigInt == 0)
+      assert(dut.io.unsupportedMode.toBigInt == 0)
+    }
+  }
 }

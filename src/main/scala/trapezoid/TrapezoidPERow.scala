@@ -222,7 +222,6 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val routed = PERowRoutePayload(cfg)
   routed.mode := input.mode
   routed.endOfTile := input.endOfTile
-  routed.overflow := mfiu.io.overflow
   routed.selectedColumns := columnPacker.io.selectedColumns
   routed.effectualMacs := mfiu.io.count
 
@@ -240,15 +239,39 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     routed.tripAOperand(lane) := aFiber.values(laneRoute.aValueIndex)
     routed.tripBOperand(lane) := bFiber.values(laneRoute.bValueIndex)
   }
+  val gustRouteErrors = Bits(cfg.cacheLineWords bits)
   for (lane <- 0 until cfg.cacheLineWords) {
     val b = input.gustavson.b(lane)
-    val a = input.gustavson.a(b.aIndex)
-    routed.gustValid(lane) := b.valid && a.valid && a.k === b.k
-    routed.gustRow(lane) := a.row
+    val trGtA = GustavsonA(cfg)
+    trGtA := GustavsonA(cfg).getZero
+    val trGtRouteValid = Bool()
+    trGtRouteValid := False
+    if (lane < cfg.localBanks) {
+      val firstA = lane * cfg.macLanesPerSubrow
+      val lastA = firstA + cfg.macLanesPerSubrow
+      for (index <- firstA until lastA) {
+        when(b.aIndex === index) {
+          trGtA := input.gustavson.a(index)
+          trGtRouteValid := True
+        }
+      }
+    }
+    val trGsA = input.gustavson.a(0)
+    val trGsMode = input.mode === TrapezoidDataflow.TrGs
+    val selectedA = Mux(trGsMode, trGsA, trGtA)
+    val routeValid = Mux(trGsMode, b.aIndex === 0, trGtRouteValid)
+    gustRouteErrors(lane) := b.valid && !routeValid
+    routed.gustValid(lane) := b.valid && routeValid && selectedA.valid &&
+      selectedA.k === b.k
+    routed.gustRow(lane) := selectedA.row
     routed.gustColumn(lane) := b.column
-    routed.gustAOperand(lane) := a.value
+    routed.gustAOperand(lane) := selectedA.value
     routed.gustBOperand(lane) := b.value
   }
+  val inputTripMode = input.mode === TrapezoidDataflow.DenseIp ||
+    input.mode === TrapezoidDataflow.TrIp
+  routed.overflow := Mux(inputTripMode, mfiu.io.overflow,
+    gustRouteErrors.orR)
 
   val routeInput = Stream(PERowRoutePayload(cfg))
   routeInput.valid := inputStage.valid
@@ -362,7 +385,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     trGsOrderError = trGsOrderError ||
       (previous.valid && current.valid && coordinateDecreases)
   }
-  val gustOrderError = mac.mode === TrapezoidDataflow.TrGs && trGsOrderError
+  val gustOrderError = mac.overflow ||
+    (mac.mode === TrapezoidDataflow.TrGs && trGsOrderError)
 
   val trGtRank = Vec(UInt(log2Up(cfg.localBanks + 1) bits), cfg.localBanks)
   for (lane <- 0 until cfg.localBanks) {

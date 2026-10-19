@@ -195,15 +195,23 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       dut.io.command.payload.gustavson.a(0).k #= 0
       dut.io.command.payload.gustavson.a(0).value #= 2
       dut.io.command.payload.gustavson.a(1).valid #= true
-      dut.io.command.payload.gustavson.a(1).row #= 3
-      dut.io.command.payload.gustavson.a(1).k #= 2
-      dut.io.command.payload.gustavson.a(1).value #= 7
+      dut.io.command.payload.gustavson.a(1).row #= 2
+      dut.io.command.payload.gustavson.a(1).k #= 1
+      dut.io.command.payload.gustavson.a(1).value #= 2
+      dut.io.command.payload.gustavson.a(2).valid #= true
+      dut.io.command.payload.gustavson.a(2).row #= 2
+      dut.io.command.payload.gustavson.a(2).k #= 2
+      dut.io.command.payload.gustavson.a(2).value #= 2
+      dut.io.command.payload.gustavson.a(3).valid #= true
+      dut.io.command.payload.gustavson.a(3).row #= 3
+      dut.io.command.payload.gustavson.a(3).k #= 3
+      dut.io.command.payload.gustavson.a(3).value #= 7
 
       val inputs = Seq(
-        (1, 2, 1, 19),
         (0, 0, 1, 17),
-        (0, 0, 0, 11),
-        (0, 0, 1, 3)
+        (1, 1, 1, 3),
+        (2, 2, 0, 11),
+        (3, 3, 1, 19)
       )
       for (((aIndex, k, column, value), lane) <- inputs.zipWithIndex) {
         dut.io.command.payload.gustavson.b(lane).valid #= true
@@ -247,6 +255,25 @@ class TrapezoidPERowSpec extends AnyFunSuite {
     }
   }
 
+  test("TrGT rejects a B element routed through the wrong subrow") {
+    simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      clearInputs(dut)
+      dut.io.command.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.command.payload.gustavson.a(1).valid #= true
+      dut.io.command.payload.gustavson.a(1).k #= 1
+      dut.io.command.payload.gustavson.a(1).value #= 3
+      dut.io.command.payload.gustavson.b(0).valid #= true
+      dut.io.command.payload.gustavson.b(0).aIndex #= 1
+      dut.io.command.payload.gustavson.b(0).k #= 1
+      dut.io.command.payload.gustavson.b(0).value #= 5
+
+      issue(dut)
+      assert(dut.io.response.payload.overflow.toBoolean)
+      assert(dut.io.response.payload.count.toInt == 0)
+    }
+  }
+
   test("TrGT and TrGS accept sparse or dense lane populations by explicit mode") {
     simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
@@ -266,15 +293,19 @@ class TrapezoidPERowSpec extends AnyFunSuite {
         val expected = scala.collection.mutable.Map.empty[(Int, Int), Int]
         for (lane <- 0 until cfg.cacheLineWords) {
           val valid = random.nextDouble() < density
-          val aIndex = lane % cfg.macLanes
-          val column = lane % 2
+          val aIndex = if (mode == TrapezoidDataflow.TrGs) 0
+            else lane % cfg.macLanes
+          val column = lane
           val value = lane + 2
           dut.io.command.payload.gustavson.b(lane).valid #= valid
           dut.io.command.payload.gustavson.b(lane).aIndex #= aIndex
           dut.io.command.payload.gustavson.b(lane).k #= aIndex
           dut.io.command.payload.gustavson.b(lane).column #= column
           dut.io.command.payload.gustavson.b(lane).value #= value
-          if (valid) expected((aIndex, column)) = (aIndex + 1) * value
+          if (valid) {
+            val key = aIndex -> column
+            expected(key) = expected.getOrElse(key, 0) + (aIndex + 1) * value
+          }
         }
 
         issue(dut)

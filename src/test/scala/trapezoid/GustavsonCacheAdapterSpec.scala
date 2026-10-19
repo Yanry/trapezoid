@@ -469,6 +469,70 @@ class GustavsonCacheAdapterSpec extends AnyFunSuite {
     }
   }
 
+  test("TrGT cache adapter emits one ordered element per temporal subrow cycle") {
+    simConfig.compile(new GustavsonBRowCacheAdapter(gustCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.rowCommand.valid #= false
+      dut.io.cacheRequest.ready #= true
+      dut.io.cacheResponse.valid #= false
+      dut.io.cacheResponse.payload.wasHit #= true
+      dut.io.cacheResponse.payload.error #= false
+      dut.io.peCommand.ready #= false
+
+      dut.io.rowCommand.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.rowCommand.payload.endOfTile #= true
+      dut.io.rowCommand.payload.aIndex #= 2
+      dut.io.rowCommand.payload.a.valid #= true
+      dut.io.rowCommand.payload.a.row #= 7
+      dut.io.rowCommand.payload.a.k #= 5
+      dut.io.rowCommand.payload.a.value #= 3
+      dut.io.rowCommand.payload.bBaseAddress #= 12
+      dut.io.rowCommand.payload.lineCount #= 1
+      dut.io.rowCommand.valid #= true
+      while (!dut.io.rowCommand.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      dut.io.rowCommand.valid #= false
+
+      while (!dut.io.cacheResponse.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.io.cacheResponse.payload.requestId #= 0
+      dut.io.cacheResponse.payload.data #= encodeLine(Seq(
+        Some(1 -> 5), None, Some(3 -> 2), Some(4 -> -1)))
+      dut.io.cacheResponse.valid #= true
+      dut.clockDomain.waitSampling()
+      dut.io.cacheResponse.valid #= false
+
+      val expected = Seq((1, 5, false), (3, 2, false), (4, -1, true))
+      for (((column, value, endOfTile), element) <- expected.zipWithIndex) {
+        while (!dut.io.peCommand.valid.toBoolean) dut.clockDomain.waitSampling()
+        val command = dut.io.peCommand.payload
+        assert(command.gustavson.b(2).valid.toBoolean)
+        assert(command.gustavson.b(2).aIndex.toInt == 2)
+        assert(command.gustavson.b(2).column.toInt == column)
+        assert(command.gustavson.b(2).value.toInt == value)
+        assert(command.endOfTile.toBoolean == endOfTile)
+        for (lane <- 0 until cfg.cacheLineWords if lane != 2) {
+          assert(!command.gustavson.b(lane).valid.toBoolean)
+        }
+
+        if (element == 0) {
+          dut.clockDomain.waitSampling(2)
+          assert(dut.io.peCommand.payload.gustavson.b(2).column.toInt == column)
+          assert(dut.io.peCommand.payload.gustavson.b(2).value.toInt == value)
+        }
+        dut.io.peCommand.ready #= true
+        dut.clockDomain.waitSampling()
+        dut.io.peCommand.ready #= false
+        sleep(1)
+      }
+
+      sleep(1)
+      assert(dut.io.done.toBoolean)
+      assert(dut.io.requestedLines.toLong == 1)
+      assert(dut.io.emittedLines.toLong == 1)
+    }
+  }
+
   test("TrGS cache adapter overlaps the next request with buffered line output") {
     simConfig.compile(new GustavsonBRowCacheAdapter(gustCfg,
       allowTrGt = false, allowTrGs = true,

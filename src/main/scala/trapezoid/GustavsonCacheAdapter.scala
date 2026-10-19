@@ -11,8 +11,9 @@ object GustavsonBRowCacheState extends SpinalEnum {
   *
   * The memory format packs each element from low to high as valid, signed
   * value, and column.  K and aIndex are supplied by the command because all B
-  * elements in the region belong to the stationary A value.  TrGT and TrGS use
-  * exactly the same cache path; mode is forwarded without density heuristics.
+  * elements in the region belong to the stationary A value. TrGT serializes a
+  * line into its owning temporal subrow, while TrGS broadcasts A and presents
+  * the whole cache line spatially.
   */
 class GustavsonBRowCacheAdapter(
     gustCfg: GustavsonCacheConfig,
@@ -51,6 +52,9 @@ class GustavsonBRowCacheAdapter(
   val lineData = Reg(Bits(cacheCfg.lineWidth bits)) init 0
   val lineBufferIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
   val lineBufferValid = RegInit(False)
+  private val elementIndexWidth = scala.math.max(1,
+    log2Up(gustCfg.elementsPerLine))
+  val lineElementCursor = Reg(UInt(elementIndexWidth bits)) init 0
   val requestOutstanding = RegInit(False)
   val outstandingIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
   val tileOpen = RegInit(False)
@@ -83,6 +87,7 @@ class GustavsonBRowCacheAdapter(
   when(io.rowCommand.fire) {
     commandReg := io.rowCommand.payload
     lineBufferValid := False
+    lineElementCursor := 0
     requestOutstanding := False
     doneReg := False
     memoryErrorReg := False
@@ -132,39 +137,94 @@ class GustavsonBRowCacheAdapter(
       lineData := io.cacheResponse.payload.data
       lineBufferIndex := outstandingIndex
       lineBufferValid := True
+      lineElementCursor := 0
     }
   }
 
   val lastLine = lineBufferIndex === (commandReg.lineCount - 1).resized
   val abortingTile = state === GustavsonBRowCacheState.AbortTile
+  val trGtMode = commandReg.mode === TrapezoidDataflow.TrGt
+  val lineElements = Vec(TrGsB(cfg), gustCfg.elementsPerLine)
+  for (element <- 0 until gustCfg.elementsPerLine) {
+    val offset = element * gustCfg.elementWidth
+    lineElements(element).valid := lineData(offset)
+    lineElements(element).k := commandReg.a.k
+    lineElements(element).value :=
+      lineData(offset + cfg.dataWidth downto offset + 1).asSInt
+    lineElements(element).column :=
+      lineData(offset + gustCfg.elementWidth - 1 downto
+        offset + 1 + cfg.dataWidth).asUInt
+  }
+
+  val selectedElementIndex = UInt(elementIndexWidth bits)
+  selectedElementIndex := 0
+  var noSelectedElement: Bool = True
+  for (element <- 0 until gustCfg.elementsPerLine) {
+    val selectable = lineElements(element).valid &&
+      lineElementCursor <= element
+    when(noSelectedElement && selectable) {
+      selectedElementIndex := element
+    }
+    noSelectedElement = noSelectedElement && !selectable
+  }
+  val selectedElementValid = !noSelectedElement
+  val selectedElement = lineElements(selectedElementIndex)
+  val laterElementBits = Bits(gustCfg.elementsPerLine bits)
+  for (element <- 0 until gustCfg.elementsPerLine) {
+    laterElementBits(element) := lineElements(element).valid &&
+      selectedElementValid && element > selectedElementIndex
+  }
+  val trGtLineComplete = !selectedElementValid || !laterElementBits.orR
+  val selectedSubrow = UInt(log2Up(cfg.localBanks) bits)
+  selectedSubrow := 0
+  for (subrow <- 0 until cfg.localBanks) {
+    val firstA = subrow * cfg.macLanesPerSubrow
+    val lastA = firstA + cfg.macLanesPerSubrow
+    val inSubrow = if (subrow == cfg.localBanks - 1)
+      commandReg.aIndex >= firstA
+    else
+      commandReg.aIndex >= firstA && commandReg.aIndex < lastA
+    when(inSubrow) {
+      selectedSubrow := subrow
+    }
+  }
   val outputValid = !io.clear &&
     ((state === GustavsonBRowCacheState.Run && lineBufferValid) ||
       state === GustavsonBRowCacheState.AbortTile)
   if (!emitSpatialCommand) {
     val adapted = PERowCommand(cfg)
     adapted.mode := commandReg.mode
-    adapted.endOfTile := abortingTile || (lastLine && commandReg.endOfTile)
+    adapted.endOfTile := abortingTile ||
+      (lastLine && commandReg.endOfTile && (!trGtMode || trGtLineComplete))
     adapted.trip := TrIpPayload(cfg).getZero
     for (index <- 0 until cfg.macLanes) {
       adapted.gustavson.a(index).valid := !abortingTile && commandReg.a.valid &&
-        commandReg.aIndex === index
+        Mux(trGtMode, commandReg.aIndex === index,
+          if (index == 0) True else False)
       adapted.gustavson.a(index).row := commandReg.a.row
       adapted.gustavson.a(index).k := commandReg.a.k
       adapted.gustavson.a(index).value := commandReg.a.value
     }
     for (lane <- 0 until cfg.cacheLineWords) {
+      adapted.gustavson.b(lane) := GustavsonB(cfg).getZero
+      if (lane < cfg.localBanks) {
+        when(trGtMode && selectedElementValid && selectedSubrow === lane) {
+          adapted.gustavson.b(lane).valid := !abortingTile
+          adapted.gustavson.b(lane).aIndex := commandReg.aIndex
+          adapted.gustavson.b(lane).k := selectedElement.k
+          adapted.gustavson.b(lane).column := selectedElement.column
+          adapted.gustavson.b(lane).value := selectedElement.value
+        }
+      }
       if (lane < gustCfg.elementsPerLine) {
-        val offset = lane * gustCfg.elementWidth
-        adapted.gustavson.b(lane).valid := !abortingTile && lineData(offset)
-        adapted.gustavson.b(lane).aIndex := commandReg.aIndex
-        adapted.gustavson.b(lane).k := commandReg.a.k
-        adapted.gustavson.b(lane).value :=
-          lineData(offset + cfg.dataWidth downto offset + 1).asSInt
-        adapted.gustavson.b(lane).column :=
-          lineData(offset + gustCfg.elementWidth - 1 downto
-            offset + 1 + cfg.dataWidth).asUInt
-      } else {
-        adapted.gustavson.b(lane) := GustavsonB(cfg).getZero
+        when(!trGtMode) {
+          adapted.gustavson.b(lane).valid := !abortingTile &&
+            lineElements(lane).valid
+          adapted.gustavson.b(lane).aIndex := 0
+          adapted.gustavson.b(lane).k := lineElements(lane).k
+          adapted.gustavson.b(lane).column := lineElements(lane).column
+          adapted.gustavson.b(lane).value := lineElements(lane).value
+        }
       }
     }
     io.peCommand.valid := outputValid
@@ -204,14 +264,19 @@ class GustavsonBRowCacheAdapter(
       doneReg := True
       state := GustavsonBRowCacheState.Idle
     } otherwise {
-      lineBufferValid := False
-      emittedLines := emittedLines + 1
-      when(lastLine) {
-        tileOpen := !commandReg.endOfTile
-        doneReg := True
-        state := GustavsonBRowCacheState.Idle
+      when(trGtMode && !trGtLineComplete) {
+        lineElementCursor := selectedElementIndex + 1
       } otherwise {
-        tileOpen := True
+        lineBufferValid := False
+        lineElementCursor := 0
+        emittedLines := emittedLines + 1
+        when(lastLine) {
+          tileOpen := !commandReg.endOfTile
+          doneReg := True
+          state := GustavsonBRowCacheState.Idle
+        } otherwise {
+          tileOpen := True
+        }
       }
     }
   }
@@ -220,6 +285,7 @@ class GustavsonBRowCacheAdapter(
     state := GustavsonBRowCacheState.Idle
     lineBufferIndex := 0
     lineBufferValid := False
+    lineElementCursor := 0
     requestOutstanding := False
     outstandingIndex := 0
     tileOpen := False

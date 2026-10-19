@@ -30,9 +30,13 @@ case class TrapezoidConfig(
   require(macLanes >= maxFibers * maxFibers,
     "one response must be able to represent every TrIP output fiber pair")
   require(cacheLineWords > 0 && cacheLineWords <= macLanes)
+  require(cacheLineWords >= localBanks,
+    "TrGT needs one command lane for each local-buffer subrow")
   require(outputLanes >= math.max(maxFibers * maxFibers, cacheLineWords))
   require(peRows > 0)
   require(localBanks == 4, "the paper's PE row has four local-buffer banks")
+  require(macLanes % localBanks == 0,
+    "MAC lanes must divide evenly across the four TrGT subrows")
   require(localWordsPerBank >= maxFibers &&
     (localWordsPerBank & (localWordsPerBank - 1)) == 0,
     "local buffer width must be a power of two and cover all TrIP fibers")
@@ -44,6 +48,7 @@ case class TrapezoidConfig(
   val fiberIndexWidth: Int = math.max(1, log2Up(maxFibers))
   val fiberValueIndexWidth: Int = math.max(1, log2Up(fiberWidth))
   val aRegisterIndexWidth: Int = math.max(1, log2Up(macLanes))
+  val macLanesPerSubrow: Int = macLanes / localBanks
   val matchCountWidth: Int = log2Up(maxFibers * maxFibers * fiberWidth + 1)
   val outputCountWidth: Int = log2Up(outputLanes + 1)
   val localWordIndexWidth: Int = log2Up(localWordsPerBank)

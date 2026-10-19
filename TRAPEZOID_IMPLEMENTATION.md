@@ -337,7 +337,8 @@ sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 - 一条命令显式携带 `TrGt`/`TrGs`、驻留 A 非零值、`aIndex`、B-row 基址和 cache-line 数量；
 - B 元素按低位到高位的 `valid`、有符号 value、column 固定记录打包，每条 cache line 可容纳的元素数量由实际 line 宽度计算；
 - B 的 K 坐标来自当前 A 元素，未占用的 PE lane 自动置 invalid；
-- adapter 串行请求整段 B row，并把每条 cache line 转换成带背压的 `PERowCommand`；
+- adapter 按地址顺序请求整段 B row，并把每条 cache line 转换成带背压的 PE-row command；
+- adapter 使用独立 request tracker 和单项 elastic line buffer；在一个 client 最多一个 outstanding 的约束下，下一条 cache 请求可以与上一条 line 向 PE row 的输出同周期握手，PE 背压时 cache 响应会稳定停在响应端口；
 - 最后一条 cache line 继承调用方的 `endOfTile`，因此同一输出 tile 可以连续累加多段 B row；
 - 对零长度、超配置长度、地址空间越界和非 Gustavson mode 进行显式拒绝，不产生 cache 请求；
 - cache error 或 request ID 不匹配会置位 `memoryError`；若 tile 已打开，还会发送空的结束命令释放 PE row，避免调度器永久停在半开状态；
@@ -349,7 +350,7 @@ sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 
 ### 3.1 功能验证
 
-当前共有 40 项自动测试，执行方式为：
+当前共有 41 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test

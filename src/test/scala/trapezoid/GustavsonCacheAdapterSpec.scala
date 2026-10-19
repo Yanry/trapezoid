@@ -340,6 +340,81 @@ class GustavsonCacheAdapterSpec extends AnyFunSuite {
     }
   }
 
+  test("TrGS cache adapter overlaps the next request with buffered line output") {
+    simConfig.compile(new GustavsonBRowCacheAdapter(gustCfg,
+      allowTrGt = false, allowTrGs = true,
+      emitSpatialCommand = true)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.rowCommand.valid #= false
+      dut.io.cacheRequest.ready #= true
+      dut.io.cacheResponse.valid #= false
+      dut.io.cacheResponse.payload.wasHit #= true
+      dut.io.cacheResponse.payload.error #= false
+      dut.io.spatialCommand.ready #= true
+
+      dut.io.rowCommand.payload.mode #= TrapezoidDataflow.TrGs
+      dut.io.rowCommand.payload.endOfTile #= true
+      dut.io.rowCommand.payload.aIndex #= 3
+      dut.io.rowCommand.payload.a.valid #= true
+      dut.io.rowCommand.payload.a.row #= 6
+      dut.io.rowCommand.payload.a.k #= 4
+      dut.io.rowCommand.payload.a.value #= 2
+      dut.io.rowCommand.payload.bBaseAddress #= 40
+      dut.io.rowCommand.payload.lineCount #= 3
+      dut.io.rowCommand.valid #= true
+      sleep(1)
+      assert(dut.io.rowCommand.ready.toBoolean)
+      dut.clockDomain.waitSampling()
+      dut.io.rowCommand.valid #= false
+
+      def waitFor(condition: => Boolean, message: String): Unit = {
+        var timeout = 0
+        sleep(1)
+        while (!condition && timeout < 100) {
+          dut.clockDomain.waitSampling()
+          sleep(1)
+          timeout += 1
+        }
+        assert(timeout < 100, message)
+      }
+
+      for (line <- 0 until 3) {
+        waitFor(dut.io.cacheRequest.valid.toBoolean,
+          s"cache request $line timed out")
+        assert(dut.io.cacheRequest.payload.requestId.toInt == line)
+        if (line > 0) {
+          assert(dut.io.spatialCommand.valid.toBoolean,
+            s"request $line did not overlap line ${line - 1} output")
+          assert(dut.io.spatialCommand.payload.b(0).column.toInt == line - 1)
+          assert(!dut.io.spatialCommand.payload.endOfTile.toBoolean)
+        }
+        dut.clockDomain.waitSampling()
+
+        dut.io.cacheResponse.payload.requestId #= line
+        dut.io.cacheResponse.payload.data #=
+          encodeLine(Seq(Some(line -> (line + 1)), None, None, None))
+        dut.io.cacheResponse.valid #= true
+        waitFor(dut.io.cacheResponse.ready.toBoolean,
+          s"cache response $line timed out")
+        dut.clockDomain.waitSampling()
+        dut.io.cacheResponse.valid #= false
+      }
+
+      waitFor(dut.io.spatialCommand.valid.toBoolean,
+        "final spatial command timed out")
+      assert(dut.io.spatialCommand.payload.b(0).column.toInt == 2)
+      assert(dut.io.spatialCommand.payload.endOfTile.toBoolean)
+      dut.clockDomain.waitSampling()
+      sleep(1)
+
+      assert(dut.io.done.toBoolean)
+      assert(dut.io.requestedLines.toLong == 3)
+      assert(dut.io.emittedLines.toLong == 3)
+      assert(!dut.io.memoryError.toBoolean)
+    }
+  }
+
   test("B-row adapter closes an open tile after a cache response error") {
     simConfig.compile(new GustavsonBRowCacheAdapter(gustCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
@@ -395,9 +470,8 @@ class GustavsonCacheAdapterSpec extends AnyFunSuite {
       waitFor(dut.io.peCommand.valid.toBoolean, "first PE command timed out")
       assert(!dut.io.peCommand.payload.endOfTile.toBoolean)
       assert(dut.io.peCommand.payload.gustavson.b(0).valid.toBoolean)
-      dut.clockDomain.waitSampling()
-
-      waitFor(dut.io.cacheRequest.valid.toBoolean, "second cache request timed out")
+      assert(dut.io.cacheRequest.valid.toBoolean,
+        "second request must overlap the first buffered line output")
       assert(dut.io.cacheRequest.payload.requestId.toInt == 1)
       dut.clockDomain.waitSampling()
 

@@ -4,7 +4,7 @@ import spinal.core._
 import spinal.lib._
 
 object GustavsonBRowCacheState extends SpinalEnum {
-  val Idle, Request, WaitResponse, Emit, AbortTile = newElement()
+  val Idle, Run, AbortTile = newElement()
 }
 
 /** Converts a cached, fixed-width B-row region into Gustavson PE-row commands.
@@ -48,8 +48,11 @@ class GustavsonBRowCacheAdapter(
 
   val state = RegInit(GustavsonBRowCacheState.Idle)
   val commandReg = Reg(CachedGustavsonBRowCommand(gustCfg))
-  val lineIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
   val lineData = Reg(Bits(cacheCfg.lineWidth bits)) init 0
+  val lineBufferIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
+  val lineBufferValid = RegInit(False)
+  val requestOutstanding = RegInit(False)
+  val outstandingIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
   val tileOpen = RegInit(False)
   val doneReg = RegInit(False)
   val memoryErrorReg = RegInit(False)
@@ -79,7 +82,8 @@ class GustavsonBRowCacheAdapter(
   io.rowCommand.ready := !io.clear && state === GustavsonBRowCacheState.Idle
   when(io.rowCommand.fire) {
     commandReg := io.rowCommand.payload
-    lineIndex := 0
+    lineBufferValid := False
+    requestOutstanding := False
     doneReg := False
     memoryErrorReg := False
     addressErrorReg := !nonEmptyInput || inputAddressError
@@ -88,7 +92,7 @@ class GustavsonBRowCacheAdapter(
     emittedLines := 0
 
     when(supportedInputMode && nonEmptyInput && !inputAddressError) {
-      state := GustavsonBRowCacheState.Request
+      state := GustavsonBRowCacheState.Run
     } otherwise {
       when(tileOpen) {
         state := GustavsonBRowCacheState.AbortTile
@@ -99,18 +103,24 @@ class GustavsonBRowCacheAdapter(
     }
   }
 
-  io.cacheRequest.valid := !io.clear && state === GustavsonBRowCacheState.Request
-  io.cacheRequest.payload.address := (commandReg.bBaseAddress + lineIndex.resized).resized
-  io.cacheRequest.payload.requestId := lineIndex.resized
+  val allRequestsIssued = requestedLines >= commandReg.lineCount.resize(32)
+  io.cacheRequest.valid := !io.clear && state === GustavsonBRowCacheState.Run &&
+    !requestOutstanding && !allRequestsIssued
+  io.cacheRequest.payload.address :=
+    (commandReg.bBaseAddress + requestedLines.resized).resized
+  io.cacheRequest.payload.requestId := requestedLines.resized
   when(io.cacheRequest.fire) {
+    outstandingIndex := requestedLines.resized
     requestedLines := requestedLines + 1
-    state := GustavsonBRowCacheState.WaitResponse
+    requestOutstanding := True
   }
 
-  io.cacheResponse.ready := !io.clear && state === GustavsonBRowCacheState.WaitResponse
+  io.cacheResponse.ready := !io.clear && state === GustavsonBRowCacheState.Run &&
+    requestOutstanding && !lineBufferValid
   when(io.cacheResponse.fire) {
+    requestOutstanding := False
     when(io.cacheResponse.payload.error ||
-        io.cacheResponse.payload.requestId =/= lineIndex.resized) {
+        io.cacheResponse.payload.requestId =/= outstandingIndex.resized) {
       memoryErrorReg := True
       when(tileOpen) {
         state := GustavsonBRowCacheState.AbortTile
@@ -120,14 +130,15 @@ class GustavsonBRowCacheAdapter(
       }
     } otherwise {
       lineData := io.cacheResponse.payload.data
-      state := GustavsonBRowCacheState.Emit
+      lineBufferIndex := outstandingIndex
+      lineBufferValid := True
     }
   }
 
-  val lastLine = lineIndex === (commandReg.lineCount - 1).resized
+  val lastLine = lineBufferIndex === (commandReg.lineCount - 1).resized
   val abortingTile = state === GustavsonBRowCacheState.AbortTile
   val outputValid = !io.clear &&
-    (state === GustavsonBRowCacheState.Emit ||
+    ((state === GustavsonBRowCacheState.Run && lineBufferValid) ||
       state === GustavsonBRowCacheState.AbortTile)
   if (!emitSpatialCommand) {
     val adapted = PERowCommand(cfg)
@@ -193,6 +204,7 @@ class GustavsonBRowCacheAdapter(
       doneReg := True
       state := GustavsonBRowCacheState.Idle
     } otherwise {
+      lineBufferValid := False
       emittedLines := emittedLines + 1
       when(lastLine) {
         tileOpen := !commandReg.endOfTile
@@ -200,15 +212,16 @@ class GustavsonBRowCacheAdapter(
         state := GustavsonBRowCacheState.Idle
       } otherwise {
         tileOpen := True
-        lineIndex := lineIndex + 1
-        state := GustavsonBRowCacheState.Request
       }
     }
   }
 
   when(io.clear) {
     state := GustavsonBRowCacheState.Idle
-    lineIndex := 0
+    lineBufferIndex := 0
+    lineBufferValid := False
+    requestOutstanding := False
+    outstandingIndex := 0
     tileOpen := False
     doneReg := False
     memoryErrorReg := False

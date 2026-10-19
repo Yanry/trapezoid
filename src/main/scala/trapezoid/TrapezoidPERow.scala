@@ -208,22 +208,54 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val mfiu = new MultiFiberIntersection(cfg)
   val columnPacker = new DynamicColumnPacker(cfg)
   val input = inputStage.payload
+  val fullFiberMask = B((BigInt(1) << cfg.fiberWidth) - 1,
+    cfg.fiberWidth bits)
+  val denseAChoices = Bits(cfg.maxFibers bits)
+  val denseBChoices = Bits(cfg.maxFibers bits)
   for (fiber <- 0 until cfg.maxFibers) {
-    mfiu.io.aValid(fiber) := input.trip.a(fiber).valid
-    mfiu.io.aMask(fiber) := input.trip.a(fiber).mask
-    mfiu.io.bValid(fiber) := input.trip.b(fiber).valid
-    mfiu.io.bMask(fiber) := input.trip.b(fiber).mask
-    columnPacker.io.aValid(fiber) := input.trip.a(fiber).valid
-    columnPacker.io.aMask(fiber) := input.trip.a(fiber).mask
-    columnPacker.io.bValid(fiber) := input.trip.b(fiber).valid
-    columnPacker.io.bMask(fiber) := input.trip.b(fiber).mask
+    denseAChoices(fiber) := input.trip.a(fiber).valid &&
+      input.trip.a(fiber).mask === fullFiberMask
+    denseBChoices(fiber) := input.trip.b(fiber).valid &&
+      input.trip.b(fiber).mask === fullFiberMask
+  }
+  val denseFastPath = input.mode === TrapezoidDataflow.DenseIp &&
+    CountOne(denseAChoices) === 1 && CountOne(denseBChoices) === 1
+  val denseAFiber = UInt(cfg.fiberIndexWidth bits)
+  val denseBFiber = UInt(cfg.fiberIndexWidth bits)
+  denseAFiber := 0
+  denseBFiber := 0
+  for (fiber <- 0 until cfg.maxFibers) {
+    when(denseAChoices(fiber)) { denseAFiber := fiber }
+    when(denseBChoices(fiber)) { denseBFiber := fiber }
+  }
+  val denseA = input.trip.a(denseAFiber)
+  val denseB = input.trip.b(denseBFiber)
+  val useSparseTripRoute = input.mode === TrapezoidDataflow.TrIp ||
+    (input.mode === TrapezoidDataflow.DenseIp && !denseFastPath)
+  for (fiber <- 0 until cfg.maxFibers) {
+    mfiu.io.aValid(fiber) := useSparseTripRoute && input.trip.a(fiber).valid
+    mfiu.io.aMask(fiber) := Mux(useSparseTripRoute,
+      input.trip.a(fiber).mask, B(0, cfg.fiberWidth bits))
+    mfiu.io.bValid(fiber) := useSparseTripRoute && input.trip.b(fiber).valid
+    mfiu.io.bMask(fiber) := Mux(useSparseTripRoute,
+      input.trip.b(fiber).mask, B(0, cfg.fiberWidth bits))
+    columnPacker.io.aValid(fiber) := useSparseTripRoute &&
+      input.trip.a(fiber).valid
+    columnPacker.io.aMask(fiber) := Mux(useSparseTripRoute,
+      input.trip.a(fiber).mask, B(0, cfg.fiberWidth bits))
+    columnPacker.io.bValid(fiber) := useSparseTripRoute &&
+      input.trip.b(fiber).valid
+    columnPacker.io.bMask(fiber) := Mux(useSparseTripRoute,
+      input.trip.b(fiber).mask, B(0, cfg.fiberWidth bits))
   }
 
   val routed = PERowRoutePayload(cfg)
   routed.mode := input.mode
   routed.endOfTile := input.endOfTile
-  routed.selectedColumns := columnPacker.io.selectedColumns
-  routed.effectualMacs := mfiu.io.count
+  routed.selectedColumns := Mux(denseFastPath,
+    U(1, routed.selectedColumns.getWidth bits), columnPacker.io.selectedColumns)
+  routed.effectualMacs := Mux(denseFastPath,
+    U(cfg.fiberWidth, cfg.matchCountWidth bits), mfiu.io.count)
 
   for (fiber <- 0 until cfg.maxFibers) {
     routed.tripATags(fiber) := input.trip.a(fiber).tag
@@ -233,11 +265,23 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     val laneRoute = mfiu.io.routes(lane)
     val aFiber = input.trip.a(laneRoute.aFiber)
     val bFiber = input.trip.b(laneRoute.bFiber)
-    routed.tripValid(lane) := laneRoute.valid
-    routed.tripAFiber(lane) := laneRoute.aFiber
-    routed.tripBFiber(lane) := laneRoute.bFiber
-    routed.tripAOperand(lane) := aFiber.values(laneRoute.aValueIndex)
-    routed.tripBOperand(lane) := bFiber.values(laneRoute.bValueIndex)
+    if (lane < cfg.fiberWidth) {
+      routed.tripValid(lane) := Mux(denseFastPath, True, laneRoute.valid)
+      routed.tripAFiber(lane) := Mux(denseFastPath,
+        denseAFiber, laneRoute.aFiber)
+      routed.tripBFiber(lane) := Mux(denseFastPath,
+        denseBFiber, laneRoute.bFiber)
+      routed.tripAOperand(lane) := Mux(denseFastPath,
+        denseA.values(lane), aFiber.values(laneRoute.aValueIndex))
+      routed.tripBOperand(lane) := Mux(denseFastPath,
+        denseB.values(lane), bFiber.values(laneRoute.bValueIndex))
+    } else {
+      routed.tripValid(lane) := laneRoute.valid
+      routed.tripAFiber(lane) := laneRoute.aFiber
+      routed.tripBFiber(lane) := laneRoute.bFiber
+      routed.tripAOperand(lane) := aFiber.values(laneRoute.aValueIndex)
+      routed.tripBOperand(lane) := bFiber.values(laneRoute.bValueIndex)
+    }
   }
   val gustRouteErrors = Bits(cfg.cacheLineWords bits)
   for (lane <- 0 until cfg.cacheLineWords) {
@@ -270,8 +314,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   }
   val inputTripMode = input.mode === TrapezoidDataflow.DenseIp ||
     input.mode === TrapezoidDataflow.TrIp
-  routed.overflow := Mux(inputTripMode, mfiu.io.overflow,
-    gustRouteErrors.orR)
+  routed.overflow := Mux(denseFastPath, False,
+    Mux(inputTripMode, mfiu.io.overflow, gustRouteErrors.orR))
 
   val routeInput = Stream(PERowRoutePayload(cfg))
   routeInput.valid := inputStage.valid

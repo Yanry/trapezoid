@@ -85,6 +85,10 @@ class TrIpTileControllerSpec extends AnyFunSuite {
     dut.clockDomain.waitSampling()
     dut.io.start.valid #= false
 
+    val expectedDenseBypass = mode == TrapezoidDataflow.DenseIp &&
+      a.values.flatten.forall(_ != 0) && b.values.flatten.forall(_ != 0)
+    assert(dut.io.denseBypassActive.toBoolean == expectedDenseBypass)
+
     val observed = mutable.Map.empty[(Int, Int), Long]
     val observedOrder = mutable.ArrayBuffer.empty[(Int, Int)]
     var lastCount = 0

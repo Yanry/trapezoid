@@ -81,7 +81,7 @@ PE row 响应会返回：
 
 | Mode | 论文推荐场景 | 当前实现行为 |
 | --- | --- | --- |
-| `DenseIp` | D x D | 使用全有效 bitmask，通过 IP 路径完成乘法和按输出坐标归约 |
+| `DenseIp` | D x D | 单 A/B fiber 且 bitmask 全有效时旁路 MFIU，按固定 K lane 完成点积；其他输入回退到通用 IP 路径 |
 | `TrIp` | MS x MS、MS x D | 多 fiber 交叉、压缩路由、并行乘法和按 A-row/B-column 归约 |
 | `TrGt` | HS x HS | 四个 temporal subrow 各自访问固定 A-register slice，每个 subrow 每周期最多接收一个 B 元素 |
 | `TrGs` | HS x MS、HS x D | 广播 A0，在一个有序 cache line 的多个 N 坐标上并行产生和归约部分积 |
@@ -98,7 +98,7 @@ PE row 已拆分为五个逻辑阶段：
 4. `Reduce/Merge`：按输出坐标归约部分积；
 5. `Output`：将完整响应写入可配置深度的弹性寄存器 FIFO。
 
-前三个阶段之间使用支持同周期出入的弹性 `Stream` 流水寄存器。在无背压时，流水线填满后可以每周期接收一条命令；任一级停顿都会沿 `ready` 反压到命令入口。TrIP 利用 MFIU 输出按 fiber pair 连续排列的性质，通过共享的可切片 contiguous reduction tree 归约：每个树节点只比较并合并左右子树边界上的一个输出簇，而不是为最多 16 个候选输出分别复制一棵全宽加法树。这对应论文 MRN 的 reduction mode，并将加法器数量从 O(`maxFibers^2 * macLanes`) 降到 O(`macLanes`)。Gustavson 路径不再对整个 16-word cache line 构造全互比较排序器：TrGT 只对四个 subrow head 进行坐标排序，且每个 head 只能访问所属的 A-register slice；TrGS 固定广播 A0，并对已经按坐标排列的 cache-line 输入进行分层稳定压缩。之后两者复用对数深度 segmented prefix tree 合并相同坐标。跨 subrow 的 TrGT 路由或乱序的 TrGS cache line 都会置 overflow 并丢弃该响应。两条路径的组合加法深度均为 O(log2(lane 数))。默认响应 FIFO 深度为 2，并以 field-wise 弹性寄存器实现；下游停顿时会保持输出稳定，并允许前级继续运行到所有弹性存储占满。
+前三个阶段之间使用支持同周期出入的弹性 `Stream` 流水寄存器。在无背压时，流水线填满后可以每周期接收一条命令；任一级停顿都会沿 `ready` 反压到命令入口。DenseIp 在恰好一个全有效 A fiber 和一个全有效 B fiber 时直接按固定 K lane 送入 MAC，并把 MFIU 和动态列规划器输入隔离为零；这保持论文 dense IP 的固定路由和低稀疏控制翻转。显式选择 DenseIp 但输入并非该形态时仍回退到通用路径，保持 mode 与 density 解耦的接口语义。TrIP 利用 MFIU 输出按 fiber pair 连续排列的性质，通过共享的可切片 contiguous reduction tree 归约：每个树节点只比较并合并左右子树边界上的一个输出簇，而不是为最多 16 个候选输出分别复制一棵全宽加法树。这对应论文 MRN 的 reduction mode，并将加法器数量从 O(`maxFibers^2 * macLanes`) 降到 O(`macLanes`)。Gustavson 路径不再对整个 16-word cache line 构造全互比较排序器：TrGT 只对四个 subrow head 进行坐标排序，且每个 head 只能访问所属的 A-register slice；TrGS 固定广播 A0，并对已经按坐标排列的 cache-line 输入进行分层稳定压缩。之后两者复用对数深度 segmented prefix tree 合并相同坐标。跨 subrow 的 TrGT 路由或乱序的 TrGS cache line 都会置 overflow 并丢弃该响应。两条路径的组合加法深度均为 O(log2(lane 数))。默认响应 FIFO 深度为 2，并以 field-wise 弹性寄存器实现；下游停顿时会保持输出稳定，并允许前级继续运行到所有弹性存储占满。
 
 这次流水化没有改变 `PERowCommand`/`PERowResponse` 外部协议，也没有根据 density 改写 mode。代价是 PE row 不再是一拍命令/响应模块，上层必须只依赖 Stream 握手，不能假定固定的一拍响应延迟。
 
@@ -577,6 +577,8 @@ paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用�
 7. 通过同步读改写跨多个 K tile 累加同一个 C tile。
 
 当前已经达到 tile controller 验收标准：测试平台只需逐个装载 K tile 并发送 `start`，控制器会自动完成列规划、必要的 A-group 拆分、PE 命令生成、跨 K 累加和最终有序读回。
+
+当显式选择 DenseIp 且声明范围内的 A/B fiber 都是全有效 bitmask 时，controller 直接固定为一个 A fiber 和一个 B column 的 128-lane 批次，跳过 TrIP 所需的逐列 preflight；`denseBypassActive` 用于周期测试确认该路径。存在任意稀疏 fiber 时仍走原有动态规划路径。
 
 矩阵控制器进一步接收一次全局描述符并自动推进 M/N/K tile，软件不再逐 tile 发送 `start`。cached wrapper 已把当前流式 fiber 装载口连接到固定跨度的 cache fiber 记录，并完成运行时基地址范围检查，使软件不再逐 fiber 握手。阶段二剩余工作是解析可变长 CSR/CSC 描述符并连接 DMA。
 

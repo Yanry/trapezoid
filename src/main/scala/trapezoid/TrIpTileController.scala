@@ -49,6 +49,7 @@ class TrIpTileController(
     val plannedColumns = out UInt(fiberCounterWidth bits)
     val candidateColumnCount = out UInt(fiberCounterWidth bits)
     val activeRows = out Bits(cfg.peRows bits)
+    val denseBypassActive = out Bool()
   }
 
   val aStorage = Vec((0 until tileCfg.maxRows).map(_ => Reg(CompressedFiber(cfg))))
@@ -70,6 +71,7 @@ class TrIpTileController(
   val batchColumns = Reg(UInt(fiberCounterWidth bits)) init 1
   val outputCell = Reg(UInt(cellIndexWidth bits)) init 0
   val modeError = RegInit(False)
+  val denseBypassActive = RegInit(False)
   val doneReg = RegInit(False)
   val commandInFlight = RegInit(False)
   val accumulationOpen = RegInit(False)
@@ -88,6 +90,7 @@ class TrIpTileController(
   io.done := doneReg
   io.awaitingKTile := accumulationOpen
   io.unsupportedMode := modeError
+  io.denseBypassActive := denseBypassActive
   io.activeAOffset := aOffset
   io.activeAGroupSize := groupSize
   io.activeBBase := bBase
@@ -102,6 +105,7 @@ class TrIpTileController(
     for (index <- 0 until tileCfg.maxColumns) bLoaded(index) := False
     for (line <- 0 until pendingLineCount) pendingValid(line) := False
     modeError := False
+    denseBypassActive := False
     doneReg := False
     for (cell <- 0 until cellCount) resultValid(cell) := False
   }
@@ -436,6 +440,26 @@ class TrIpTileController(
     }
   }
 
+  val fullFiberMask = B((BigInt(1) << cfg.fiberWidth) - 1,
+    cfg.fiberWidth bits)
+  var allDeclaredARowsDense: Bool = True
+  for (row <- 0 until tileCfg.maxRows) {
+    val declared = U(row, tileCfg.rowCountWidth bits) < io.start.payload.rowCount
+    allDeclaredARowsDense = allDeclaredARowsDense &&
+      (!declared || (aLoaded(row) && aStorage(row).valid &&
+        aStorage(row).mask === fullFiberMask))
+  }
+  var allDeclaredBColumnsDense: Bool = True
+  for (column <- 0 until tileCfg.maxColumns) {
+    val declared = U(column, tileCfg.columnCountWidth bits) <
+      io.start.payload.columnCount
+    allDeclaredBColumnsDense = allDeclaredBColumnsDense &&
+      (!declared || (bLoaded(column) && bStorage(column).valid &&
+        bStorage(column).mask === fullFiberMask))
+  }
+  val denseStartBypass = io.start.payload.mode === TrapezoidDataflow.DenseIp &&
+    allDeclaredARowsDense && allDeclaredBColumnsDense
+
   def advanceSchedule(): Unit = {
     when(finalBatch) {
       bBase := 0
@@ -449,9 +473,14 @@ class TrIpTileController(
         }
       } otherwise {
         aOffset := (aOffset + groupSize).resized
-        groupSize := (U(cfg.maxFibers, fiberCounterWidth bits) -
-          (aOffset + groupSize).resized).resized
-        state := TrIpTileState.Preflight
+        when(denseBypassActive) {
+          groupSize := 1
+          state := TrIpTileState.Plan
+        } otherwise {
+          groupSize := (U(cfg.maxFibers, fiberCounterWidth bits) -
+            (aOffset + groupSize).resized).resized
+          state := TrIpTileState.Preflight
+        }
       }
     } otherwise {
       bBase := (bBase + batchColumns).resized
@@ -468,7 +497,9 @@ class TrIpTileController(
         columnCount := io.start.payload.columnCount
         lastKTile := io.start.payload.lastKTile
         aOffset := 0
-        groupSize := cfg.maxFibers
+        groupSize := Mux(denseStartBypass,
+          U(1, fiberCounterWidth bits), U(cfg.maxFibers, fiberCounterWidth bits))
+        denseBypassActive := denseStartBypass
         bBase := 0
         outputCell := 0
         val invalidStart = (io.start.payload.mode =/= TrapezoidDataflow.DenseIp &&
@@ -496,7 +527,8 @@ class TrIpTileController(
         when(io.start.payload.rowCount === 0 || io.start.payload.columnCount === 0) {
           doneReg := True
         } otherwise {
-          state := TrIpTileState.Preflight
+          state := Mux(denseStartBypass,
+            TrIpTileState.Plan, TrIpTileState.Preflight)
         }
       }
     }

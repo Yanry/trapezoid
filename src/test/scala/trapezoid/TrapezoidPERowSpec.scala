@@ -107,6 +107,36 @@ class TrapezoidPERowSpec extends AnyFunSuite {
     }
   }
 
+  test("DenseIp full fibers use fixed lanes from arbitrary fiber slots") {
+    simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      clearInputs(dut)
+      dut.io.command.payload.mode #= TrapezoidDataflow.DenseIp
+
+      dut.io.command.payload.trip.a(1).valid #= true
+      dut.io.command.payload.trip.a(1).tag #= 6
+      dut.io.command.payload.trip.a(1).mask #= 0xf
+      for ((value, index) <- Seq(1, 2, 3, 4).zipWithIndex) {
+        dut.io.command.payload.trip.a(1).values(index) #= value
+      }
+      dut.io.command.payload.trip.b(0).valid #= true
+      dut.io.command.payload.trip.b(0).tag #= 7
+      dut.io.command.payload.trip.b(0).mask #= 0xf
+      for ((value, index) <- Seq(5, 6, 7, 8).zipWithIndex) {
+        dut.io.command.payload.trip.b(0).values(index) #= value
+      }
+
+      issue(dut)
+      assert(!dut.io.response.payload.overflow.toBoolean)
+      assert(dut.io.response.payload.selectedColumns.toInt == 1)
+      assert(dut.io.response.payload.effectualMacs.toInt == cfg.fiberWidth)
+      assert(dut.io.response.payload.count.toInt == 1)
+      assert(dut.io.response.payload.results(0).row.toInt == 6)
+      assert(dut.io.response.payload.results(0).column.toInt == 7)
+      assert(dut.io.response.payload.results(0).value.toInt == 70)
+    }
+  }
+
   test("TrIP prefix routing and reduction scale across four by four fibers") {
     val wideCfg = cfg.copy(maxFibers = 4, macLanes = 16, outputLanes = 16)
     simConfig.compile(new TrapezoidPERow(wideCfg)).doSim { dut =>

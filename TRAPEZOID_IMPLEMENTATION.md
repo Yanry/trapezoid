@@ -61,7 +61,7 @@
 5. 生成 A/B fiber、坐标以及压缩值索引等路由信息；
 6. 当 effectual computation 超过 MAC lane 数时产生 `overflow`。
 
-当前实现完成了论文 MFIU 和 shift-unit 的等价逻辑功能。MFIU 已从单条全局候选前缀链改为两级结构：先并行形成最多 4 x 4 个 fiber-pair intersection，并用 pair-local prefix tree 生成局部 computation index；再用第二棵并行 prefix-sum tree 生成 pair offset，将匹配压缩到全局 MAC lane。这避免了 `maxFibers^2 * fiberWidth` 长度的串行前缀依赖；4 x 4 pair 配置的 offset 路径只有 4 层窄加法器，更接近论文 Fig. 11 的并行 intersection/prefix 组织。shift unit 使用的 A/B 压缩 value rank 也按源 fiber 预计算一次，由所有目标 lane 共享，不会为每个 lane 重复展开 popcount 网络。最终 lane 选择仍由 SpinalHDL 组合选择网络生成，还没有进一步映射成论文采用的 Benes network 物理结构。
+当前实现完成了论文 MFIU 和 shift-unit 的等价逻辑功能。最多 `4 x 4 x fiberWidth` 个 pair-major 候选先并行形成，随后进入分层稳定 compaction tree：每个节点根据左子树有效数，通过多级 shift 将右侧紧凑流拼接到左侧，而不是让每个 MAC lane 比较全部候选的全交叉网络。该网络保持 fiber-pair 和 K-coordinate 顺序，并只保留前 `macLanes` 项；独立计数路径仍报告完整 effectual computation 数和 overflow。shift unit 使用的 A/B 压缩 value rank 按源 fiber 通过并行 prefix tree 预计算一次，由所有目标 lane 共享。当前 route metadata 压缩已经分层化，但 PE row 随后的 A/B operand 动态选择仍由 SpinalHDL 组合 mux 实现，尚未映射成论文使用的两套 128 x 128 Benes distribution network。
 
 ### 2.4 动态 B 列打包
 
@@ -253,7 +253,13 @@ sbt -batch 'runMain trapezoid.GenerateCachedGustavsonSystem'
 7. 不属于 Gustavson 路径的 mode 通过 `unsupportedMode` 拒绝；
 8. busy 状态下 `clear` 会排空已进入 PE 的响应后安全中止。
 
-当前 accumulator 是寄存器式坐标 CAM 和确定性最小坐标选择网络，适合功能验证和小规模配置。TrGT subrow/FIFO 已由独立前端实现；后续仍需把 FIFO 和 accumulator 映射到本地 SRAM，并将最小坐标选择网络替换为可流水化 merge tree。
+当前 accumulator 使用按 `(row,column)` 排序的紧凑寄存器数组。每个 PE response 结果依次与有效前缀比较：命中时累加，未命中时插入对应位置并平移后续项。这样只需 O(`accumulatorEntries`) 个坐标比较器，结束时可以直接每周期流出一个有序结果；此前每个输出都重新进行全表最小坐标选择的 O(`accumulatorEntries^2`) 网络已经删除。TrGT subrow/FIFO 已由独立前端实现；后续仍需把 FIFO 和 accumulator 映射到本地 SRAM，并把逐项插入升级为可流水化的双流 merge tree。
+
+单个 paper 参数 Gustavson PE row 可以独立生成，便于在完整 128-row 阵列之前检查 RTL 规模和关键路径：
+
+```bash
+sbt -batch 'runMain trapezoid.GeneratePaperGustavsonTileEngine'
+```
 
 ### 2.11 TrGT/TrGS 前端与多 PE row 阵列
 
@@ -334,7 +340,7 @@ TrGT 前端暴露 accepted/issued B-element 计数，便于检查 FIFO 停顿和
 
 ### 3.1 功能验证
 
-当前共有 34 项自动测试，执行方式为：
+当前共有 36 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -343,6 +349,7 @@ sbt -batch test
 已验证：
 
 - TrIP 对多个压缩 fiber 的坐标交叉；
+- MFIU 分层 compactor 在 100 组固定种子随机输入下保持 pair-major 路由、value rank、完整计数和 overflow；
 - 压缩 values 索引和 MAC lane 路由；
 - 同一输出元素的多个部分积归约；
 - 动态 B column 选择和 effectual MAC 统计；
@@ -402,7 +409,7 @@ verilator --lint-only --Wall -Wno-fatal generated-cached-gustavson/*.v
 
 当前已生成的 RTL 目录都没有 lint error。剩余 warning 主要来自 SpinalHDL 生成的枚举调试字符串、未消费的调试/诊断信号和部分保留接口，不影响功能。
 
-此前已用 `TrapezoidConfig.paper.copy(peRows = 1)` 对论文参数的单个 PE row 做独立 elaboration。当前论文配置保持 128 个输入 MAC lane、128-wide fiber 和 `4 x 4` fiber intersection，但将响应修正为 16 个结果 lane：MRN 每条命令最多生成 16 个 TrIP 输出，TrGS 每条 cache line 也最多提供 16 个输出。该修正显著缩小 PE row 间接口和弹性寄存器面积。完整 128-row 阵列的生成、lint 和综合仍属于后续规模化工作。
+已对 paper 参数的单个 Gustavson/PE row 做独立 elaboration。当前论文配置保持 128 个输入 MAC lane、128-wide fiber 和 `4 x 4` fiber intersection，但将响应修正为 16 个结果 lane：MRN 每条命令最多生成 16 个 TrIP 输出，TrGS 每条 cache line 也最多提供 16 个输出。分层 MFIU compactor 将 `MultiFiberIntersection.v` 从旧结构约 `304.7 MB / 6,391,733` 行降到约 `17.7 MB / 205,127` 行，单行生成时间从约 68 秒降到 38 秒。该数字是生成 RTL 文本规模而非综合面积；完整 128-row 阵列的生成、lint 和综合仍属于后续规模化工作。
 
 ### 3.3 四种 mode 的论文规模周期模型
 
@@ -452,17 +459,19 @@ sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
 
 它仍使用 `4 x 4` 小配置，逐次运行真实 `TrIpTileController` 和 `GustavsonTileEngine`，并把每次硬件结果与 Scala 参考结果比较。该小基准适合做 RTL 正确性和控制器周期回归；论文规模模型适合快速检查 `256 x 256` workload 映射。两者用途不同。
 
-本轮每 PE row 私有 buffer 和并行 scatter 修改后的固定种子结果为：
+当前宽行 buffer、并行 scatter 和有序 Gustavson flush 修改后的固定种子结果为：
 
 | A/B 非零密度 | `DenseIp` | `TrIp` | `TrGt` | `TrGs` |
 | ---: | ---: | ---: | ---: | ---: |
-| 0% | 37.0 | 37.0 | 8.0 | 8.0 |
-| 25% | 39.7 | 39.7 | 34.3 | 34.3 |
-| 50% | 68.3 | 68.3 | 85.3 | 85.3 |
-| 75% | 110.7 | 110.7 | 138.7 | 138.7 |
-| 100% | 122.0 | 122.0 | 193.0 | 193.0 |
+| 0% | 37.0 | 37.0 | 7.0 | 7.0 |
+| 25% | 39.7 | 39.7 | 31.3 | 31.3 |
+| 50% | 68.3 | 68.3 | 75.0 | 75.0 |
+| 75% | 110.7 | 110.7 | 123.3 | 123.3 |
+| 100% | 122.0 | 122.0 | 177.0 | 177.0 |
 
 这些数字包含当前小 RTL 的 PE pipeline、controller 状态转换、TrIP scatter/读改写/有序读回和 Gustavson merge/flush；不包含外部 HBM，也不能直接与论文 128 x 128 阵列结果比较。
+
+与旧的逐结果全表最小选择相比，有序连续 flush 使 50% 密度的 TrGT/TrGS 从 `85.3` 降至 `75.0` 周期，100% 密度从 `193.0` 降至 `177.0` 周期。当前 merge 输入端仍逐项插入，因此下一步收益应来自 SRAM 双流 merge 和命令/merge 流水重叠。
 
 小 RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用同一个 `TrIpTileController` 调度和 PE 数据通路；`TrGt`/`TrGs` 同样共用 `GustavsonTileEngine`。接口已经允许任意 density 下显式选择每种 mode，但尚未加入使同一路径内两个 mode 产生不同周期行为的完整专用微架构优化。
 
@@ -506,7 +515,7 @@ sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
 当前 TrGT/TrGS 已能在任意 lane density 下完成命令内归约、跨命令累加、有序 flush、SRAM subrow FIFO 调度、多 PE row 分配和共享结果仲裁，但尚未完成：
 
 - 将 TrGT typed FIFO bank 与 TrIP 结果 buffer 统一成可按 mode 切换的同一组物理 SRAM；
-- 将寄存器式坐标 CAM 替换为可扩展的本地 buffer/merge tree；
+- 将当前有序寄存器 accumulator 替换为可扩展的本地 buffer/双流 merge tree；
 - 在 first-free 分配之上增加 row 成本估计、公平仲裁和描述符驱动的负载均衡；
 - 从 CSR row pointer 自动生成 B-row cache 区间，以及 DMA/HBM refill 流程。
 
@@ -570,7 +579,7 @@ sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
 
 验收标准：TrGT 和 TrGS 可以消费完整 CSR row，并直接输出完整、有序的 C row。
 
-六项均已完成可仿真的功能版本：第 2 项使用四个同步 `Mem` bank 推断 SRAM，但尚未与 TrIP 结果 buffer 复用同一物理实例。TrGS 已具有广播/列坐标分发路径，多个命令可持续累加相同坐标，`endOfTile` 后按坐标排序并背压输出；共享调度器可让多个 PE row 重叠执行，并保证一个 tile 的命令与输出边界不被拆散。固定宽度 B-row 区域已经通过统一 cache 完成 miss/refill/hit，后续重点是解析 CSR row pointer、统一物理 SRAM 和实现流水化 merge tree。
+六项均已完成可仿真的功能版本：第 2 项使用四个同步 `Mem` bank 推断 SRAM，但尚未与 TrIP 结果 buffer 复用同一物理实例。TrGS 已具有广播/列坐标分发路径，多个命令可持续累加相同坐标；有序寄存器 accumulator 已删除 flush 阶段的全表最小选择网络，并能在 `endOfTile` 后每周期输出一个结果。共享调度器可让多个 PE row 重叠执行，并保证一个 tile 的命令与输出边界不被拆散。固定宽度 B-row 区域已经通过统一 cache 完成 miss/refill/hit，后续重点是解析 CSR row pointer、统一物理 SRAM 和将逐项插入替换为流水化双流 merge tree。
 
 ### 阶段 4：实现多级存储系统（统一读协议、bank 仲裁与 refill 已完成）
 
@@ -599,8 +608,8 @@ sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
 
 1. 先对 1、4、16 个 PE row 做综合；
 2. 检查 MFIU 前缀逻辑和路由网络的关键路径；
-3. 在现有两级 fiber-pair MFIU、并行 prefix tree 和 stage 边界基础上，将组合 lane 选择替换为 Benes network；
-4. 当前 TrIP contiguous reduction tree 已按输出簇切片；下一步补齐 Gustavson 的流式 merge mode，并根据综合关键路径在树中增加可配置寄存器切分；
+3. 在现有分层 MFIU compactor、value-rank prefix tree 和 stage 边界基础上，将 A/B operand 动态 mux 替换为两套 Benes distribution network；
+4. 当前 TrIP contiguous reduction tree 已按输出簇切片，Gustavson flush 也已改为有序连续输出；下一步将 Gustavson 的逐项寄存器插入替换为 SRAM 双流 merge，并根据综合关键路径增加可配置寄存器切分；
 5. 再尝试生成和综合 128 x 128 paper 配置；
 6. 建立吞吐、利用率、面积、频率和存储流量统计。
 

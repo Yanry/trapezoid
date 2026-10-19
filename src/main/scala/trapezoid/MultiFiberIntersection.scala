@@ -12,6 +12,15 @@ import spinal.lib._
   */
 class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
   private val pairCount = cfg.maxFibers * cfg.maxFibers
+  private val routeValidOffset = 0
+  private val routeAFiberOffset = routeValidOffset + 1
+  private val routeBFiberOffset = routeAFiberOffset + cfg.fiberIndexWidth
+  private val routeCoordinateOffset = routeBFiberOffset + cfg.fiberIndexWidth
+  private val routeAValueOffset = routeCoordinateOffset + cfg.fiberValueIndexWidth
+  private val routeBValueOffset = routeAValueOffset + cfg.fiberValueIndexWidth
+  private val routeWidth = routeBValueOffset + cfg.fiberValueIndexWidth
+
+  private case class CompactedRoutes(entries: Vector[Bits], count: UInt)
 
   private def parallelPrefix(values: Seq[UInt]): Seq[UInt] = {
     var level = values.map(_.resize(cfg.matchCountWidth))
@@ -30,6 +39,58 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
     level
   }
 
+  /** Stable hierarchical compaction of pair-major route candidates.
+    *
+    * Each node concatenates two already compacted streams by shifting the
+    * right stream by the number of valid entries on the left. The barrel
+    * stages avoid the old output-lane by candidate all-to-all comparison.
+    */
+  private def compactRoutes(inputs: IndexedSeq[Bits]): CompactedRoutes = {
+    require(inputs.nonEmpty)
+    if (inputs.length == 1) {
+      val count = UInt(cfg.matchCountWidth bits)
+      count := inputs.head(routeValidOffset).asUInt.resize(cfg.matchCountWidth)
+      CompactedRoutes(Vector(inputs.head), count)
+    } else {
+      val split = inputs.length / 2
+      val left = compactRoutes(inputs.take(split))
+      val right = compactRoutes(inputs.drop(split))
+      val capacity = scala.math.min(cfg.macLanes,
+        left.entries.length + right.entries.length)
+      val storedCountWidth = log2Up(capacity + 1)
+      val leftStoredCount = UInt(storedCountWidth bits)
+      val leftFillsOutput = left.count >= capacity
+      leftStoredCount := Mux(leftFillsOutput,
+        U(capacity, storedCountWidth bits), left.count.resize(storedCountWidth))
+
+      val zeroRoute = B(0, routeWidth bits)
+      var shiftedRight = Vector.tabulate(capacity) { index =>
+        if (index < right.entries.length) right.entries(index) else zeroRoute
+      }
+      var distance = 1
+      var stage = 0
+      while (distance < capacity) {
+        val previous = shiftedRight
+        shiftedRight = Vector.tabulate(capacity) { index =>
+          val shifted = if (index >= distance) previous(index - distance) else zeroRoute
+          Mux(leftStoredCount(stage), shifted, previous(index))
+        }
+        distance *= 2
+        stage += 1
+      }
+
+      val entries = Vector.tabulate(capacity) { index =>
+        val leftEntry = if (index < left.entries.length) left.entries(index) else zeroRoute
+        Mux(leftFillsOutput ||
+          U(index, storedCountWidth bits) < leftStoredCount,
+          leftEntry, shiftedRight(index))
+      }
+      val count = UInt(cfg.matchCountWidth bits)
+      count := (left.count + right.count).resize(cfg.matchCountWidth)
+      CompactedRoutes(entries, count)
+    }
+  }
+
   val io = new Bundle {
     val aValid = in Vec(Bool(), cfg.maxFibers)
     val aMask = in Vec(Bits(cfg.fiberWidth bits), cfg.maxFibers)
@@ -44,35 +105,11 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
   // This mirrors the paper's parallel MFIU organization and avoids a single
   // maxFibers^2 * fiberWidth-long prefix dependency.
   val pairMasks = Vec(Bits(cfg.fiberWidth bits), pairCount)
-  val pairMatches = Vec(UInt(cfg.matchCountWidth bits), pairCount)
-  val pairLocalRanks = Vec(
-    Vec(UInt(cfg.matchCountWidth bits), cfg.fiberWidth), pairCount)
-  val pairOffsets = Vec(UInt(cfg.matchCountWidth bits), pairCount + 1)
   for (a <- 0 until cfg.maxFibers; b <- 0 until cfg.maxFibers) {
     val pair = a * cfg.maxFibers + b
     pairMasks(pair) := Mux(io.aValid(a) && io.bValid(b),
       io.aMask(a) & io.bMask(b), B(0, cfg.fiberWidth bits))
-    val localPrefix = parallelPrefix((0 until cfg.fiberWidth).map { coordinate =>
-      pairMasks(pair)(coordinate).asUInt.resize(cfg.matchCountWidth)
-    })
-    pairMatches(pair) := localPrefix.last
-    pairLocalRanks(pair)(0) := 0
-    for (coordinate <- 1 until cfg.fiberWidth) {
-      pairLocalRanks(pair)(coordinate) := localPrefix(coordinate - 1)
-    }
   }
-
-  // The paper's cumulative match indices are produced by a prefix tree.
-  // Keep the pair-local popcounts in parallel, then scan only the 4 x 4 pair
-  // counts; this bounds the offset path to log2(maxFibers^2) adder levels.
-  val inclusivePairCounts = parallelPrefix(pairMatches.toSeq)
-  pairOffsets(0) := 0
-  for (pair <- 0 until pairCount) {
-    pairOffsets(pair + 1) := inclusivePairCounts(pair)
-  }
-
-  io.count := pairOffsets.last
-  io.overflow := pairOffsets.last > cfg.macLanes
 
   // The shift unit's compressed-value ranks depend only on one source fiber.
   // Build each rank network once and share it across all destination lanes.
@@ -95,27 +132,48 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
     }
   }
 
-  for (lane <- 0 until cfg.macLanes) {
-    io.routes(lane).valid := False
-    io.routes(lane).aFiber := 0
-    io.routes(lane).bFiber := 0
-    io.routes(lane).coordinate := 0
-    io.routes(lane).aValueIndex := 0
-    io.routes(lane).bValueIndex := 0
+  private val candidates = for {
+    a <- 0 until cfg.maxFibers
+    b <- 0 until cfg.maxFibers
+    coordinate <- 0 until cfg.fiberWidth
+  } yield {
+    val pair = a * cfg.maxFibers + b
+    val route = Bits(routeWidth bits)
+    route := 0
+    route(routeValidOffset) := pairMasks(pair)(coordinate)
+    route(routeAFiberOffset + cfg.fiberIndexWidth - 1 downto routeAFiberOffset) :=
+      U(a, cfg.fiberIndexWidth bits).asBits
+    route(routeBFiberOffset + cfg.fiberIndexWidth - 1 downto routeBFiberOffset) :=
+      U(b, cfg.fiberIndexWidth bits).asBits
+    route(routeCoordinateOffset + cfg.fiberValueIndexWidth - 1 downto
+      routeCoordinateOffset) := U(coordinate, cfg.fiberValueIndexWidth bits).asBits
+    route(routeAValueOffset + cfg.fiberValueIndexWidth - 1 downto
+      routeAValueOffset) := aValueRanks(a)(coordinate).asBits
+    route(routeBValueOffset + cfg.fiberValueIndexWidth - 1 downto
+      routeBValueOffset) := bValueRanks(b)(coordinate).asBits
+    route
+  }
+  private val compacted = compactRoutes(candidates)
+  require(compacted.entries.length == cfg.macLanes)
+  io.count := compacted.count
+  io.overflow := compacted.count > cfg.macLanes
 
-    for (a <- 0 until cfg.maxFibers; b <- 0 until cfg.maxFibers; k <- 0 until cfg.fiberWidth) {
-      val pair = a * cfg.maxFibers + b
-      val globalRank =
-        (pairOffsets(pair) + pairLocalRanks(pair)(k)).resize(cfg.matchCountWidth)
-      when(pairMasks(pair)(k) && globalRank === lane) {
-        io.routes(lane).valid := True
-        io.routes(lane).aFiber := a
-        io.routes(lane).bFiber := b
-        io.routes(lane).coordinate := k
-        io.routes(lane).aValueIndex := aValueRanks(a)(k)
-        io.routes(lane).bValueIndex := bValueRanks(b)(k)
-      }
-    }
+  for (lane <- 0 until cfg.macLanes) {
+    val route = compacted.entries(lane)
+    io.routes(lane).valid := route(routeValidOffset)
+    io.routes(lane).aFiber := route(
+      routeAFiberOffset + cfg.fiberIndexWidth - 1 downto routeAFiberOffset).asUInt
+    io.routes(lane).bFiber := route(
+      routeBFiberOffset + cfg.fiberIndexWidth - 1 downto routeBFiberOffset).asUInt
+    io.routes(lane).coordinate := route(
+      routeCoordinateOffset + cfg.fiberValueIndexWidth - 1 downto
+        routeCoordinateOffset).asUInt
+    io.routes(lane).aValueIndex := route(
+      routeAValueOffset + cfg.fiberValueIndexWidth - 1 downto
+        routeAValueOffset).asUInt
+    io.routes(lane).bValueIndex := route(
+      routeBValueOffset + cfg.fiberValueIndexWidth - 1 downto
+        routeBValueOffset).asUInt
   }
 }
 

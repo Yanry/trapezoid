@@ -4,15 +4,15 @@ import spinal.core._
 import spinal.lib._
 
 object GustavsonTileState extends SpinalEnum {
-  val Accept, WaitResponse, Merge, FindMinimum, Output, AbortDrain = newElement()
+  val Accept, WaitResponse, Merge, Output, AbortDrain = newElement()
 }
 
 /** Multi-command coordinate accumulator for the TrGT and TrGS paths.
   *
   * Each command is first reduced by a PE row.  Results with the same matrix
-  * coordinate are then accumulated across commands.  The command carrying
-  * endOfTile closes the tile and causes all entries to be emitted in ascending
-  * (row, column) order.  TrGT and TrGS are both legal at every lane density.
+  * coordinate are then inserted into a compact coordinate-sorted accumulator.
+  * The command carrying endOfTile closes the tile and streams the sorted prefix
+  * directly. TrGT and TrGS are both legal at every lane density.
   */
 class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
   private val cfg = tileCfg.core
@@ -39,9 +39,8 @@ class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
   val responseIndex = Reg(UInt(responseIndexWidth bits)) init 0
   val responseReg = Reg(PERowResponse(cfg))
   val outputIndex = Reg(UInt(tileCfg.entryIndexWidth bits)) init 0
-  val outputReg = Reg(MatrixResult(cfg))
 
-  val entryValid = Vec((0 until tileCfg.accumulatorEntries).map(_ => RegInit(False)))
+  val entryCount = Reg(UInt(tileCfg.entryCountWidth bits)) init 0
   val entryRow = Vec((0 until tileCfg.accumulatorEntries).map(_ =>
     Reg(UInt(cfg.coordinateWidth bits)) init 0))
   val entryColumn = Vec((0 until tileCfg.accumulatorEntries).map(_ =>
@@ -49,14 +48,18 @@ class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
   val entryValue = Vec((0 until tileCfg.accumulatorEntries).map(_ =>
     Reg(SInt(cfg.accumulatorWidth bits)) init 0))
 
-  val activeCount = CountOne(entryValid.asBits).resize(tileCfg.entryCountWidth)
   io.busy := tileOpen || state =/= GustavsonTileState.Accept
   io.done := doneReg
   io.overflow := overflowReg
   io.unsupportedMode := modeError
-  io.activeEntries := activeCount
+  io.activeEntries := entryCount
   io.result.valid := state === GustavsonTileState.Output
-  io.result.payload := outputReg
+  io.result.payload.valid := True
+  io.result.payload.row := entryRow(outputIndex)
+  io.result.payload.column := entryColumn(outputIndex)
+  io.result.payload.value := entryValue(outputIndex)
+  io.result.payload.endOfTile :=
+    outputIndex.resize(tileCfg.entryCountWidth) + 1 === entryCount
 
   val supportedMode = io.command.payload.mode === TrapezoidDataflow.TrGt ||
     io.command.payload.mode === TrapezoidDataflow.TrGs
@@ -72,45 +75,32 @@ class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
 
   val currentResult = responseReg.results(responseIndex)
   val coordinateMatches = Vec(Bool(), tileCfg.accumulatorEntries)
-  val freeChoices = Vec(Bool(), tileCfg.accumulatorEntries)
+  val currentComesBefore = Vec(Bool(), tileCfg.accumulatorEntries)
+  val insertionChoices = Vec(Bool(), tileCfg.accumulatorEntries)
+  val insertionPrefix = Vec(Bool(), tileCfg.accumulatorEntries + 1)
+  insertionPrefix(0) := False
   for (entry <- 0 until tileCfg.accumulatorEntries) {
-    coordinateMatches(entry) := entryValid(entry) &&
+    val active = U(entry, tileCfg.entryCountWidth bits) < entryCount
+    coordinateMatches(entry) := active &&
       entryRow(entry) === currentResult.row && entryColumn(entry) === currentResult.column
-    var earlierFree: Bool = False
-    for (previous <- 0 until entry) earlierFree = earlierFree || !entryValid(previous)
-    freeChoices(entry) := !entryValid(entry) && !earlierFree
+    currentComesBefore(entry) := active &&
+      (currentResult.row < entryRow(entry) ||
+        (currentResult.row === entryRow(entry) &&
+          currentResult.column < entryColumn(entry)))
+    insertionChoices(entry) := currentComesBefore(entry) && !insertionPrefix(entry)
+    insertionPrefix(entry + 1) := insertionPrefix(entry) || currentComesBefore(entry)
   }
   val matchFound = coordinateMatches.asBits.orR
-  val freeFound = freeChoices.asBits.orR
   val matchIndex = UInt(tileCfg.entryIndexWidth bits)
-  val freeIndex = UInt(tileCfg.entryIndexWidth bits)
+  val insertionIndex = UInt(tileCfg.entryIndexWidth bits)
   matchIndex := 0
-  freeIndex := 0
+  insertionIndex := entryCount.resize(tileCfg.entryIndexWidth)
   for (entry <- 0 until tileCfg.accumulatorEntries) {
     when(coordinateMatches(entry)) { matchIndex := entry }
-    when(freeChoices(entry)) { freeIndex := entry }
+    when(insertionChoices(entry)) { insertionIndex := entry }
   }
-
-  // A deterministic all-entry comparison produces one minimum coordinate.
-  val minimumFlags = Vec(Bool(), tileCfg.accumulatorEntries)
-  for (entry <- 0 until tileCfg.accumulatorEntries) {
-    var beaten: Bool = False
-    for (other <- 0 until tileCfg.accumulatorEntries if other != entry) {
-      val lowerCoordinate = entryRow(other) < entryRow(entry) ||
-        (entryRow(other) === entryRow(entry) && entryColumn(other) < entryColumn(entry))
-      val equalEarlier = if (other < entry) {
-        entryRow(other) === entryRow(entry) && entryColumn(other) === entryColumn(entry)
-      } else False
-      beaten = beaten || (entryValid(other) && (lowerCoordinate || equalEarlier))
-    }
-    minimumFlags(entry) := entryValid(entry) && !beaten
-  }
-  val minimumFound = minimumFlags.asBits.orR
-  val minimumIndex = UInt(tileCfg.entryIndexWidth bits)
-  minimumIndex := 0
-  for (entry <- 0 until tileCfg.accumulatorEntries) {
-    when(minimumFlags(entry)) { minimumIndex := entry }
-  }
+  val insertionAccepted = currentResult.valid && !matchFound &&
+    entryCount =/= tileCfg.accumulatorEntries
 
   switch(state) {
     is(GustavsonTileState.Accept) {
@@ -121,13 +111,13 @@ class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
           commandInFlight := True
           finalCommand := io.command.payload.endOfTile
           when(!tileOpen) {
-            for (entry <- 0 until tileCfg.accumulatorEntries) entryValid(entry) := False
+            entryCount := 0
             overflowReg := False
           }
           tileOpen := True
           state := GustavsonTileState.WaitResponse
         } otherwise {
-          for (entry <- 0 until tileCfg.accumulatorEntries) entryValid(entry) := False
+          entryCount := 0
           tileOpen := False
           overflowReg := False
           modeError := True
@@ -142,8 +132,18 @@ class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
         responseIndex := 0
         commandInFlight := False
         when(pe.io.response.payload.count === 0) {
-          when(finalCommand) { state := GustavsonTileState.FindMinimum }
-            .otherwise { state := GustavsonTileState.Accept }
+          when(finalCommand) {
+            when(entryCount === 0) {
+              tileOpen := False
+              doneReg := True
+              state := GustavsonTileState.Accept
+            } otherwise {
+              outputIndex := 0
+              state := GustavsonTileState.Output
+            }
+          } otherwise {
+            state := GustavsonTileState.Accept
+          }
         } otherwise {
           state := GustavsonTileState.Merge
         }
@@ -154,11 +154,24 @@ class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
       when(currentResult.valid) {
         when(matchFound) {
           entryValue(matchIndex) := (entryValue(matchIndex) + currentResult.value).resized
-        } elsewhen(freeFound) {
-          entryValid(freeIndex) := True
-          entryRow(freeIndex) := currentResult.row
-          entryColumn(freeIndex) := currentResult.column
-          entryValue(freeIndex) := currentResult.value
+        } elsewhen(entryCount =/= tileCfg.accumulatorEntries) {
+          for (entry <- 1 until tileCfg.accumulatorEntries) {
+            when(U(entry, tileCfg.entryCountWidth bits) >
+                insertionIndex.resize(tileCfg.entryCountWidth) &&
+                U(entry, tileCfg.entryCountWidth bits) <= entryCount) {
+              entryRow(entry) := entryRow(entry - 1)
+              entryColumn(entry) := entryColumn(entry - 1)
+              entryValue(entry) := entryValue(entry - 1)
+            }
+          }
+          for (entry <- 0 until tileCfg.accumulatorEntries) {
+            when(insertionIndex === entry) {
+              entryRow(entry) := currentResult.row
+              entryColumn(entry) := currentResult.column
+              entryValue(entry) := currentResult.value
+            }
+          }
+          entryCount := entryCount + 1
         } otherwise {
           overflowReg := True
         }
@@ -166,38 +179,32 @@ class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
 
       when(responseIndex === (responseReg.count - 1).resized) {
         responseIndex := 0
-        when(finalCommand) { state := GustavsonTileState.FindMinimum }
-          .otherwise { state := GustavsonTileState.Accept }
+        when(finalCommand) {
+          when(entryCount =/= 0 || insertionAccepted) {
+            outputIndex := 0
+            state := GustavsonTileState.Output
+          } otherwise {
+            tileOpen := False
+            doneReg := True
+            state := GustavsonTileState.Accept
+          }
+        } otherwise {
+          state := GustavsonTileState.Accept
+        }
       } otherwise {
         responseIndex := responseIndex + 1
       }
     }
 
-    is(GustavsonTileState.FindMinimum) {
-      when(minimumFound) {
-        outputIndex := minimumIndex
-        outputReg.valid := True
-        outputReg.row := entryRow(minimumIndex)
-        outputReg.column := entryColumn(minimumIndex)
-        outputReg.value := entryValue(minimumIndex)
-        outputReg.endOfTile := activeCount === 1
-        state := GustavsonTileState.Output
-      } otherwise {
-        tileOpen := False
-        doneReg := True
-        state := GustavsonTileState.Accept
-      }
-    }
-
     is(GustavsonTileState.Output) {
       when(io.result.ready) {
-        entryValid(outputIndex) := False
-        when(outputReg.endOfTile) {
+        when(io.result.payload.endOfTile) {
+          entryCount := 0
           tileOpen := False
           doneReg := True
           state := GustavsonTileState.Accept
         } otherwise {
-          state := GustavsonTileState.FindMinimum
+          outputIndex := outputIndex + 1
         }
       }
     }
@@ -211,7 +218,7 @@ class GustavsonTileEngine(tileCfg: GustavsonTileConfig) extends Component {
   }
 
   when(io.clear) {
-    for (entry <- 0 until tileCfg.accumulatorEntries) entryValid(entry) := False
+    entryCount := 0
     tileOpen := False
     doneReg := False
     overflowReg := False
@@ -407,6 +414,14 @@ object GenerateGustavsonTileEngine extends App {
     targetDirectory = "generated-gustavson",
     oneFilePerComponent = true
   ).generate(new GustavsonTileEngine(GustavsonTileConfig(TrapezoidConfig.small)))
+}
+
+object GeneratePaperGustavsonTileEngine extends App {
+  SpinalConfig(
+    mode = Verilog,
+    targetDirectory = "generated-paper-gustavson",
+    oneFilePerComponent = true
+  ).generate(new GustavsonTileEngine(GustavsonTileConfig(TrapezoidConfig.paper)))
 }
 
 object GenerateGustavsonArray extends App {

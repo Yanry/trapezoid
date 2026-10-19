@@ -35,6 +35,7 @@ vhdl/
 *.sv
 *.vh
 *.vhd
+*.lst
 
 # Spinal internal
 .spinal/

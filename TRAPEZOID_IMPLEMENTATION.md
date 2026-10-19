@@ -35,7 +35,7 @@
 工程提供两套预定义配置：
 
 - `TrapezoidConfig.small`：默认 4 个 PE row，每行 16 个 MAC，用于快速生成和仿真；
-- `TrapezoidConfig.paper`：128 个 PE row，每行 128 个 MAC、16-word cache line，对应论文 Table I 的主要阵列尺寸。
+- `TrapezoidConfig.paper`：128 个 PE row，每行 128 个 MAC、16-word cache line、16 个归约结果槽，对应论文 Table I 的主要阵列尺寸。16 个结果槽覆盖 TrIP 的 `4 x 4` 输出矩阵，也覆盖 TrGS 每周期最多 16 个 cache-line 元素；它不等于 128 个 MAC lane。Gustavson 整 tile 累加表容量与 response 宽度解耦，paper 默认仍为 128 项，可保存一条完整 C row。
 
 ### 2.2 统一的数据类型和流接口
 
@@ -97,7 +97,7 @@ PE row 已拆分为五个逻辑阶段：
 4. `Reduce/Merge`：按输出坐标归约部分积；
 5. `Output`：将完整响应写入可配置深度的弹性寄存器 FIFO。
 
-前三个阶段之间使用支持同周期出入的弹性 `Stream` 流水寄存器。在无背压时，流水线填满后可以每周期接收一条命令；任一级停顿都会沿 `ready` 反压到命令入口。TrIP 利用 MFIU 输出按 fiber pair 连续排列的性质，通过共享的可切片 contiguous reduction tree 归约：每个树节点只比较并合并左右子树边界上的一个输出簇，而不是为最多 16 个候选输出分别复制一棵全宽加法树。这对应论文 MRN 的 reduction mode，并将加法器数量从 O(`maxFibers^2 * macLanes`) 降到 O(`macLanes`)。Gustavson 路径仍允许命令内坐标任意排列，使用平衡加法树合并相同坐标。两条路径的组合加法深度均为 O(log2(lane 数))。默认响应 FIFO 深度为 2，并以 field-wise 弹性寄存器实现，避免 paper 配置的超宽 `PERowResponse` 被 `StreamFifo` 压成超过 SpinalHDL 1.7 限制的单个 `Bits`；下游停顿时会保持输出稳定，并允许前级继续运行到所有弹性存储占满。
+前三个阶段之间使用支持同周期出入的弹性 `Stream` 流水寄存器。在无背压时，流水线填满后可以每周期接收一条命令；任一级停顿都会沿 `ready` 反压到命令入口。TrIP 利用 MFIU 输出按 fiber pair 连续排列的性质，通过共享的可切片 contiguous reduction tree 归约：每个树节点只比较并合并左右子树边界上的一个输出簇，而不是为最多 16 个候选输出分别复制一棵全宽加法树。这对应论文 MRN 的 reduction mode，并将加法器数量从 O(`maxFibers^2 * macLanes`) 降到 O(`macLanes`)。Gustavson 路径仍允许命令内坐标任意排列，使用平衡加法树合并相同坐标。两条路径的组合加法深度均为 O(log2(lane 数))。默认响应 FIFO 深度为 2，并以 field-wise 弹性寄存器实现；下游停顿时会保持输出稳定，并允许前级继续运行到所有弹性存储占满。
 
 这次流水化没有改变 `PERowCommand`/`PERowResponse` 外部协议，也没有根据 density 改写 mode。代价是 PE row 不再是一拍命令/响应模块，上层必须只依赖 Stream 握手，不能假定固定的一拍响应延迟。
 
@@ -111,7 +111,7 @@ PE row 已拆分为五个逻辑阶段：
 - 读响应有效信号；
 - 可配置的 bank 深度。
 
-它可以作为 TrIP 输出 scatter buffer 或 TrGT 的 B-row FIFO。通用 `Trapezoid` 顶层仍开放本地 buffer 端口；`TrIpTileController` 已经自动将 PE 输出 scatter 到四 bank buffer，并按 row-major 顺序读回。
+它可以作为 TrIP 输出 scatter buffer 或 TrGT 的 B-row FIFO。通用 `Trapezoid` 顶层仍开放本地 buffer 端口；`TrIpTileController` 为每个 PE row 例化独立的四 bank buffer，使用 `A fiber/subrow -> bank`、`B column -> address` 的映射。所有 PE row 并行处理同一个 response lane，并按 row-major 顺序从对应 PE buffer 读回。scatter 只遍历各 PE 实际 `count` 的最大值，不再固定扫描所有结果槽。
 
 ### 2.7 顶层阵列和 RTL 生成
 
@@ -226,7 +226,7 @@ sbt -batch 'runMain trapezoid.GenerateCachedGustavsonSystem'
 3. 同时计算所有活动 PE row 的 B-column 容量并取全局最小值；
 4. 在发送一个 A fiber group 前复用列规划器顺序预检全部 B column；若任意单列可能溢出，则先缩小 group 并重新扫描，避免处理中途改变分组和重复累加；
 5. 原子地向所有 PE row 分发命令，避免部分 PE 提前接受批次；
-6. 收集所有 PE 响应，并逐项 scatter 到控制器内的四 bank 结果 buffer；
+6. 收集所有 PE 响应，并让各 PE row 并行 scatter 到各自的四 bank 结果 buffer；
 7. 使用 `firstKTile/lastKTile` 描述 K 序列，在四 bank buffer 中同步读改写并跨 K tile 累加；
 8. 中间 K tile 只完成累加，最后一个 K tile 才按 row-major 顺序读回结果；
 9. 支持输出背压、稳定的 `endOfTile`、保持型 `done` 和 `awaitingKTile` 状态；
@@ -398,7 +398,7 @@ verilator --lint-only --Wall -Wno-fatal generated-cached-gustavson/*.v
 
 当前已生成的 RTL 目录都没有 lint error。剩余 warning 主要来自 SpinalHDL 生成的枚举调试字符串、未消费的调试/诊断信号和部分保留接口，不影响功能。
 
-此外，已用 `TrapezoidConfig.paper.copy(peRows = 1)` 对论文参数的单个 PE row 做独立 elaboration：128 个 FP32 宽输入 MAC lane、128-wide fiber、4 x 4 fiber intersection 和 128 个输出 lane 均成功生成 Verilog。输出缓冲使用 field-wise 弹性寄存器，避免 SpinalHDL 1.7 将约 13.6 Kbit 的完整响应压成超宽单一 `Bits`。该检查只覆盖单 PE row 的 RTL 可生成性；完整 128-row 阵列的生成、lint 和综合仍属于后续规模化工作。
+此前已用 `TrapezoidConfig.paper.copy(peRows = 1)` 对论文参数的单个 PE row 做独立 elaboration。当前论文配置保持 128 个输入 MAC lane、128-wide fiber 和 `4 x 4` fiber intersection，但将响应修正为 16 个结果 lane：MRN 每条命令最多生成 16 个 TrIP 输出，TrGS 每条 cache line 也最多提供 16 个输出。该修正显著缩小 PE row 间接口和弹性寄存器面积。完整 128-row 阵列的生成、lint 和综合仍属于后续规模化工作。
 
 ### 3.3 四种 mode 的论文规模周期模型
 
@@ -448,6 +448,18 @@ sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
 
 它仍使用 `4 x 4` 小配置，逐次运行真实 `TrIpTileController` 和 `GustavsonTileEngine`，并把每次硬件结果与 Scala 参考结果比较。该小基准适合做 RTL 正确性和控制器周期回归；论文规模模型适合快速检查 `256 x 256` workload 映射。两者用途不同。
 
+本轮每 PE row 私有 buffer 和并行 scatter 修改后的固定种子结果为：
+
+| A/B 非零密度 | `DenseIp` | `TrIp` | `TrGt` | `TrGs` |
+| ---: | ---: | ---: | ---: | ---: |
+| 0% | 37.0 | 37.0 | 8.0 | 8.0 |
+| 25% | 40.3 | 40.3 | 34.3 | 34.3 |
+| 50% | 71.3 | 71.3 | 85.3 | 85.3 |
+| 75% | 111.7 | 111.7 | 138.7 | 138.7 |
+| 100% | 122.0 | 122.0 | 193.0 | 193.0 |
+
+这些数字包含当前小 RTL 的 PE pipeline、controller 状态转换、TrIP scatter/读改写/有序读回和 Gustavson merge/flush；不包含外部 HBM，也不能直接与论文 128 x 128 阵列结果比较。
+
 小 RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用同一个 `TrIpTileController` 调度和 PE 数据通路；`TrGt`/`TrGs` 同样共用 `GustavsonTileEngine`。接口已经允许任意 density 下显式选择每种 mode，但尚未加入使同一路径内两个 mode 产生不同周期行为的完整专用微架构优化。
 
 ### 3.4 当前适用范围
@@ -483,7 +495,7 @@ sbt -batch 'Test/runMain trapezoid.SmallRtlDataflowLatencyBenchmark'
 
 ### 4.2 缺少全局 cache 和 DMA
 
-当前已实现一个参数化 multi-client、multi-bank direct-mapped 读 cache，以及每 bank 一个独立 miss 的共享 refill 协议。TrIP 矩阵前端和 Gustavson B-row 前端都已经与实际 cache、外部 refill 端口封装成完整读系统，但仍未实现论文中的 4 个 cache cluster、完整 32 x 32 cluster 互连、写 cache/dirty eviction、HBM 请求和 DMA。通用顶层的每 PE row 本地 buffer 仍由外部端口控制；TrIP tile controller 使用独立的四 bank 结果 buffer 完成自动 scatter 和有序读回。后续需要把结果写回映射到统一存储层次。
+当前已实现一个参数化 multi-client、multi-bank direct-mapped 读 cache，以及每 bank 一个独立 miss 的共享 refill 协议。TrIP 矩阵前端和 Gustavson B-row 前端都已经与实际 cache、外部 refill 端口封装成完整读系统，但仍未实现论文中的 4 个 cache cluster、完整 32 x 32 cluster 互连、写 cache/dirty eviction、HBM 请求和 DMA。通用顶层的每 PE row 本地 buffer 仍由外部端口控制；TrIP tile controller 已改为每个 PE row 独占一个四 bank 结果 buffer，完成并行 scatter 和有序读回。后续仍需把 TrIP 与 Gustavson 的两套存储封装统一成同一物理 SRAM。
 
 ### 4.3 Gustavson 存储和并行调度仍待完成
 

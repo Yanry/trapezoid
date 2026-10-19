@@ -13,7 +13,8 @@ object TrIpTileState extends SpinalEnum {
   * Rows of A and columns of B are loaded as compressed fibers.  The scheduler
   * partitions A fibers when necessary, finds a B-column prefix that fits every
   * active PE row, dispatches all rows atomically, scatters results into the
-  * four-bank local buffer, and reads them back in row-major load order.
+  * PE-row-private four-bank local buffers, and reads them back in row-major
+  * load order. All PE rows scatter the same response lane in parallel.
   * DenseIp and TrIp are both accepted at any input density; mode selection is
   * always controlled by the caller.
   */
@@ -61,7 +62,6 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
   val groupSize = Reg(UInt(fiberCounterWidth bits)) init cfg.maxFibers
   val bBase = Reg(UInt(tileCfg.columnIndexWidth bits)) init 0
   val batchColumns = Reg(UInt(fiberCounterWidth bits)) init 1
-  val scatterPe = Reg(UInt(peIndexWidth bits)) init 0
   val scatterLane = Reg(UInt(outputIndexWidth bits)) init 0
   val outputCell = Reg(UInt(cellIndexWidth bits)) init 0
   val modeError = RegInit(False)
@@ -69,8 +69,12 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
   val commandInFlight = RegInit(False)
   val accumulationOpen = RegInit(False)
   val lastKTile = RegInit(True)
-  val pendingCell = Reg(UInt(cellIndexWidth bits)) init 0
-  val pendingValue = Reg(SInt(cfg.accumulatorWidth bits)) init 0
+  val pendingValid = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
+  val pendingBank = Vec((0 until cfg.peRows).map(_ => Reg(UInt(bankIndexWidth bits)) init 0))
+  val pendingAddress = Vec((0 until cfg.peRows).map(_ =>
+    Reg(UInt(cfg.localAddressWidth bits)) init 0))
+  val pendingValue = Vec((0 until cfg.peRows).map(_ =>
+    Reg(SInt(cfg.accumulatorWidth bits)) init 0))
   val outputReg = Reg(MatrixResult(cfg))
   val resultValid = Vec((0 until cellCount).map(_ => RegInit(False)))
 
@@ -90,6 +94,7 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
   when(io.clear) {
     for (index <- 0 until tileCfg.maxRows) aLoaded(index) := False
     for (index <- 0 until tileCfg.maxColumns) bLoaded(index) := False
+    for (pe <- 0 until cfg.peRows) pendingValid(pe) := False
     modeError := False
     doneReg := False
     for (cell <- 0 until cellCount) resultValid(cell) := False
@@ -189,76 +194,118 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
         state === TrIpTileState.AbortDrain
   }
 
-  val currentResponse = if (cfg.peRows == 1) responseRegs(0) else responseRegs(scatterPe)
-  val currentResult = currentResponse.results(scatterLane)
+  val maxResponseCount = responseRegs.map(_.count)
+    .reduce((left, right) => Mux(left > right, left, right))
 
-  val rowFound = Bool()
-  val rowSlot = UInt(tileCfg.rowIndexWidth bits)
-  rowFound := False
-  rowSlot := 0
-  for (row <- 0 until tileCfg.maxRows) {
-    when(aLoaded(row) && U(row, tileCfg.rowCountWidth bits) < rowCount &&
-        aStorage(row).tag === currentResult.row) {
-      rowFound := True
-      rowSlot := row
+  val localBuffers = Array.fill(cfg.peRows)(new BankedLocalBuffer(cfg))
+  val currentResults = Vec((0 until cfg.peRows).map(pe =>
+    responseRegs(pe).results(scatterLane)))
+  val scatterRowFound = Vec(Bool(), cfg.peRows)
+  val scatterLocalRow = Vec(UInt(cfg.fiberIndexWidth bits), cfg.peRows)
+  val scatterColumnFound = Vec(Bool(), cfg.peRows)
+  val scatterColumn = Vec(UInt(tileCfg.columnIndexWidth bits), cfg.peRows)
+  val scatterGlobalCell = Vec(UInt(cellIndexWidth bits), cfg.peRows)
+  val scatterBank = Vec(UInt(bankIndexWidth bits), cfg.peRows)
+  val scatterAddress = Vec(UInt(cfg.localAddressWidth bits), cfg.peRows)
+  val scatterNeedsAccumulation = Vec(Bool(), cfg.peRows)
+
+  for (pe <- 0 until cfg.peRows) {
+    scatterRowFound(pe) := False
+    scatterLocalRow(pe) := 0
+    for (fiber <- 0 until cfg.maxFibers) {
+      val globalRow = pe * cfg.maxFibers + fiber
+      when(aLoaded(globalRow) && U(globalRow, tileCfg.rowCountWidth bits) < rowCount &&
+          aStorage(globalRow).tag === currentResults(pe).row) {
+        scatterRowFound(pe) := True
+        scatterLocalRow(pe) := fiber
+      }
+    }
+
+    scatterColumnFound(pe) := False
+    scatterColumn(pe) := 0
+    for (column <- 0 until tileCfg.maxColumns) {
+      when(bLoaded(column) && U(column, tileCfg.columnCountWidth bits) < columnCount &&
+          bStorage(column).tag === currentResults(pe).column) {
+        scatterColumnFound(pe) := True
+        scatterColumn(pe) := column
+      }
+    }
+
+    val globalRow = (U(pe * cfg.maxFibers, tileCfg.rowIndexWidth bits) +
+      scatterLocalRow(pe).resize(tileCfg.rowIndexWidth)).resized
+    scatterGlobalCell(pe) := ((globalRow.resize(cellIndexWidth) <<
+      tileCfg.columnIndexWidth) + scatterColumn(pe).resize(cellIndexWidth)).resized
+    scatterBank(pe) := scatterLocalRow(pe).resize(bankIndexWidth)
+    scatterAddress(pe) := scatterColumn(pe).resize(cfg.localAddressWidth)
+    scatterNeedsAccumulation(pe) := state === TrIpTileState.Scatter &&
+      currentResults(pe).valid && scatterRowFound(pe) && scatterColumnFound(pe) &&
+      resultValid(scatterGlobalCell(pe))
+  }
+
+  val outputRowSlot = (outputCell >> tileCfg.columnIndexWidth)
+    .resize(tileCfg.rowIndexWidth)
+  val outputColumnSlot = outputCell(tileCfg.columnIndexWidth - 1 downto 0)
+  val outputPe = UInt(peIndexWidth bits)
+  val outputLocalRow = UInt(cfg.fiberIndexWidth bits)
+  outputPe := 0
+  outputLocalRow := 0
+  for (pe <- 0 until cfg.peRows; fiber <- 0 until cfg.maxFibers) {
+    when(outputRowSlot === pe * cfg.maxFibers + fiber) {
+      outputPe := pe
+      outputLocalRow := fiber
+    }
+  }
+  val outputBank = outputLocalRow.resize(bankIndexWidth)
+  val outputAddress = outputColumnSlot.resize(cfg.localAddressWidth)
+  val fullWriteMask = B((BigInt(1) << (cfg.accumulatorWidth / 8)) - 1,
+    (cfg.accumulatorWidth / 8) bits)
+
+  for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
+    val buffer = localBuffers(pe)
+    buffer.io.bus.writes(bank).valid := False
+    buffer.io.bus.writes(bank).payload.address := 0
+    buffer.io.bus.writes(bank).payload.data := 0
+    buffer.io.bus.writes(bank).payload.mask := fullWriteMask
+    buffer.io.bus.readCommands(bank).valid := False
+    buffer.io.bus.readCommands(bank).payload := 0
+
+    val directScatterWrite = state === TrIpTileState.Scatter &&
+      currentResults(pe).valid && scatterRowFound(pe) && scatterColumnFound(pe) &&
+      !resultValid(scatterGlobalCell(pe)) && scatterBank(pe) === bank
+    when(directScatterWrite) {
+      buffer.io.bus.writes(bank).valid := True
+      buffer.io.bus.writes(bank).payload.address := scatterAddress(pe)
+      buffer.io.bus.writes(bank).payload.data := currentResults(pe).value.asBits
+    }
+
+    when(scatterNeedsAccumulation(pe) && scatterBank(pe) === bank) {
+      buffer.io.bus.readCommands(bank).valid := True
+      buffer.io.bus.readCommands(bank).payload := scatterAddress(pe)
+    }
+
+    when(state === TrIpTileState.ScatterAccumWait && pendingValid(pe) &&
+        pendingBank(pe) === bank && buffer.io.bus.readResponses(bank).valid) {
+      buffer.io.bus.writes(bank).valid := True
+      buffer.io.bus.writes(bank).payload.address := pendingAddress(pe)
+      buffer.io.bus.writes(bank).payload.data :=
+        (buffer.io.bus.readResponses(bank).payload.asSInt + pendingValue(pe))
+          .resized.asBits
+    }
+
+    when(state === TrIpTileState.ReadPlan && resultValid(outputCell) &&
+        outputPe === pe && outputBank === bank) {
+      buffer.io.bus.readCommands(bank).valid := True
+      buffer.io.bus.readCommands(bank).payload := outputAddress
     }
   }
 
-  val columnFound = Bool()
-  val columnSlot = UInt(tileCfg.columnIndexWidth bits)
-  columnFound := False
-  columnSlot := 0
-  for (column <- 0 until tileCfg.maxColumns) {
-    when(bLoaded(column) && U(column, tileCfg.columnCountWidth bits) < columnCount &&
-        bStorage(column).tag === currentResult.column) {
-      columnFound := True
-      columnSlot := column
-    }
-  }
-
-  val scatterCell = UInt(cellIndexWidth bits)
-  scatterCell := ((rowSlot.resize(cellIndexWidth) << tileCfg.columnIndexWidth) +
-    columnSlot.resize(cellIndexWidth)).resized
-  val bufferCell = UInt(cellIndexWidth bits)
-  bufferCell := outputCell
-  when(state === TrIpTileState.Scatter) { bufferCell := scatterCell }
-  when(state === TrIpTileState.ScatterAccumWait) { bufferCell := pendingCell }
-  val bufferBank = bufferCell.resize(bankIndexWidth)
-  val bufferAddress = if (cellIndexWidth <= bankIndexWidth) {
-    U(0, cfg.localAddressWidth bits)
-  } else {
-    bufferCell(cellIndexWidth - 1 downto bankIndexWidth).resize(cfg.localAddressWidth)
-  }
-
-  val localBuffer = new BankedLocalBuffer(cfg)
-  val directScatterWrite = state === TrIpTileState.Scatter && currentResult.valid &&
-    rowFound && columnFound && !resultValid(scatterCell)
-  val accumulatedScatterWrite = state === TrIpTileState.ScatterAccumWait
-  for (bank <- 0 until cfg.localBanks) {
-    localBuffer.io.bus.writes(bank).valid := False
-    localBuffer.io.bus.writes(bank).payload.address := bufferAddress
-    localBuffer.io.bus.writes(bank).payload.data := Mux(
-      state === TrIpTileState.ScatterAccumWait,
-      (localBuffer.io.bus.readResponses(bank).payload.asSInt + pendingValue).resized.asBits,
-      currentResult.value.asBits)
-    localBuffer.io.bus.writes(bank).payload.mask :=
-      B((BigInt(1) << (cfg.accumulatorWidth / 8)) - 1, (cfg.accumulatorWidth / 8) bits)
-    localBuffer.io.bus.readCommands(bank).valid := False
-    localBuffer.io.bus.readCommands(bank).payload := 0
-    when((directScatterWrite ||
-        (accumulatedScatterWrite && localBuffer.io.bus.readResponses(bank).valid)) &&
-        bufferBank === bank) {
-      localBuffer.io.bus.writes(bank).valid := True
-    }
-  }
-
-  for (bank <- 0 until cfg.localBanks) {
-    val scatterRead = state === TrIpTileState.Scatter && currentResult.valid &&
-      rowFound && columnFound && resultValid(scatterCell)
-    val outputRead = state === TrIpTileState.ReadPlan && resultValid(outputCell)
-    when((scatterRead || outputRead) && bufferBank === bank) {
-      localBuffer.io.bus.readCommands(bank).valid := True
-      localBuffer.io.bus.readCommands(bank).payload := bufferAddress
+  val accumulationIssued = scatterNeedsAccumulation.asBits.orR
+  val accumulationReady = Bool()
+  accumulationReady := True
+  for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
+    when(pendingValid(pe) && pendingBank(pe) === bank &&
+        !localBuffers(pe).io.bus.readResponses(bank).valid) {
+      accumulationReady := False
     }
   }
 
@@ -266,10 +313,20 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
   val selectedReadData = Bits(cfg.accumulatorWidth bits)
   selectedReadValid := False
   selectedReadData := 0
-  for (bank <- 0 until cfg.localBanks) {
-    when(bufferBank === bank) {
-      selectedReadValid := localBuffer.io.bus.readResponses(bank).valid
-      selectedReadData := localBuffer.io.bus.readResponses(bank).payload
+  for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
+    when(outputPe === pe && outputBank === bank) {
+      selectedReadValid := localBuffers(pe).io.bus.readResponses(bank).valid
+      selectedReadData := localBuffers(pe).io.bus.readResponses(bank).payload
+    }
+  }
+
+  for (pe <- 0 until cfg.peRows; fiber <- 0 until cfg.maxFibers;
+       column <- 0 until tileCfg.maxColumns) {
+    val cell = (pe * cfg.maxFibers + fiber) * tileCfg.maxColumns + column
+    when(state === TrIpTileState.Scatter && currentResults(pe).valid &&
+        scatterRowFound(pe) && scatterColumnFound(pe) &&
+        scatterLocalRow(pe) === fiber && scatterColumn(pe) === column) {
+      resultValid(cell) := True
     }
   }
 
@@ -326,14 +383,9 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
   }
 
   def advanceScatter(): Unit = {
-    when(scatterLane === cfg.outputLanes - 1) {
+    when(scatterLane.resize(cfg.outputCountWidth) + 1 >= maxResponseCount) {
       scatterLane := 0
-      when(scatterPe === cfg.peRows - 1) {
-        scatterPe := 0
-        advanceSchedule()
-      } otherwise {
-        scatterPe := scatterPe + 1
-      }
+      advanceSchedule()
     } otherwise {
       scatterLane := scatterLane + 1
     }
@@ -431,31 +483,32 @@ class TrIpTileController(tileCfg: TrIpTileConfig) extends Component {
       when(allResponsesValid) {
         for (pe <- 0 until cfg.peRows) responseRegs(pe) := pes(pe).io.response.payload
         commandInFlight := False
-        scatterPe := 0
         scatterLane := 0
         state := TrIpTileState.Scatter
       }
     }
 
     is(TrIpTileState.Scatter) {
-      when(currentResult.valid && rowFound && columnFound) {
-        when(resultValid(scatterCell)) {
-          pendingCell := scatterCell
-          pendingValue := currentResult.value
-          state := TrIpTileState.ScatterAccumWait
-        } otherwise {
-          for (cell <- 0 until cellCount) {
-            when(scatterCell === cell) { resultValid(cell) := True }
+      when(maxResponseCount === 0) {
+        advanceSchedule()
+      } elsewhen(accumulationIssued) {
+        for (pe <- 0 until cfg.peRows) {
+          pendingValid(pe) := scatterNeedsAccumulation(pe)
+          when(scatterNeedsAccumulation(pe)) {
+            pendingBank(pe) := scatterBank(pe)
+            pendingAddress(pe) := scatterAddress(pe)
+            pendingValue(pe) := currentResults(pe).value
           }
-          advanceScatter()
         }
+        state := TrIpTileState.ScatterAccumWait
       } otherwise {
         advanceScatter()
       }
     }
 
     is(TrIpTileState.ScatterAccumWait) {
-      when(selectedReadValid) {
+      when(accumulationReady) {
+        for (pe <- 0 until cfg.peRows) pendingValid(pe) := False
         state := TrIpTileState.Scatter
         advanceScatter()
       }

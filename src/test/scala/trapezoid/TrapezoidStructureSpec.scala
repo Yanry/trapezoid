@@ -32,6 +32,13 @@ class TrapezoidStructureSpec extends AnyFunSuite {
     elaborate(new BankedLocalBuffer(cfg))
   }
 
+  test("paper configuration uses sixteen result lanes and per-row buffer capacity") {
+    assert(TrapezoidConfig.paper.outputLanes == 16)
+    val paperTile = TrIpTileConfig(TrapezoidConfig.paper)
+    assert(TrapezoidConfig.paper.localDepthPerBank >= paperTile.maxColumns)
+    assert(GustavsonTileConfig(TrapezoidConfig.paper).accumulatorEntries == 128)
+  }
+
   test("multi-row Gustavson array elaborates") {
     elaborate(new GustavsonArray(GustavsonTileConfig(cfg, accumulatorEntries = 4)))
   }

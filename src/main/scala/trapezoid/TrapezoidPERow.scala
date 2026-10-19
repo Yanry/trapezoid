@@ -334,9 +334,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig) extends Component {
     nextResponse.count := leaderPrefix.last.resized
   }
 
-  // Stage 4: use distributed elastic registers instead of StreamFifo's packed
-  // Mem. A paper-sized response is wider than SpinalHDL 1.7's single-Bits
-  // limit, while field-wise registers preserve the same ordered buffering.
+  // Stage 4: field-wise elastic registers preserve response ordering and make
+  // backpressure independent of whether a target can infer a very-wide FIFO.
   val responseInput = Stream(PERowResponse(cfg))
   responseInput.valid := macStage.valid
   responseInput.payload := nextResponse

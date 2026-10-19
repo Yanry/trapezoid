@@ -57,7 +57,7 @@ object TrapezoidConfig {
     fiberWidth = 128,
     macLanes = 128,
     cacheLineWords = 16,
-    outputLanes = 128,
+    outputLanes = 16,
     peRows = 128,
     localDepthPerBank = 512
   )
@@ -81,8 +81,8 @@ case class TrIpTileConfig(core: TrapezoidConfig, maxColumns: Int = 16) {
     "maxColumns must be a power of two for compact circular indexing")
   require(core.macLanes >= core.fiberWidth,
     "one A fiber and one B fiber must always fit without overflow")
-  require(core.localDepthPerBank * core.localBanks >= maxRows * maxColumns,
-    "local buffers must hold the complete ordered output tile")
+  require(core.localDepthPerBank >= maxColumns,
+    "each PE-row buffer bank must hold one output row")
 
   val rowIndexWidth: Int = math.max(1, log2Up(maxRows))
   val columnIndexWidth: Int = math.max(1, log2Up(maxColumns))
@@ -177,7 +177,7 @@ case class GustavsonTileConfig(
 
 object GustavsonTileConfig {
   def apply(core: TrapezoidConfig): GustavsonTileConfig =
-    new GustavsonTileConfig(core, core.outputLanes)
+    new GustavsonTileConfig(core, math.max(core.outputLanes, core.macLanes))
 }
 
 /** Fixed-width B-row storage consumed by the Gustavson cache adapter.

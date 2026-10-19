@@ -126,9 +126,12 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
       assert(dut.io.busy.toBoolean)
       assert(!dut.io.result.valid.toBoolean)
 
+      issue(dut, TrapezoidDataflow.TrGs, endOfTile = false,
+        a = Seq((2, 2, 4)),
+        b = Seq((0, 2, 0, 1), (0, 2, 1, 3)))
       issue(dut, TrapezoidDataflow.TrGs, endOfTile = true,
-        a = Seq((2, 2, 4), (0, 3, 6)),
-        b = Seq((0, 2, 1, 3), (1, 3, 2, 2), (0, 2, 0, 1)))
+        a = Seq((0, 3, 6)),
+        b = Seq((0, 3, 2, 2)))
 
       val observed = collect(dut)
       assert(observed.map(x => (x._1, x._2, x._3)) == Seq(

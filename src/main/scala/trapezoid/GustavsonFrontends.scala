@@ -313,7 +313,8 @@ class TrGsSpatialEngine(
 
   val commandFire = io.command.fire && supportedMode
   val responseFire = pe.io.response.fire
-  val accumulateResponse = responseFire && state === TrGsSpatialState.Run
+  val accumulateResponse = responseFire && state === TrGsSpatialState.Run &&
+    !pe.io.response.payload.overflow
   pe.io.response.ready := !io.clear &&
     (state === TrGsSpatialState.Run || state === TrGsSpatialState.AbortDrain)
 
@@ -512,7 +513,7 @@ class TrGsSpatialEngine(
         inputClosed := True
       }
       when(responseFire) {
-        when(responseConflict) { overflowReg := True }
+        when(responseConflict || response.overflow) { overflowReg := True }
         when(response.results(0).endOfTile) {
           inputClosed := False
           when(slotValid.asBits.orR || (!responseConflict && newEntry.orR)) {

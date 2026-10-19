@@ -224,6 +224,29 @@ class TrapezoidPERowSpec extends AnyFunSuite {
     }
   }
 
+  test("TrGS reports an unordered cache line instead of silently misrouting it") {
+    simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      clearInputs(dut)
+      dut.io.command.payload.mode #= TrapezoidDataflow.TrGs
+      dut.io.command.payload.gustavson.a(0).valid #= true
+      dut.io.command.payload.gustavson.a(0).row #= 2
+      dut.io.command.payload.gustavson.a(0).k #= 0
+      dut.io.command.payload.gustavson.a(0).value #= 3
+      for ((column, lane) <- Seq(3, 1).zipWithIndex) {
+        dut.io.command.payload.gustavson.b(lane).valid #= true
+        dut.io.command.payload.gustavson.b(lane).aIndex #= 0
+        dut.io.command.payload.gustavson.b(lane).k #= 0
+        dut.io.command.payload.gustavson.b(lane).column #= column
+        dut.io.command.payload.gustavson.b(lane).value #= lane + 2
+      }
+
+      issue(dut)
+      assert(dut.io.response.payload.overflow.toBoolean)
+      assert(dut.io.response.payload.count.toInt == 0)
+    }
+  }
+
   test("TrGT and TrGS accept sparse or dense lane populations by explicit mode") {
     simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)

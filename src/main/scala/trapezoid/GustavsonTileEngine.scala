@@ -135,6 +135,7 @@ class GustavsonTileEngine(
         responseReg := pe.io.response.payload
         responseIndex := 0
         commandInFlight := False
+        when(pe.io.response.payload.overflow) { overflowReg := True }
         when(pe.io.response.payload.count === 0) {
           when(finalCommand) {
             when(entryCount === 0) {

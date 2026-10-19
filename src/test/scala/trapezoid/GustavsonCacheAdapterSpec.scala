@@ -95,8 +95,8 @@ class GustavsonCacheAdapterSpec extends AnyFunSuite {
 
       val base = 10
       val memory = Map(
-        base -> encodeLine(Seq(Some(3 -> 2), None, Some(1 -> 5), None)),
-        (base + 1) -> encodeLine(Seq(Some(3 -> 4), Some(2 -> -1), None, None)))
+        base -> encodeLine(Seq(Some(1 -> 5), None, Some(3 -> 2), None)),
+        (base + 1) -> encodeLine(Seq(Some(2 -> -1), Some(3 -> 4), None, None)))
       val refillAddresses = mutable.ArrayBuffer.empty[Int]
 
       fork {
@@ -195,8 +195,8 @@ class GustavsonCacheAdapterSpec extends AnyFunSuite {
 
       val base = 30
       val memory = Map(
-        base -> encodeLine(Seq(Some(3 -> 2), None, Some(1 -> 5), None)),
-        (base + 1) -> encodeLine(Seq(Some(3 -> 4), Some(2 -> -1), None, None)))
+        base -> encodeLine(Seq(Some(1 -> 5), None, Some(3 -> 2), None)),
+        (base + 1) -> encodeLine(Seq(Some(2 -> -1), Some(3 -> 4), None, None)))
       val refillAddresses = mutable.ArrayBuffer.empty[Int]
 
       fork {

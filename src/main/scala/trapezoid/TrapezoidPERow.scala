@@ -80,6 +80,52 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       entries: Vec[PERowReducedProduct],
       count: UInt)
 
+  /** Stable hierarchical compaction for an already coordinate-ordered stream. */
+  private def compactValid(inputs: Seq[PERowReducedProduct]): ReductionGroup = {
+    require(inputs.nonEmpty)
+    if (inputs.length == 1) {
+      val entries = Vec(PERowReducedProduct(cfg), 1)
+      val count = UInt(1 bits)
+      entries(0) := inputs.head
+      count := inputs.head.valid.asUInt
+      ReductionGroup(entries, count)
+    } else {
+      val split = inputs.length / 2
+      val left = compactValid(inputs.take(split))
+      val right = compactValid(inputs.drop(split))
+      val capacity = inputs.length
+      val countWidth = log2Up(capacity + 1)
+      val leftCount = left.count.resize(countWidth)
+      val rightCount = right.count.resize(countWidth)
+      val zero = PERowReducedProduct(cfg).getZero
+
+      var shiftedRight = Vector.tabulate(capacity) { index =>
+        if (index < right.entries.length) right.entries(index) else zero
+      }
+      var distance = 1
+      var stage = 0
+      while (distance < capacity) {
+        val previous = shiftedRight
+        shiftedRight = Vector.tabulate(capacity) { index =>
+          val shifted = if (index >= distance) previous(index - distance) else zero
+          Mux(leftCount(stage), shifted, previous(index))
+        }
+        distance *= 2
+        stage += 1
+      }
+
+      val entries = Vec(PERowReducedProduct(cfg), capacity)
+      for (index <- 0 until capacity) {
+        val leftEntry = if (index < left.entries.length) left.entries(index) else zero
+        entries(index) := Mux(U(index, countWidth bits) < leftCount,
+          leftEntry, shiftedRight(index))
+      }
+      val count = UInt(countWidth bits)
+      count := (leftCount + rightCount).resize(countWidth)
+      ReductionGroup(entries, count)
+    }
+  }
+
   /** Reduce adjacent products belonging to the same A/B fiber pair.
     *
     * MFIU packs products in pair-major order, so every output's products form
@@ -292,14 +338,36 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     nextResponse.count := Mux(mac.overflow, U(0), tripReduction.count).resized
   }
 
-  // Gustavson's merge mode consumes coordinate-ordered streams. Rank the
-  // cache-line products once, then use a logarithmic-depth segmented prefix
-  // tree to combine equal coordinates. This shares O(N log N) adders instead
-  // of building one complete N-input reduction tree for every input lane.
-  val gustRank = Vec(UInt(cfg.outputCountWidth bits), cfg.cacheLineWords)
-  for (lane <- 0 until cfg.cacheLineWords) {
-    val precedes = Bits(cfg.cacheLineWords bits)
-    for (other <- 0 until cfg.cacheLineWords) {
+  // TrGT merges four coordinate-sorted subrow heads. TrGS receives one
+  // coordinate-ordered cache line and only needs stable valid-lane compaction.
+  // Keeping these mode-specific inputs removes the old 16x16 all-to-all rank
+  // network while retaining the shared segmented reduction tree below.
+  val gustLeaves = (0 until cfg.cacheLineWords).map { lane =>
+    val leaf = PERowReducedProduct(cfg)
+    leaf.valid := mac.gustValid(lane)
+    leaf.aFiber := 0
+    leaf.bFiber := 0
+    leaf.row := mac.gustRow(lane)
+    leaf.column := mac.gustColumn(lane)
+    leaf.value := mac.gustProduct(lane)
+    leaf
+  }
+  private val trGsCompacted = compactValid(gustLeaves)
+  var trGsOrderError: Bool = False
+  for (position <- 1 until cfg.cacheLineWords) {
+    val previous = trGsCompacted.entries(position - 1)
+    val current = trGsCompacted.entries(position)
+    val coordinateDecreases = current.row < previous.row ||
+      (current.row === previous.row && current.column < previous.column)
+    trGsOrderError = trGsOrderError ||
+      (previous.valid && current.valid && coordinateDecreases)
+  }
+  val gustOrderError = mac.mode === TrapezoidDataflow.TrGs && trGsOrderError
+
+  val trGtRank = Vec(UInt(log2Up(cfg.localBanks + 1) bits), cfg.localBanks)
+  for (lane <- 0 until cfg.localBanks) {
+    val precedes = Bits(cfg.localBanks bits)
+    for (other <- 0 until cfg.localBanks) {
       if (other == lane) {
         precedes(other) := False
       } else {
@@ -316,7 +384,19 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
           (lowerCoordinate || sameCoordinateEarlier)
       }
     }
-    gustRank(lane) := CountOne(precedes).resized
+    trGtRank(lane) := CountOne(precedes).resized
+  }
+
+  val trGtSorted = Vec(PERowReducedProduct(cfg), cfg.cacheLineWords)
+  for (position <- 0 until cfg.cacheLineWords) {
+    trGtSorted(position) := PERowReducedProduct(cfg).getZero
+    if (position < cfg.localBanks) {
+      for (source <- 0 until cfg.localBanks) {
+        when(mac.gustValid(source) && trGtRank(source) === position) {
+          trGtSorted(position) := gustLeaves(source)
+        }
+      }
+    }
   }
 
   val sortedValid = Vec(Bool(), cfg.cacheLineWords)
@@ -324,18 +404,12 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val sortedColumn = Vec(UInt(cfg.coordinateWidth bits), cfg.cacheLineWords)
   val sortedValue = Vec(SInt(cfg.accumulatorWidth bits), cfg.cacheLineWords)
   for (position <- 0 until cfg.cacheLineWords) {
-    sortedValid(position) := False
-    sortedRow(position) := 0
-    sortedColumn(position) := 0
-    sortedValue(position) := 0
-    for (source <- 0 until cfg.cacheLineWords) {
-      when(mac.gustValid(source) && gustRank(source) === position) {
-        sortedValid(position) := True
-        sortedRow(position) := mac.gustRow(source)
-        sortedColumn(position) := mac.gustColumn(source)
-        sortedValue(position) := mac.gustProduct(source)
-      }
-    }
+    val ordered = Mux(mac.mode === TrapezoidDataflow.TrGs,
+      trGsCompacted.entries(position), trGtSorted(position))
+    sortedValid(position) := ordered.valid
+    sortedRow(position) := ordered.row
+    sortedColumn(position) := ordered.column
+    sortedValue(position) := ordered.value
   }
 
   var segmentedSums = (0 until cfg.cacheLineWords).map(sortedValue(_))
@@ -373,7 +447,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     segmentEnd(position) := sortedValid(position) && nextDiffers
     segmentPrefix(position + 1) := segmentPrefix(position) + segmentEnd(position).asUInt
     for (out <- 0 until cfg.outputLanes) {
-      when(!tripMode && segmentEnd(position) && segmentPrefix(position) === out) {
+      when(!tripMode && !gustOrderError && segmentEnd(position) &&
+          segmentPrefix(position) === out) {
         nextResponse.results(out).valid := True
         nextResponse.results(out).row := sortedRow(position)
         nextResponse.results(out).column := sortedColumn(position)
@@ -383,7 +458,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   }
 
   when(!tripMode) {
-    nextResponse.count := segmentPrefix.last.resized
+    nextResponse.overflow := gustOrderError
+    nextResponse.count := Mux(gustOrderError, U(0), segmentPrefix.last).resized
   }
 
   // Stage 4: field-wise elastic registers preserve response ordering and make

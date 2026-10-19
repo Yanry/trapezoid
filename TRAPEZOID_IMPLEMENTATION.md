@@ -98,7 +98,7 @@ PE row 已拆分为五个逻辑阶段：
 4. `Reduce/Merge`：按输出坐标归约部分积；
 5. `Output`：将完整响应写入可配置深度的弹性寄存器 FIFO。
 
-前三个阶段之间使用支持同周期出入的弹性 `Stream` 流水寄存器。在无背压时，流水线填满后可以每周期接收一条命令；任一级停顿都会沿 `ready` 反压到命令入口。TrIP 利用 MFIU 输出按 fiber pair 连续排列的性质，通过共享的可切片 contiguous reduction tree 归约：每个树节点只比较并合并左右子树边界上的一个输出簇，而不是为最多 16 个候选输出分别复制一棵全宽加法树。这对应论文 MRN 的 reduction mode，并将加法器数量从 O(`maxFibers^2 * macLanes`) 降到 O(`macLanes`)。Gustavson 路径先将命令内的有效乘积按 `(row,column)` 排序，再使用对数深度 segmented prefix tree 合并相同坐标并输出坐标序结果；相比为每个输入 lane 复制一棵全宽归约树，加法器数量由 O(`cacheLineWords^2`) 降为 O(`cacheLineWords * log2(cacheLineWords)`)。两条路径的组合加法深度均为 O(log2(lane 数))。默认响应 FIFO 深度为 2，并以 field-wise 弹性寄存器实现；下游停顿时会保持输出稳定，并允许前级继续运行到所有弹性存储占满。
+前三个阶段之间使用支持同周期出入的弹性 `Stream` 流水寄存器。在无背压时，流水线填满后可以每周期接收一条命令；任一级停顿都会沿 `ready` 反压到命令入口。TrIP 利用 MFIU 输出按 fiber pair 连续排列的性质，通过共享的可切片 contiguous reduction tree 归约：每个树节点只比较并合并左右子树边界上的一个输出簇，而不是为最多 16 个候选输出分别复制一棵全宽加法树。这对应论文 MRN 的 reduction mode，并将加法器数量从 O(`maxFibers^2 * macLanes`) 降到 O(`macLanes`)。Gustavson 路径不再对整个 16-word cache line 构造全互比较排序器：TrGT 只对四个 subrow head 进行坐标排序，TrGS 对已经按坐标排列的 cache-line 输入进行分层稳定压缩，之后两者复用对数深度 segmented prefix tree 合并相同坐标。TrGS 在压缩后使用相邻比较器验证坐标单调性，乱序输入置 overflow 并丢弃该响应。两条路径的组合加法深度均为 O(log2(lane 数))。默认响应 FIFO 深度为 2，并以 field-wise 弹性寄存器实现；下游停顿时会保持输出稳定，并允许前级继续运行到所有弹性存储占满。
 
 这次流水化没有改变 `PERowCommand`/`PERowResponse` 外部协议，也没有根据 density 改写 mode。代价是 PE row 不再是一拍命令/响应模块，上层必须只依赖 Stream 握手，不能假定固定的一拍响应延迟。
 

@@ -76,21 +76,6 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     extends Component with TrapezoidPERowComponent {
   val io = TrapezoidPERowIo(cfg)
 
-  private def balancedSum(terms: Seq[SInt]): SInt = {
-    require(terms.nonEmpty)
-    if (terms.length == 1) {
-      terms.head.resize(cfg.accumulatorWidth)
-    } else {
-      val nextLevel = terms.grouped(2).map {
-        case Seq(left, right) =>
-          (left.resize(cfg.accumulatorWidth) + right.resize(cfg.accumulatorWidth))
-            .resize(cfg.accumulatorWidth)
-        case Seq(left) => left.resize(cfg.accumulatorWidth)
-      }.toSeq
-      balancedSum(nextLevel)
-    }
-  }
-
   private case class ReductionGroup(
       entries: Vec[PERowReducedProduct],
       count: UInt)
@@ -307,38 +292,98 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     nextResponse.count := Mux(mac.overflow, U(0), tripReduction.count).resized
   }
 
-  val leader = Vec(Bool(), cfg.cacheLineWords)
-  val leaderPrefix = Vec(UInt(cfg.outputCountWidth bits), cfg.cacheLineWords + 1)
-  leaderPrefix(0) := 0
+  // Gustavson's merge mode consumes coordinate-ordered streams. Rank the
+  // cache-line products once, then use a logarithmic-depth segmented prefix
+  // tree to combine equal coordinates. This shares O(N log N) adders instead
+  // of building one complete N-input reduction tree for every input lane.
+  val gustRank = Vec(UInt(cfg.outputCountWidth bits), cfg.cacheLineWords)
   for (lane <- 0 until cfg.cacheLineWords) {
-    var seen = False
-    for (previous <- 0 until lane) {
-      seen = seen || (mac.gustValid(previous) &&
-        mac.gustRow(previous) === mac.gustRow(lane) &&
-        mac.gustColumn(previous) === mac.gustColumn(lane))
+    val precedes = Bits(cfg.cacheLineWords bits)
+    for (other <- 0 until cfg.cacheLineWords) {
+      if (other == lane) {
+        precedes(other) := False
+      } else {
+        val lowerCoordinate = mac.gustRow(other) < mac.gustRow(lane) ||
+          (mac.gustRow(other) === mac.gustRow(lane) &&
+            mac.gustColumn(other) < mac.gustColumn(lane))
+        val sameCoordinateEarlier = if (other < lane) {
+          mac.gustRow(other) === mac.gustRow(lane) &&
+            mac.gustColumn(other) === mac.gustColumn(lane)
+        } else {
+          False
+        }
+        precedes(other) := mac.gustValid(other) &&
+          (lowerCoordinate || sameCoordinateEarlier)
+      }
     }
-    leader(lane) := mac.gustValid(lane) && !seen
-    leaderPrefix(lane + 1) := leaderPrefix(lane) + leader(lane).asUInt
+    gustRank(lane) := CountOne(precedes).resized
+  }
 
-    val terms = (0 until cfg.cacheLineWords).map { other =>
-      val sameOutput = mac.gustValid(other) &&
-        mac.gustRow(other) === mac.gustRow(lane) &&
-        mac.gustColumn(other) === mac.gustColumn(lane)
-      Mux(sameOutput, mac.gustProduct(other), S(0, cfg.accumulatorWidth bits))
+  val sortedValid = Vec(Bool(), cfg.cacheLineWords)
+  val sortedRow = Vec(UInt(cfg.coordinateWidth bits), cfg.cacheLineWords)
+  val sortedColumn = Vec(UInt(cfg.coordinateWidth bits), cfg.cacheLineWords)
+  val sortedValue = Vec(SInt(cfg.accumulatorWidth bits), cfg.cacheLineWords)
+  for (position <- 0 until cfg.cacheLineWords) {
+    sortedValid(position) := False
+    sortedRow(position) := 0
+    sortedColumn(position) := 0
+    sortedValue(position) := 0
+    for (source <- 0 until cfg.cacheLineWords) {
+      when(mac.gustValid(source) && gustRank(source) === position) {
+        sortedValid(position) := True
+        sortedRow(position) := mac.gustRow(source)
+        sortedColumn(position) := mac.gustColumn(source)
+        sortedValue(position) := mac.gustProduct(source)
+      }
     }
-    val sum = balancedSum(terms)
+  }
+
+  var segmentedSums = (0 until cfg.cacheLineWords).map(sortedValue(_))
+  var distance = 1
+  while (distance < cfg.cacheLineWords) {
+    val nextLevel = Vec(SInt(cfg.accumulatorWidth bits), cfg.cacheLineWords)
+    for (position <- 0 until cfg.cacheLineWords) {
+      if (position < distance) {
+        nextLevel(position) := segmentedSums(position)
+      } else {
+        val sameSegment = sortedValid(position) && sortedValid(position - distance) &&
+          sortedRow(position) === sortedRow(position - distance) &&
+          sortedColumn(position) === sortedColumn(position - distance)
+        nextLevel(position) := Mux(sameSegment,
+          (segmentedSums(position) + segmentedSums(position - distance))
+            .resize(cfg.accumulatorWidth),
+          segmentedSums(position))
+      }
+    }
+    segmentedSums = (0 until cfg.cacheLineWords).map(nextLevel(_))
+    distance *= 2
+  }
+
+  val segmentEnd = Vec(Bool(), cfg.cacheLineWords)
+  val segmentPrefix = Vec(UInt(cfg.outputCountWidth bits), cfg.cacheLineWords + 1)
+  segmentPrefix(0) := 0
+  for (position <- 0 until cfg.cacheLineWords) {
+    val nextDiffers = if (position == cfg.cacheLineWords - 1) {
+      True
+    } else {
+      !sortedValid(position + 1) ||
+        sortedRow(position) =/= sortedRow(position + 1) ||
+        sortedColumn(position) =/= sortedColumn(position + 1)
+    }
+    segmentEnd(position) := sortedValid(position) && nextDiffers
+    segmentPrefix(position + 1) := segmentPrefix(position) + segmentEnd(position).asUInt
     for (out <- 0 until cfg.outputLanes) {
-      when(!tripMode && leader(lane) && leaderPrefix(lane) === out) {
+      when(!tripMode && segmentEnd(position) && segmentPrefix(position) === out) {
         nextResponse.results(out).valid := True
-        nextResponse.results(out).row := mac.gustRow(lane)
-        nextResponse.results(out).column := mac.gustColumn(lane)
-        nextResponse.results(out).value := sum
+        nextResponse.results(out).row := sortedRow(position)
+        nextResponse.results(out).column := sortedColumn(position)
+        nextResponse.results(out).value := segmentedSums(position)
       }
     }
   }
 
   when(!tripMode) {
-    nextResponse.count := leaderPrefix.last.resized
+    nextResponse.count := segmentPrefix.last.resized
   }
 
   // Stage 4: field-wise elastic registers preserve response ordering and make

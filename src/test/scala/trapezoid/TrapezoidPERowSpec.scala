@@ -184,7 +184,7 @@ class TrapezoidPERowSpec extends AnyFunSuite {
     }
   }
 
-  test("Gustavson modes merge partial products with identical coordinates") {
+  test("Gustavson modes sort coordinates and merge identical partial products") {
     simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       clearInputs(dut)
@@ -200,9 +200,9 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       dut.io.command.payload.gustavson.a(1).value #= 7
 
       val inputs = Seq(
-        (0, 0, 0, 11),
-        (0, 0, 1, 17),
         (1, 2, 1, 19),
+        (0, 0, 1, 17),
+        (0, 0, 0, 11),
         (0, 0, 1, 3)
       )
       for (((aIndex, k, column, value), lane) <- inputs.zipWithIndex) {

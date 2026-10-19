@@ -235,4 +235,108 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
       assert(observed == Seq((6, 0, 17L), (6, 1, 4L), (6, 2, 27L), (6, 3, 8L)))
     }
   }
+
+  test("TrGS accepts consecutive cache lines into spatial accumulators") {
+    simConfig.compile(new TrGsSpatialEngine(tileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      initializeTrGs(dut)
+      dut.io.result.ready #= true
+
+      for (command <- 0 until 3) {
+        dut.io.command.payload.mode #= TrapezoidDataflow.TrGs
+        dut.io.command.payload.endOfTile #= (command == 2)
+        dut.io.command.payload.a.valid #= true
+        dut.io.command.payload.a.row #= 7
+        dut.io.command.payload.a.k #= command
+        dut.io.command.payload.a.value #= command + 1
+        for (lane <- 0 until cfg.cacheLineWords) {
+          val b = dut.io.command.payload.b(lane)
+          b.valid #= true
+          b.k #= command
+          b.column #= lane
+          b.value #= lane + 1
+        }
+        dut.io.command.valid #= true
+        sleep(1)
+        assert(dut.io.command.ready.toBoolean,
+          s"cache line $command was not accepted without a bubble")
+        dut.clockDomain.waitSampling()
+      }
+      dut.io.command.valid #= false
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 200) {
+        sleep(1)
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+
+      assert(dut.io.done.toBoolean)
+      assert(observed == Seq(
+        (7, 0, 6L), (7, 1, 12L), (7, 2, 18L), (7, 3, 24L)))
+      assert(!dut.io.overflow.toBoolean)
+      assert(!dut.io.unsupportedMode.toBoolean)
+    }
+  }
+
+  test("TrGS clear drains in-flight responses without contaminating the next tile") {
+    simConfig.compile(new TrGsSpatialEngine(tileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      initializeTrGs(dut)
+      dut.io.result.ready #= true
+
+      dut.io.command.payload.mode #= TrapezoidDataflow.TrGs
+      dut.io.command.payload.endOfTile #= false
+      dut.io.command.payload.a.valid #= true
+      dut.io.command.payload.a.row #= 1
+      dut.io.command.payload.a.k #= 0
+      dut.io.command.payload.a.value #= 9
+      for (lane <- 0 until cfg.cacheLineWords) {
+        val b = dut.io.command.payload.b(lane)
+        b.valid #= (lane == 0)
+        b.k #= 0
+        b.column #= lane
+        b.value #= 9
+      }
+      dut.io.command.valid #= true
+      sleep(1)
+      assert(dut.io.command.ready.toBoolean)
+      dut.clockDomain.waitSampling()
+      dut.io.command.valid #= false
+      dut.io.clear #= true
+      dut.clockDomain.waitSampling()
+      dut.io.clear #= false
+
+      var timeout = 0
+      while (dut.io.busy.toBoolean && timeout < 50) {
+        assert(!dut.io.result.valid.toBoolean)
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(!dut.io.busy.toBoolean)
+      assert(!dut.io.done.toBoolean)
+
+      issueTrGs(dut, k = 1, aValue = 2,
+        Seq(Some(2 -> 3), None, None, None), endOfTile = true)
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      while (!dut.io.done.toBoolean && timeout < 100) {
+        sleep(1)
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(observed == Seq((6, 2, 6L)))
+      assert(dut.io.done.toBoolean)
+    }
+  }
 }

@@ -206,11 +206,20 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
   }
 }
 
-/** TrGS adapter that broadcasts one A nonzero and spatially distributes a
-  * cache-line of B elements by their column coordinates.
-  */
+object TrGsSpatialState extends SpinalEnum {
+  val Idle, Run, Output, AbortDrain = newElement()
+}
+
+/** TrGS engine with one accumulator slot per spatial output column. */
 class TrGsSpatialEngine(tileCfg: GustavsonTileConfig) extends Component {
   private val cfg = tileCfg.core
+  private val slots = tileCfg.accumulatorEntries
+  private val inFlightWidth = log2Up(cfg.responseFifoDepth + 5)
+  require((slots & (slots - 1)) == 0,
+    "TrGS spatial accumulator entries must be a power of two")
+  require(slots >= cfg.macLanes,
+    "TrGS needs at least one accumulator slot per spatial MAC lane")
+  require(cfg.coordinateWidth >= tileCfg.entryIndexWidth)
 
   val io = new Bundle {
     val clear = in Bool()
@@ -222,13 +231,26 @@ class TrGsSpatialEngine(tileCfg: GustavsonTileConfig) extends Component {
     val unsupportedMode = out Bool()
   }
 
-  val engine = new GustavsonTileEngine(tileCfg)
-  engine.io.clear := io.clear
-  io.result <> engine.io.result
-  io.busy := engine.io.busy
-  io.done := engine.io.done
-  io.overflow := engine.io.overflow
-  io.unsupportedMode := engine.io.unsupportedMode
+  val state = RegInit(TrGsSpatialState.Idle)
+  val inputClosed = RegInit(False)
+  val doneReg = RegInit(False)
+  val overflowReg = RegInit(False)
+  val modeErrorReg = RegInit(False)
+  val inFlight = Reg(UInt(inFlightWidth bits)) init 0
+  val outputCursor = Reg(UInt(tileCfg.entryIndexWidth bits)) init 0
+
+  val slotValid = Vec((0 until slots).map(_ => RegInit(False)))
+  val slotRow = Vec((0 until slots).map(_ =>
+    Reg(UInt(cfg.coordinateWidth bits)) init 0))
+  val slotColumn = Vec((0 until slots).map(_ =>
+    Reg(UInt(cfg.coordinateWidth bits)) init 0))
+  val slotValue = Vec((0 until slots).map(_ =>
+    Reg(SInt(cfg.accumulatorWidth bits)) init 0))
+
+  io.busy := state =/= TrGsSpatialState.Idle
+  io.done := doneReg
+  io.overflow := overflowReg
+  io.unsupportedMode := modeErrorReg
 
   val adapted = PERowCommand(cfg)
   adapted.mode := io.command.payload.mode
@@ -246,9 +268,157 @@ class TrGsSpatialEngine(tileCfg: GustavsonTileConfig) extends Component {
     adapted.gustavson.b(lane).value := io.command.payload.b(lane).value
   }
 
-  engine.io.command.valid := io.command.valid
-  engine.io.command.payload := adapted
-  io.command.ready := engine.io.command.ready
+  val pe = new TrapezoidPERow(cfg)
+  val supportedMode = io.command.payload.mode === TrapezoidDataflow.TrGs
+  val acceptsSupported = (state === TrGsSpatialState.Idle ||
+    (state === TrGsSpatialState.Run && !inputClosed)) && supportedMode
+  pe.io.command.valid := !io.clear && io.command.valid && acceptsSupported
+  pe.io.command.payload := adapted
+  io.command.ready := !io.clear && Mux(supportedMode,
+    acceptsSupported && pe.io.command.ready,
+    state === TrGsSpatialState.Idle)
+
+  val commandFire = io.command.fire && supportedMode
+  val responseFire = pe.io.response.fire
+  val accumulateResponse = responseFire && state === TrGsSpatialState.Run
+  pe.io.response.ready := !io.clear &&
+    (state === TrGsSpatialState.Run || state === TrGsSpatialState.AbortDrain)
+
+  val response = pe.io.response.payload
+  var responseConflict: Bool = False
+  for (lane <- 0 until cfg.outputLanes;
+       earlier <- 0 until lane) {
+    val laneResult = response.results(lane)
+    val earlierResult = response.results(earlier)
+    responseConflict = responseConflict ||
+      (laneResult.valid && earlierResult.valid &&
+        laneResult.column(tileCfg.entryIndexWidth - 1 downto 0) ===
+          earlierResult.column(tileCfg.entryIndexWidth - 1 downto 0))
+  }
+
+  val newEntry = Bits(cfg.outputLanes bits)
+  for (lane <- 0 until cfg.outputLanes) {
+    val result = response.results(lane)
+    val slot = result.column(tileCfg.entryIndexWidth - 1 downto 0)
+    val coordinateCollision = slotValid(slot) &&
+      (slotRow(slot) =/= result.row || slotColumn(slot) =/= result.column)
+    newEntry(lane) := result.valid && !slotValid(slot)
+    when(accumulateResponse && result.valid && !responseConflict) {
+      when(coordinateCollision) {
+        overflowReg := True
+      } otherwise {
+        for (entry <- 0 until slots) {
+          when(slot === entry) {
+            when(slotValid(entry)) {
+              slotValue(entry) := (slotValue(entry) + result.value).resized
+            } otherwise {
+              slotValid(entry) := True
+              slotRow(entry) := result.row
+              slotColumn(entry) := result.column
+              slotValue(entry) := result.value
+            }
+          }
+        }
+      }
+    }
+  }
+  val outputChoices = Vec(Bool(), slots)
+  var earlierOutput: Bool = False
+  for (entry <- 0 until slots) {
+    val eligible = slotValid(entry) &&
+      U(entry, tileCfg.entryIndexWidth bits) >= outputCursor
+    outputChoices(entry) := eligible && !earlierOutput
+    earlierOutput = earlierOutput || eligible
+  }
+  val outputFound = outputChoices.asBits.orR
+  val outputSlot = UInt(tileCfg.entryIndexWidth bits)
+  outputSlot := 0
+  for (entry <- 0 until slots) {
+    when(outputChoices(entry)) { outputSlot := entry }
+  }
+  val laterOutput = Vec(Bool(), slots)
+  for (entry <- 0 until slots) {
+    laterOutput(entry) := slotValid(entry) &&
+      U(entry, tileCfg.entryIndexWidth bits) > outputSlot
+  }
+
+  io.result.valid := state === TrGsSpatialState.Output && outputFound
+  io.result.payload.valid := True
+  io.result.payload.row := slotRow(outputSlot)
+  io.result.payload.column := slotColumn(outputSlot)
+  io.result.payload.value := slotValue(outputSlot)
+  io.result.payload.endOfTile := !laterOutput.asBits.orR
+
+  when(commandFire =/= responseFire) {
+    when(commandFire) { inFlight := inFlight + 1 }
+      .otherwise { inFlight := inFlight - 1 }
+  }
+
+  switch(state) {
+    is(TrGsSpatialState.Idle) {
+      when(io.command.fire) {
+        doneReg := False
+        when(supportedMode) {
+          for (entry <- 0 until slots) slotValid(entry) := False
+          overflowReg := False
+          modeErrorReg := False
+          inputClosed := io.command.payload.endOfTile
+          state := TrGsSpatialState.Run
+        } otherwise {
+          modeErrorReg := True
+          doneReg := True
+        }
+      }
+    }
+
+    is(TrGsSpatialState.Run) {
+      when(commandFire && io.command.payload.endOfTile) {
+        inputClosed := True
+      }
+      when(responseFire) {
+        when(responseConflict) { overflowReg := True }
+        when(response.results(0).endOfTile) {
+          inputClosed := False
+          when(slotValid.asBits.orR || (!responseConflict && newEntry.orR)) {
+            outputCursor := 0
+            state := TrGsSpatialState.Output
+          } otherwise {
+            doneReg := True
+            state := TrGsSpatialState.Idle
+          }
+        }
+      }
+    }
+
+    is(TrGsSpatialState.Output) {
+      when(io.result.fire) {
+        when(io.result.payload.endOfTile) {
+          for (entry <- 0 until slots) slotValid(entry) := False
+          doneReg := True
+          state := TrGsSpatialState.Idle
+        } otherwise {
+          outputCursor := outputSlot + 1
+        }
+      }
+    }
+
+    is(TrGsSpatialState.AbortDrain) {
+      when(responseFire && inFlight === 1) {
+        inFlight := 0
+        state := TrGsSpatialState.Idle
+      }
+    }
+  }
+
+  when(io.clear) {
+    for (entry <- 0 until slots) slotValid(entry) := False
+    inputClosed := False
+    doneReg := False
+    overflowReg := False
+    modeErrorReg := False
+    when(inFlight === 0) { state := TrGsSpatialState.Idle }
+      .otherwise { state := TrGsSpatialState.AbortDrain }
+  }
 }
 
 object GenerateTrGtSubrowScheduler extends App {
@@ -265,4 +435,12 @@ object GenerateTrGsSpatialEngine extends App {
     targetDirectory = "generated-trgs",
     oneFilePerComponent = true
   ).generate(new TrGsSpatialEngine(GustavsonTileConfig(TrapezoidConfig.small)))
+}
+
+object GeneratePaperTrGsSpatialEngine extends App {
+  SpinalConfig(
+    mode = Verilog,
+    targetDirectory = "generated-paper-trgs",
+    oneFilePerComponent = true
+  ).generate(new TrGsSpatialEngine(GustavsonTileConfig(TrapezoidConfig.paper)))
 }

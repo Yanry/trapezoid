@@ -301,11 +301,12 @@ class GustavsonCacheAdapterSpec extends AnyFunSuite {
     val clusteredCacheCfg = cacheCfg.copy(clientCount = 2)
     val clusteredGustCfg = gustCfg.copy(cache = clusteredCacheCfg)
     simConfig.compile(new ClusteredCachedTrGsSpatialSystem(
-      clusteredGustCfg)).doSim { dut =>
+      clusteredGustCfg, wideWriteback = true)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       dut.io.clear #= false
       dut.io.command.valid #= false
       dut.io.result.ready #= false
+      dut.io.resultLine.ready #= false
       dut.io.refillRequest.ready #= false
       dut.io.refillResponse.valid #= false
       dut.io.refillResponse.payload.bank #= 0
@@ -392,14 +393,17 @@ class GustavsonCacheAdapterSpec extends AnyFunSuite {
         s"assigned=${dut.io.assignedTiles.toLong} allocated=${dut.io.allocated.toBigInt}")
 
       val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
-      dut.io.result.ready #= true
+      dut.io.resultLine.ready #= true
       timeout = 0
       while (observed.size < 2 && timeout < 300) {
         sleep(1)
-        if (dut.io.result.valid.toBoolean) {
-          observed += ((dut.io.result.payload.row.toInt,
-            dut.io.result.payload.column.toInt,
-            dut.io.result.payload.value.toLong))
+        if (dut.io.resultLine.valid.toBoolean) {
+          for (lane <- 0 until cfg.cacheLineWords
+               if dut.io.resultLine.payload.results(lane).valid.toBoolean) {
+            val result = dut.io.resultLine.payload.results(lane)
+            observed += ((result.row.toInt, result.column.toInt,
+              result.value.toLong))
+          }
         }
         dut.clockDomain.waitSampling()
         timeout += 1

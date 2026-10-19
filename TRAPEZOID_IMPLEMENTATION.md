@@ -269,8 +269,8 @@ sbt -batch 'runMain trapezoid.GeneratePaperGustavsonTileEngine'
 
 - `TrGtSubrowScheduler`：将一个 PE row 划分为 4 个逻辑 subrow，每个 subrow 配置独立 B FIFO，每次最多从每个 FIFO 发出一个元素；
 - `GustavsonBFifo`：使用同步 `Mem` 推断本地 SRAM bank，支持预取 head、独立 Stream 背压、occupancy、满队列停顿和环回；
-- `TrGsSpatialEngine`：把一个 A 非零值广播到 cache-line 内所有有效 B lane，并使用按输出列索引的 spatial accumulator；一个 PE response 的最多 16 个结果可以在同一周期写入不同列槽，连续 cache line 可以无空拍进入 PE 流水线；
-- `TrGsSpatialArray` / `TrGsSpatialRowScheduler`：为每个物理 PE row 配置独立 spatial accumulator，按 tile first-free 分配 PE row；一个 tile 的输出流在共享端口保持锁定到 `endOfTile`，其他 PE row 可并行计算或等待输出；
+- `TrGsSpatialEngine`：把一个 A 非零值广播到 cache-line 内所有有效 B lane，并使用按输出列索引的 spatial accumulator；一个 PE response 的最多 16 个结果可以在同一周期写入不同列槽，连续 cache line 可以无空拍进入 PE 流水线；结束时可通过 `MatrixResultLine` 每拍并行排出最多 `cacheLineWords` 个有序结果；
+- `TrGsSpatialArray` / `TrGsSpatialRowScheduler`：为每个物理 PE row 配置独立 spatial accumulator，按 tile first-free 分配 PE row；一个 tile 的输出流在共享端口保持锁定到 `endOfTile`，其他 PE row 可并行计算或等待输出；通过编译期参数在兼容的 scalar 结果流与 cache-line 宽结果流之间选择，不会同时实例化两套排空数据通路；
 - `GustavsonArray`：为每个 PE row 复制独立的 Gustavson accumulator、命令/结果 Stream 和状态接口；
 - `GustavsonRowScheduler`：把共享命令流按 tile 分配给空闲 PE row，同一 tile 固定在同一 row，最终命令送出后可重叠执行下一个 tile，并将共享结果端口锁定到当前 tile 的 `endOfTile`。
 
@@ -283,7 +283,7 @@ sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialEngine'
 sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 ```
 
-这些模块已经实现论文数据移动方式的功能等价路径。TrGT FIFO 已使用四个同步 memory bank，但由于 B 元素包含 `aIndex/k/column/value`，其 typed word 宽度不同于当前结果 buffer；两种用途尚未统一成同一个可切换的 `BankedLocalBuffer` 实例。TrGS 已删除通用 Gustavson accumulator 对 PE response 逐项串行插入的周期瓶颈，其列槽对应论文中每个乘法器负责一个 C-row 位置的空间累加方式；当前仍通过带坐标的组合适配完成分发，尚未替换为流水化物理分发网络。
+这些模块已经实现论文数据移动方式的功能等价路径。paper 生成入口启用 16-result 宽写回：128 个 accumulator 槽被划分为 8 个对齐 line，全空 line 会被跳过，每个非空 line 使用一拍排空，满 C row 从 128 拍降为 8 拍。该结构避免了把任意 128 个槽全局压缩到 16 lane 所需的大型 compactor，更接近本地 bank/line 读取。TrGT FIFO 已使用四个同步 memory bank，但由于 B 元素包含 `aIndex/k/column/value`，其 typed word 宽度不同于当前结果 buffer；两种用途尚未统一成同一个可切换的 `BankedLocalBuffer` 实例。TrGS 已删除通用 Gustavson accumulator 对 PE response 逐项串行插入和逐项输出的周期瓶颈，其列槽对应论文中每个乘法器负责一个 C-row 位置的空间累加方式；当前仍通过带坐标的组合适配完成分发，尚未替换为流水化物理分发网络。
 
 ### 2.12 矩阵描述符与外层 M/N/K 循环
 
@@ -347,13 +347,13 @@ sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 
 `CachedGustavsonSystem` 使用 cache client 0，并集成 `GustavsonRowScheduler`、`BankedReadCache` 和外部 refill Stream。相同 valid density 的 B row 可以由调用方分别选择 `TrGt` 或 `TrGs`；adapter 不统计 density，也不会修改 mode。`CachedTrGsSpatialSystem` 是面向 TrGS 综合和周期实验的专用顶层：adapter 直接产生窄 `TrGsCommand`，不再构造 128-entry A 向量；cache line 送入 `TrGsSpatialRowScheduler`，非 TrGS 命令在发出 cache 请求前被拒绝。该顶层只实例化一套 TrGS PE-row 阵列，不会为了保留通用路径同时复制一套 TrGT 阵列。当前地址仍由软件提供固定宽度 B-row 区域，CSR row pointer 解析和 DMA 尚未实现。
 
-`ClusteredCachedTrGsSpatialSystem` 进一步按 cache client 数量划分 TrGS cluster。每个 cluster 包含一个独立 B-row adapter 和 `peRows / clientCount` 条 PE row，总 PE row 数不变；输入 tile 从 first-free cluster 分配，并在该 tile 的所有 B-row command 完成前保持 cluster 归属。不同 cluster 可同时持有 cache outstanding request、等待不同 bank refill 或运行 PE row。各 cluster 内部先完成 PE-row 结果仲裁，顶层结果端口再锁定一个 cluster 直到 `endOfTile`，因此并行 tile 的结果不会交叉。small 生成配置使用 2 个 cluster，每个 cluster 2 条 PE row；映射到论文的 32 个 cache client 和 128 条 PE row 时对应每 cluster 4 条 PE row。
+`ClusteredCachedTrGsSpatialSystem` 进一步按 cache client 数量划分 TrGS cluster。每个 cluster 包含一个独立 B-row adapter 和 `peRows / clientCount` 条 PE row，总 PE row 数不变；输入 tile 从 first-free cluster 分配，并在该 tile 的所有 B-row command 完成前保持 cluster 归属。不同 cluster 可同时持有 cache outstanding request、等待不同 bank refill 或运行 PE row。各 cluster 内部先完成 PE-row 结果仲裁，顶层结果端口再锁定一个 cluster 直到 `endOfTile`，因此并行 tile 的结果不会交叉。生成入口启用 cache-line 宽写回，small 生成配置使用 2 个 cluster，每个 cluster 2 条 PE row；映射到论文的 32 个 cache client 和 128 条 PE row 时对应每 cluster 4 条 PE row。
 
 ## 3. 当前达到的效果
 
 ### 3.1 功能验证
 
-当前共有 42 项自动测试，执行方式为：
+当前共有 43 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -399,9 +399,10 @@ sbt -batch test
 - 同一稀疏 B row 分别显式运行 `TrGt`/`TrGs`，并验证首次 miss/refill、重复读取 hit 和结果一致性；
 - Gustavson B-row 非法 mode、地址越界和 refill error 拒绝，以及 cache error 后自动关闭半开 tile；
 - TrGS adapter 在输出已缓存 line 的同周期发出下一条 cache 请求；
-- 两个 TrGS cluster 使用独立 cache client，并行持有和执行不同 tile。
+- 两个 TrGS cluster 使用独立 cache client，并行持有和执行不同 tile；
+- TrGS 宽写回将分属首尾 line 的 6 个结果分成 `4 + 2` 两拍输出，跳过中间全空 line，并在背压期间保持整行稳定。
 
-当前测试结果为 42 项全部通过。
+当前测试结果为 43 项全部通过。
 
 ### 3.2 RTL 检查
 
@@ -482,7 +483,7 @@ sbt -batch 'Test/runMain trapezoid.FullPaperRtlDataflowLatencyBenchmark'
 
 该入口保持 `128 x 128` paper PE/MAC 配置，并通过层次化 blackbox 只生成一次 paper PE-row 内核；但当前 TrIP controller 生成的顶层 Verilog仍约 767MB。在 30GiB 主机上 Spinal elaboration 可以完成，Verilator translation 会被系统以 `SIGKILL(9)` 终止，因此该入口只适合更高内存的机器，不应作为本机默认测试。`PaperRtlDataflowLatencyBenchmark` 作为兼容入口会打印说明并转到可运行的 paper cycle model，不再触发 OOM。
 
-paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用同一个 `TrIpTileController` 调度和 PE 数据通路。`TrGt` 仍通过通用 `GustavsonRowScheduler` 的有序 merge accumulator 执行；`TrGs` 已切换到 `TrGsSpatialRowScheduler`，使用 128 个 paper PE row、连续 cache-line 发射和按列空间累加，因此两种 Gustavson mode 的 RTL 周期不再被同一个逐项 merge 状态机人为拉齐。完整 cache/HBM 流量和写回争用仍未包含。
+paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用同一个 `TrIpTileController` 调度和 PE 数据通路。`TrGt` 仍通过通用 `GustavsonRowScheduler` 的有序 merge accumulator 执行；`TrGs` 已切换到启用宽写回的 `TrGsSpatialRowScheduler`，使用 128 个 paper PE row、连续 cache-line 发射、按列空间累加和每拍最多 16 个结果的排空，因此两种 Gustavson mode 的 RTL 周期不再被同一个逐项 merge/输出状态机人为拉齐。完整 cache/HBM 流量以及写回端口、bank 和 NoC 争用仍未包含。
 
 ### 3.4 当前适用范围
 

@@ -378,7 +378,10 @@ class CachedTrGsSpatialSystem(gustCfg: GustavsonCacheConfig) extends Component {
 }
 
 /** Multi-client TrGS system partitioned into cache/PE-row clusters. */
-class ClusteredCachedTrGsSpatialSystem(gustCfg: GustavsonCacheConfig)
+class ClusteredCachedTrGsSpatialSystem(
+    gustCfg: GustavsonCacheConfig,
+    wideWriteback: Boolean = false
+)
     extends Component {
   private val cfg = gustCfg.tile.core
   private val cacheCfg = gustCfg.cache
@@ -398,6 +401,7 @@ class ClusteredCachedTrGsSpatialSystem(gustCfg: GustavsonCacheConfig)
     val clear = in Bool()
     val command = slave(Stream(CachedGustavsonBRowCommand(gustCfg)))
     val result = master(Stream(MatrixResult(cfg)))
+    val resultLine = master(Stream(MatrixResultLine(cfg)))
     val refillRequest = master(Stream(CacheRefillRequest(cacheCfg)))
     val refillResponse = slave(Stream(CacheRefillResponse(cacheCfg)))
     val clusterOwned = out Bits(clusterCount bits)
@@ -425,7 +429,7 @@ class ClusteredCachedTrGsSpatialSystem(gustCfg: GustavsonCacheConfig)
     localGustCfg, allowTrGt = false, allowTrGs = true,
     emitSpatialCommand = true))
   val schedulers = Array.fill(clusterCount)(
-    new TrGsSpatialRowScheduler(localTile))
+    new TrGsSpatialRowScheduler(localTile, wideOutput = wideWriteback))
   val cache = new BankedReadCache(cacheCfg)
   cache.io.clear := io.clear
   io.refillRequest <> cache.io.refillRequest
@@ -537,8 +541,10 @@ class ClusteredCachedTrGsSpatialSystem(gustCfg: GustavsonCacheConfig)
   val outputChoices = Vec(Bool(), clusterCount)
   var earlierOutput: Bool = False
   for (cluster <- 0 until clusterCount) {
-    outputChoices(cluster) := schedulers(cluster).io.result.valid && !earlierOutput
-    earlierOutput = earlierOutput || schedulers(cluster).io.result.valid
+    val clusterValid = if (wideWriteback) schedulers(cluster).io.resultLine.valid
+      else schedulers(cluster).io.result.valid
+    outputChoices(cluster) := clusterValid && !earlierOutput
+    earlierOutput = earlierOutput || clusterValid
   }
   val outputFound = outputChoices.asBits.orR
   val chosenOutputCluster = UInt(clusterIndexWidth bits)
@@ -554,20 +560,39 @@ class ClusteredCachedTrGsSpatialSystem(gustCfg: GustavsonCacheConfig)
   val outputRouteValid = !io.clear && (outputLocked || outputFound)
   io.result.valid := False
   io.result.payload := MatrixResult(cfg).getZero
+  io.resultLine.valid := False
+  io.resultLine.payload := MatrixResultLine(cfg).getZero
   for (cluster <- 0 until clusterCount) {
-    schedulers(cluster).io.result.ready := io.result.ready &&
-      outputRouteValid && selectedOutputCluster === cluster
-    when(outputRouteValid && selectedOutputCluster === cluster) {
-      io.result.valid := schedulers(cluster).io.result.valid
-      io.result.payload := schedulers(cluster).io.result.payload
+    if (wideWriteback) {
+      schedulers(cluster).io.result.ready := False
+      schedulers(cluster).io.resultLine.ready := io.resultLine.ready &&
+        outputRouteValid && selectedOutputCluster === cluster
+      when(outputRouteValid && selectedOutputCluster === cluster) {
+        io.resultLine.valid := schedulers(cluster).io.resultLine.valid
+        io.resultLine.payload := schedulers(cluster).io.resultLine.payload
+      }
+    } else {
+      schedulers(cluster).io.resultLine.ready := False
+      schedulers(cluster).io.result.ready := io.result.ready &&
+        outputRouteValid && selectedOutputCluster === cluster
+      when(outputRouteValid && selectedOutputCluster === cluster) {
+        io.result.valid := schedulers(cluster).io.result.valid
+        io.result.payload := schedulers(cluster).io.result.payload
+      }
     }
   }
   when(!outputLocked && outputFound) {
     outputLocked := True
     outputCluster := chosenOutputCluster
   }
-  when(io.result.fire && io.result.payload.endOfTile) {
-    outputLocked := False
+  if (wideWriteback) {
+    when(io.resultLine.fire && io.resultLine.payload.endOfTile) {
+      outputLocked := False
+    }
+  } else {
+    when(io.result.fire && io.result.payload.endOfTile) {
+      outputLocked := False
+    }
   }
 
   io.cacheBankBusy := cache.io.bankBusy
@@ -639,5 +664,5 @@ object GenerateClusteredCachedTrGsSpatialSystem extends App {
     targetDirectory = "generated-clustered-cached-trgs",
     oneFilePerComponent = true
   ).generate(new ClusteredCachedTrGsSpatialSystem(
-    GustavsonCacheConfig(tile, cache)))
+    GustavsonCacheConfig(tile, cache), wideWriteback = true))
 }

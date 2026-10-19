@@ -179,6 +179,7 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     dut.io.clear #= false
     dut.io.command.valid #= false
     dut.io.result.ready #= false
+    dut.io.resultLine.ready #= false
   }
 
   private def issueTrGs(dut: TrGsSpatialEngine, k: Int, aValue: Int,
@@ -285,6 +286,74 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     }
   }
 
+  test("TrGS wide writeback emits one cache-line batch per cycle") {
+    val wideTileCfg = tileCfg.copy(accumulatorEntries = 16)
+    simConfig.compile(new TrGsSpatialEngine(
+      wideTileCfg, wideOutput = true)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      initializeTrGs(dut)
+
+      issueTrGs(dut, k = 0, aValue = 2,
+        Seq(Some(0 -> 1), Some(1 -> 2), Some(2 -> 3), Some(3 -> 4)),
+        endOfTile = false)
+      issueTrGs(dut, k = 1, aValue = 3,
+        Seq(Some(12 -> 5), Some(13 -> 6), None, None), endOfTile = true)
+
+      var timeout = 0
+      while (!dut.io.resultLine.valid.toBoolean && timeout < 100) {
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(timeout < 100)
+      assert(dut.io.resultLine.payload.count.toInt == 4)
+      val stalled = (0 until cfg.cacheLineWords).map { lane =>
+        val result = dut.io.resultLine.payload.results(lane)
+        (result.valid.toBoolean, result.row.toInt, result.column.toInt,
+          result.value.toLong, result.endOfTile.toBoolean)
+      }
+      for (_ <- 0 until 3) {
+        dut.clockDomain.waitSampling()
+        val current = (0 until cfg.cacheLineWords).map { lane =>
+          val result = dut.io.resultLine.payload.results(lane)
+          (result.valid.toBoolean, result.row.toInt, result.column.toInt,
+            result.value.toLong, result.endOfTile.toBoolean)
+        }
+        assert(current == stalled)
+      }
+
+      dut.io.resultLine.ready #= true
+      val lines = mutable.ArrayBuffer.empty[
+        (Int, Boolean, Seq[(Int, Int, Long, Boolean)])]
+      while (!dut.io.done.toBoolean && timeout < 200) {
+        sleep(1)
+        if (dut.io.resultLine.valid.toBoolean &&
+            dut.io.resultLine.ready.toBoolean) {
+          val count = dut.io.resultLine.payload.count.toInt
+          val results = (0 until count).map { lane =>
+            val result = dut.io.resultLine.payload.results(lane)
+            assert(result.valid.toBoolean)
+            (result.row.toInt, result.column.toInt, result.value.toLong,
+              result.endOfTile.toBoolean)
+          }
+          lines += ((count, dut.io.resultLine.payload.endOfTile.toBoolean, results))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+
+      assert(dut.io.done.toBoolean)
+      assert(lines.map(_._1) == Seq(4, 2))
+      assert(lines.map(_._2) == Seq(false, true))
+      assert(lines.flatMap(_._3).map(x => (x._1, x._2, x._3)) == Seq(
+        (6, 0, 2L), (6, 1, 4L), (6, 2, 6L),
+        (6, 3, 8L), (6, 12, 15L), (6, 13, 18L)))
+      assert(lines.flatMap(_._3).map(_._4) ==
+        Seq(false, false, false, false, false, true))
+      assert(!dut.io.result.valid.toBoolean)
+      assert(!dut.io.overflow.toBoolean)
+    }
+  }
+
   test("TrGS clear drains in-flight responses without contaminating the next tile") {
     simConfig.compile(new TrGsSpatialEngine(tileCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
@@ -348,6 +417,7 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
       dut.io.clear #= false
       dut.io.command.valid #= false
       dut.io.result.ready #= false
+      dut.io.resultLine.ready #= false
 
       def issue(row: Int, column: Int, aValue: Int, bValue: Int): Unit = {
         dut.io.command.payload.mode #= TrapezoidDataflow.TrGs

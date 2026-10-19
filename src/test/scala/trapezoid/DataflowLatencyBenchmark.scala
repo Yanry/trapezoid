@@ -718,11 +718,12 @@ object FullPaperRtlDataflowLatencyBenchmark extends App {
   }
 
   simConfig.compile(new TrGsSpatialRowScheduler(gustCfg,
-    paperPe(kernelSources))).doSim { dut =>
+    paperPe(kernelSources), wideOutput = true)).doSim { dut =>
     dut.clockDomain.forkStimulus(10)
     dut.io.clear #= false
     dut.io.command.valid #= false
-    dut.io.result.ready #= true
+    dut.io.result.ready #= false
+    dut.io.resultLine.ready #= true
 
     def clearPayload(): Unit = {
       dut.io.command.payload.mode #= TrapezoidDataflow.TrGs
@@ -762,9 +763,12 @@ object FullPaperRtlDataflowLatencyBenchmark extends App {
 
       def sampleCycle(): Unit = {
         sleep(1)
-        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
-          observed((dut.io.result.payload.row.toInt,
-            dut.io.result.payload.column.toInt)) = dut.io.result.payload.value.toLong
+        if (dut.io.resultLine.valid.toBoolean && dut.io.resultLine.ready.toBoolean) {
+          for (lane <- 0 until cfg.cacheLineWords
+               if dut.io.resultLine.payload.results(lane).valid.toBoolean) {
+            val result = dut.io.resultLine.payload.results(lane)
+            observed((result.row.toInt, result.column.toInt)) = result.value.toLong
+          }
         }
         dut.clockDomain.waitSampling()
         cycles += 1
@@ -800,9 +804,13 @@ object FullPaperRtlDataflowLatencyBenchmark extends App {
               observedMacs += (0 until cfg.cacheLineWords).count(lane =>
                 dut.io.command.payload.b(lane).valid.toBoolean)
             }
-            if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
-              observed((dut.io.result.payload.row.toInt,
-                dut.io.result.payload.column.toInt)) = dut.io.result.payload.value.toLong
+            if (dut.io.resultLine.valid.toBoolean &&
+                dut.io.resultLine.ready.toBoolean) {
+              for (lane <- 0 until cfg.cacheLineWords
+                   if dut.io.resultLine.payload.results(lane).valid.toBoolean) {
+                val result = dut.io.resultLine.payload.results(lane)
+                observed((result.row.toInt, result.column.toInt)) = result.value.toLong
+              }
             }
             dut.clockDomain.waitSampling()
             cycles += 1

@@ -55,6 +55,13 @@ case class MatrixResult(cfg: TrapezoidConfig) extends Bundle {
   val endOfTile = Bool()
 }
 
+/** One PE-local writeback line containing coordinate-ordered results. */
+case class MatrixResultLine(cfg: TrapezoidConfig) extends Bundle {
+  val count = UInt(log2Up(cfg.cacheLineWords + 1) bits)
+  val results = Vec(MatrixResult(cfg), cfg.cacheLineWords)
+  val endOfTile = Bool()
+}
+
 case class PERowResponse(cfg: TrapezoidConfig) extends Bundle {
   val mode = TrapezoidDataflow()
   val overflow = Bool()

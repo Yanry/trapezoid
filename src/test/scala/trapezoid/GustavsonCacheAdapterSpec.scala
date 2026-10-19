@@ -180,6 +180,123 @@ class GustavsonCacheAdapterSpec extends AnyFunSuite {
     }
   }
 
+  test("cached TrGS spatial system refills, hits, and rejects TrGT before memory") {
+    simConfig.compile(new CachedTrGsSpatialSystem(gustCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.command.valid #= false
+      dut.io.result.ready #= false
+      dut.io.refillRequest.ready #= true
+      dut.io.refillResponse.valid #= false
+      dut.io.refillResponse.payload.bank #= 0
+      dut.io.refillResponse.payload.address #= 0
+      dut.io.refillResponse.payload.data #= 0
+      dut.io.refillResponse.payload.error #= false
+
+      val base = 30
+      val memory = Map(
+        base -> encodeLine(Seq(Some(3 -> 2), None, Some(1 -> 5), None)),
+        (base + 1) -> encodeLine(Seq(Some(3 -> 4), Some(2 -> -1), None, None)))
+      val refillAddresses = mutable.ArrayBuffer.empty[Int]
+
+      fork {
+        while (true) {
+          dut.io.refillRequest.ready #= true
+          dut.io.refillResponse.valid #= false
+          sleep(1)
+          if (dut.io.refillRequest.valid.toBoolean) {
+            val bank = dut.io.refillRequest.payload.bank.toInt
+            val address = dut.io.refillRequest.payload.address.toInt
+            refillAddresses += address
+            dut.clockDomain.waitSampling()
+            dut.io.refillRequest.ready #= false
+            dut.clockDomain.waitSampling(2)
+            dut.io.refillResponse.payload.bank #= bank
+            dut.io.refillResponse.payload.address #= address
+            dut.io.refillResponse.payload.data #= memory(address)
+            dut.io.refillResponse.payload.error #= false
+            dut.io.refillResponse.valid #= true
+            while (!dut.io.refillResponse.ready.toBoolean) {
+              dut.clockDomain.waitSampling()
+            }
+            dut.clockDomain.waitSampling()
+            dut.io.refillResponse.valid #= false
+          } else {
+            dut.clockDomain.waitSampling()
+          }
+        }
+      }
+
+      def issue(mode: TrapezoidDataflow.E, row: Int, aValue: Int): Unit = {
+        dut.io.command.payload.mode #= mode
+        dut.io.command.payload.endOfTile #= true
+        dut.io.command.payload.aIndex #= 2
+        dut.io.command.payload.a.valid #= true
+        dut.io.command.payload.a.row #= row
+        dut.io.command.payload.a.k #= 5
+        dut.io.command.payload.a.value #= aValue
+        dut.io.command.payload.bBaseAddress #= base
+        dut.io.command.payload.lineCount #= 2
+        dut.io.command.valid #= true
+        sleep(1)
+        while (!dut.io.command.ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        sleep(1)
+        dut.io.command.valid #= false
+      }
+
+      issue(TrapezoidDataflow.TrGt, row = 1, aValue = 9)
+      assert(dut.io.commandDone.toBoolean)
+      assert(dut.io.adapterUnsupportedMode.toBoolean)
+      assert(dut.io.requestedLines.toLong == 0)
+      assert(dut.io.assignedTiles.toLong == 0)
+      assert(refillAddresses.isEmpty)
+
+      def run(row: Int, aValue: Int, seed: Int): Seq[(Int, Int, Long)] = {
+        val completedBefore = dut.io.completedTiles.toLong
+        issue(TrapezoidDataflow.TrGs, row, aValue)
+        val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+        val random = new Random(seed)
+        var sawEnd = false
+        var timeout = 0
+        while ((!sawEnd || dut.io.completedTiles.toLong == completedBefore) &&
+            timeout < 1000) {
+          dut.io.result.ready #= random.nextBoolean()
+          sleep(1)
+          if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+            observed += ((dut.io.result.payload.row.toInt,
+              dut.io.result.payload.column.toInt,
+              dut.io.result.payload.value.toLong))
+            sawEnd = dut.io.result.payload.endOfTile.toBoolean
+          }
+          dut.clockDomain.waitSampling()
+          timeout += 1
+        }
+        dut.io.result.ready #= false
+        assert(timeout < 1000, s"row=$row results=$observed")
+        observed.toSeq
+      }
+
+      assert(run(row = 8, aValue = 2, seed = 0x81) ==
+        Seq((8, 1, 10L), (8, 2, -2L), (8, 3, 12L)))
+      assert(refillAddresses.sorted == Seq(base, base + 1))
+      assert(dut.io.cacheMissCount.toLong == 2)
+      assert(dut.io.cacheRefillCount.toLong == 2)
+
+      assert(run(row = 9, aValue = 3, seed = 0x82) ==
+        Seq((9, 1, 15L), (9, 2, -3L), (9, 3, 18L)))
+      assert(refillAddresses.size == 2)
+      assert(dut.io.cacheHitCount.toLong == 2)
+      assert(dut.io.assignedTiles.toLong == 2)
+      assert(dut.io.completedTiles.toLong == 2)
+      assert(!dut.io.memoryError.toBoolean)
+      assert(!dut.io.addressError.toBoolean)
+      assert(!dut.io.adapterUnsupportedMode.toBoolean)
+      assert(dut.io.schedulerOverflow.toBigInt == 0)
+      assert(dut.io.schedulerUnsupportedMode.toBigInt == 0)
+    }
+  }
+
   test("B-row adapter rejects unsupported modes and overflowing address ranges") {
     simConfig.compile(new GustavsonBRowCacheAdapter(gustCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)

@@ -206,9 +206,10 @@ sbt -batch 'runMain trapezoid.GenerateGustavsonRowScheduler'
 
 ```bash
 sbt -batch 'runMain trapezoid.GenerateCachedGustavsonSystem'
+sbt -batch 'runMain trapezoid.GenerateCachedTrGsSpatialSystem'
 ```
 
-输出位于 `generated-cached-gustavson/`。
+分别输出位于 `generated-cached-gustavson/` 和 `generated-cached-trgs/`。
 
 ### 2.8 矩阵级参考模型
 
@@ -342,13 +343,13 @@ sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 - cache error 或 request ID 不匹配会置位 `memoryError`；若 tile 已打开，还会发送空的结束命令释放 PE row，避免调度器永久停在半开状态；
 - 暴露 requested/emitted line、cache hit/miss/refill、PE row 分配和完成 tile 等状态计数。
 
-`CachedGustavsonSystem` 使用 cache client 0，并集成 `GustavsonRowScheduler`、`BankedReadCache` 和外部 refill Stream。相同 valid density 的 B row 可以由调用方分别选择 `TrGt` 或 `TrGs`；adapter 不统计 density，也不会修改 mode。当前地址仍由软件提供固定宽度 B-row 区域，CSR row pointer 解析和 DMA 尚未实现。
+`CachedGustavsonSystem` 使用 cache client 0，并集成 `GustavsonRowScheduler`、`BankedReadCache` 和外部 refill Stream。相同 valid density 的 B row 可以由调用方分别选择 `TrGt` 或 `TrGs`；adapter 不统计 density，也不会修改 mode。`CachedTrGsSpatialSystem` 是面向 TrGS 综合和周期实验的专用顶层：adapter 直接产生窄 `TrGsCommand`，不再构造 128-entry A 向量；cache line 送入 `TrGsSpatialRowScheduler`，非 TrGS 命令在发出 cache 请求前被拒绝。该顶层只实例化一套 TrGS PE-row 阵列，不会为了保留通用路径同时复制一套 TrGT 阵列。当前地址仍由软件提供固定宽度 B-row 区域，CSR row pointer 解析和 DMA 尚未实现。
 
 ## 3. 当前达到的效果
 
 ### 3.1 功能验证
 
-当前共有 36 项自动测试，执行方式为：
+当前共有 40 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test

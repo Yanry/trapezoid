@@ -39,12 +39,11 @@ case class PERowMacPayload(cfg: TrapezoidConfig) extends Bundle {
   val tripValid = Vec(Bool(), cfg.macLanes)
   val tripAFiber = Vec(UInt(cfg.fiberIndexWidth bits), cfg.macLanes)
   val tripBFiber = Vec(UInt(cfg.fiberIndexWidth bits), cfg.macLanes)
-  val tripProduct = Vec(SInt(cfg.accumulatorWidth bits), cfg.macLanes)
+  val product = Vec(SInt(cfg.accumulatorWidth bits), cfg.macLanes)
 
   val gustValid = Vec(Bool(), cfg.cacheLineWords)
   val gustRow = Vec(UInt(cfg.coordinateWidth bits), cfg.cacheLineWords)
   val gustColumn = Vec(UInt(cfg.coordinateWidth bits), cfg.cacheLineWords)
-  val gustProduct = Vec(SInt(cfg.accumulatorWidth bits), cfg.cacheLineWords)
 }
 
 /** One packed TrIP product carried through the configurable reduction tree. */
@@ -331,6 +330,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   multiplied.overflow := route.overflow
   multiplied.selectedColumns := route.selectedColumns
   multiplied.effectualMacs := route.effectualMacs
+  val routeTripMode = route.mode === TrapezoidDataflow.DenseIp ||
+    route.mode === TrapezoidDataflow.TrIp
   for (fiber <- 0 until cfg.maxFibers) {
     multiplied.tripATags(fiber) := route.tripATags(fiber)
     multiplied.tripBTags(fiber) := route.tripBTags(fiber)
@@ -339,17 +340,25 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     multiplied.tripValid(lane) := route.tripValid(lane)
     multiplied.tripAFiber(lane) := route.tripAFiber(lane)
     multiplied.tripBFiber(lane) := route.tripBFiber(lane)
-    val product = route.tripAOperand(lane) * route.tripBOperand(lane)
-    multiplied.tripProduct(lane) := Mux(route.tripValid(lane),
-      product.resize(cfg.accumulatorWidth), S(0, cfg.accumulatorWidth bits))
+    val gustValid = if (lane < cfg.cacheLineWords)
+      route.gustValid(lane) else False
+    val gustAOperand = if (lane < cfg.cacheLineWords)
+      route.gustAOperand(lane) else S(0, cfg.dataWidth bits)
+    val gustBOperand = if (lane < cfg.cacheLineWords)
+      route.gustBOperand(lane) else S(0, cfg.dataWidth bits)
+    val selectedValid = Mux(routeTripMode, route.tripValid(lane), gustValid)
+    val selectedAOperand = Mux(routeTripMode,
+      route.tripAOperand(lane), gustAOperand)
+    val selectedBOperand = Mux(routeTripMode,
+      route.tripBOperand(lane), gustBOperand)
+    val laneProduct = selectedAOperand * selectedBOperand
+    multiplied.product(lane) := Mux(selectedValid,
+      laneProduct.resize(cfg.accumulatorWidth), S(0, cfg.accumulatorWidth bits))
   }
   for (lane <- 0 until cfg.cacheLineWords) {
     multiplied.gustValid(lane) := route.gustValid(lane)
     multiplied.gustRow(lane) := route.gustRow(lane)
     multiplied.gustColumn(lane) := route.gustColumn(lane)
-    val product = route.gustAOperand(lane) * route.gustBOperand(lane)
-    multiplied.gustProduct(lane) := Mux(route.gustValid(lane),
-      product.resize(cfg.accumulatorWidth), S(0, cfg.accumulatorWidth bits))
   }
 
   val macInput = Stream(PERowMacPayload(cfg))
@@ -383,7 +392,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     leaf.bFiber := mac.tripBFiber(lane)
     leaf.row := mac.tripATags(mac.tripAFiber(lane))
     leaf.column := mac.tripBTags(mac.tripBFiber(lane))
-    leaf.value := mac.tripProduct(lane)
+    leaf.value := mac.product(lane)
     leaf
   }
   private val tripReduction = reduceContiguous(tripLeaves)
@@ -416,7 +425,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     leaf.bFiber := 0
     leaf.row := mac.gustRow(lane)
     leaf.column := mac.gustColumn(lane)
-    leaf.value := mac.gustProduct(lane)
+    leaf.value := mac.product(lane)
     leaf
   }
   private val trGsCompacted = compactValid(gustLeaves)

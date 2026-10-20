@@ -200,6 +200,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   // Stage 1: the MFIU/shift equivalent distributes operands to fixed lanes.
   val mfiu = new MultiFiberIntersection(cfg)
   val columnPacker = new DynamicColumnPacker(cfg)
+  val aDistribution = new OperandDistributionNetwork(cfg)
+  val bDistribution = new OperandDistributionNetwork(cfg)
   val input = inputStage.payload
   val fullFiberMask = B((BigInt(1) << cfg.fiberWidth) - 1,
     cfg.fiberWidth bits)
@@ -240,6 +242,24 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       input.trip.b(fiber).valid
     columnPacker.io.bMask(fiber) := Mux(useSparseTripRoute,
       input.trip.b(fiber).mask, B(0, cfg.fiberWidth bits))
+    for (value <- 0 until cfg.fiberWidth) {
+      mfiu.io.aValues(fiber)(value) := Mux(useSparseTripRoute,
+        input.trip.a(fiber).values(value), S(0, cfg.dataWidth bits))
+      mfiu.io.bValues(fiber)(value) := Mux(useSparseTripRoute,
+        input.trip.b(fiber).values(value), S(0, cfg.dataWidth bits))
+    }
+  }
+  aDistribution.io.sources := mfiu.io.aSources
+  aDistribution.io.sourceValid := mfiu.io.aSourceValid
+  bDistribution.io.sources := mfiu.io.bSources
+  bDistribution.io.sourceValid := mfiu.io.bSourceValid
+  for (lane <- 0 until cfg.macLanes) {
+    aDistribution.io.laneValid(lane) := useSparseTripRoute &&
+      mfiu.io.routes(lane).valid
+    bDistribution.io.laneValid(lane) := useSparseTripRoute &&
+      mfiu.io.routes(lane).valid
+    aDistribution.io.sourceIndex(lane) := mfiu.io.routes(lane).aSourceIndex
+    bDistribution.io.sourceIndex(lane) := mfiu.io.routes(lane).bSourceIndex
   }
 
   val routed = PERowRoutePayload(cfg)
@@ -271,17 +291,15 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       tripAFiber := Mux(denseFastPath, denseAFiber, laneRoute.aFiber)
       tripBFiber := Mux(denseFastPath, denseBFiber, laneRoute.bFiber)
       tripAOperand := Mux(denseFastPath, denseA.values(lane),
-        input.trip.a(laneRoute.aFiber).values(laneRoute.aValueIndex))
+        aDistribution.io.outputs(lane))
       tripBOperand := Mux(denseFastPath, denseB.values(lane),
-        input.trip.b(laneRoute.bFiber).values(laneRoute.bValueIndex))
+        bDistribution.io.outputs(lane))
     } else {
       tripValid := laneRoute.valid
       tripAFiber := laneRoute.aFiber
       tripBFiber := laneRoute.bFiber
-      tripAOperand := input.trip.a(laneRoute.aFiber)
-        .values(laneRoute.aValueIndex)
-      tripBOperand := input.trip.b(laneRoute.bFiber)
-        .values(laneRoute.bValueIndex)
+      tripAOperand := aDistribution.io.outputs(lane)
+      tripBOperand := bDistribution.io.outputs(lane)
     }
 
     val gustValid = Bool()
@@ -334,7 +352,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       tripBOperand, gustBOperand)
   }
   routed.overflow := Mux(denseFastPath, False,
-    Mux(inputTripMode, mfiu.io.overflow, gustRouteErrors.orR))
+    Mux(inputTripMode, mfiu.io.overflow || aDistribution.io.routeError ||
+      bDistribution.io.routeError, gustRouteErrors.orR))
 
   val routeInput = Stream(PERowRoutePayload(cfg))
   routeInput.valid := inputStage.valid

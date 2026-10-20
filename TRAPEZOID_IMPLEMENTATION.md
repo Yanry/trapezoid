@@ -58,10 +58,10 @@
 2. 找出所有 effectual computation；
 3. 使用前缀计数将稀疏匹配压缩到连续 MAC lane；
 4. 计算匹配元素在压缩 values 数组中的索引；
-5. 生成 A/B fiber、坐标以及压缩值索引等路由信息；
+5. 生成 A/B fiber、坐标、压缩值索引和连续 distribution-source 索引；
 6. 当 effectual computation 超过 MAC lane 数时产生 `overflow`。
 
-当前实现完成了论文 MFIU 和 shift-unit 的等价逻辑功能。最多 `4 x 4 x fiberWidth` 个 pair-major 候选先并行形成，随后进入分层稳定 compaction tree：每个节点根据左子树有效数，通过多级 shift 将右侧紧凑流拼接到左侧，而不是让每个 MAC lane 比较全部候选的全交叉网络。该网络保持 fiber-pair 和 K-coordinate 顺序，并只保留前 `macLanes` 项；独立计数路径仍报告完整 effectual computation 数和 overflow。shift unit 使用的 A/B 压缩 value rank 按源 fiber 通过并行 prefix tree 预计算一次，由所有目标 lane 共享。当前 route metadata 压缩已经分层化，但 PE row 随后的 A/B operand 动态选择仍由 SpinalHDL 组合 mux 实现，尚未映射成论文使用的两套 128 x 128 Benes distribution network。
+当前实现完成了论文 MFIU 和 shift-unit 的等价逻辑功能。最多 `4 x 4 x fiberWidth` 个 pair-major 候选先并行形成，随后进入分层稳定 compaction tree：每个节点根据左子树有效数，通过多级 shift 将右侧紧凑流拼接到左侧，而不是让每个 MAC lane 比较全部候选的全交叉网络。该网络保持 fiber-pair 和 K-coordinate 顺序，并只保留前 `macLanes` 项；独立计数路径仍报告完整 effectual computation 数和 overflow。shift unit 首先计算每条 A/B fiber 中真正参与至少一次乘法的 coordinate，再用原 bitmask 把 participating bit 分层压缩到 compressed-value 顺序，最后按 fiber offset 合并成最多 `macLanes` 个连续物理 source 槽。每个 effectual route 同时携带原 fiber/value index 和新的全局 source index；同一个非零值被多个乘法复用时，这些 route 指向同一 source 槽。PE row 已实例化两套独立 `OperandDistributionNetwork` 边界，A/B 网络都只接收 `macLanes` 个 source，而不再让每个 MAC lane 直接从 `maxFibers x fiberWidth` 个命令值中动态读取。当前 network 内部仍使用 source-index selector，尚未替换为论文的 O(`N log N`) Benes switch fabric 和对应 runtime 控制生成。
 
 ### 2.4 动态 B 列打包
 
@@ -360,7 +360,7 @@ sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 
 ### 3.1 功能验证
 
-当前共有 43 项自动测试，执行方式为：
+当前共有 49 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -369,7 +369,7 @@ sbt -batch test
 已验证：
 
 - TrIP 对多个压缩 fiber 的坐标交叉；
-- MFIU 分层 compactor 在 100 组固定种子随机输入下保持 pair-major 路由、value rank、完整计数和 overflow；
+- MFIU 分层 compactor 在 100 组固定种子随机输入下保持 pair-major 路由、value rank、连续 source packing、全局 source index、完整计数和 overflow；
 - 压缩 values 索引和 MAC lane 路由；
 - 同一输出元素的多个部分积归约；
 - 动态 B column 选择和 effectual MAC 统计；
@@ -432,7 +432,7 @@ verilator --lint-only --Wall -Wno-fatal generated-cached-gustavson/*.v
 
 当前已生成的 RTL 目录都没有 lint error。剩余 warning 主要来自 SpinalHDL 生成的枚举调试字符串、未消费的调试/诊断信号和部分保留接口，不影响功能。
 
-已对 paper 参数的单个 Gustavson/PE row 做独立 elaboration。当前论文配置保持 128 个输入 MAC lane、128-wide fiber 和 `4 x 4` fiber intersection，但将响应修正为 16 个结果 lane：MRN 每条命令最多生成 16 个 TrIP 输出，TrGS 每条 cache line 也最多提供 16 个输出。分层 MFIU compactor 将 `MultiFiberIntersection.v` 从旧结构约 `304.7 MB / 6,391,733` 行降到约 `17.7 MB / 205,127` 行，单行生成时间从约 68 秒降到 38 秒。该数字是生成 RTL 文本规模而非综合面积；完整 128-row 阵列的生成、lint 和综合仍属于后续规模化工作。
+已对 paper 参数的单个 Gustavson/PE row 做独立 elaboration。当前论文配置保持 128 个输入 MAC lane、128-wide fiber 和 `4 x 4` fiber intersection，但将响应修正为 16 个结果 lane：MRN 每条命令最多生成 16 个 TrIP 输出，TrGS 每条 cache line 也最多提供 16 个输出。最早的全比较 MFIU 约为 `304.7 MB / 6,391,733` 行；仅包含分层 route compactor 和 value-rank prefix tree 的版本约为 `17.7 MB / 205,127` 行。加入论文 Fig. 12 对应的 A/B participating-value shift、连续 source packing 和全局 source index 后，当前 `MultiFiberIntersection.v` 约为 `35.8 MB / 419,087` 行，`OperandDistributionNetwork.v` 约为 `1.0 MB / 18,323` 行，`TrapezoidPERow.v` 则因删除直接的 `4 x 128` operand 读取网络降至约 `19.4 MB / 345,979` 行，最终 paper 单行生成约 52 秒。上述数字是生成 RTL 文本规模而非综合面积；完整 128-row 阵列的生成、lint 和综合仍属于后续规模化工作。
 
 ### 3.3 四种 mode 的论文规模周期模型
 
@@ -679,7 +679,7 @@ sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 
 1. 先对 1、4、16 个 PE row 做综合；
 2. 检查 MFIU 前缀逻辑和路由网络的关键路径；
-3. 在现有分层 MFIU compactor、value-rank prefix tree 和 stage 边界基础上，将 A/B operand 动态 mux 替换为两套 Benes distribution network；
+3. 当前已完成 participating-value shift、连续 source packing、全局 source index 和两套 128-input distribution 边界；下一步实现 Benes runtime control generator，并把 boundary 内的 source-index selector 替换为 O(`N log N`) switch fabric；
 4. 当前 TrIP contiguous reduction tree 已按输出簇切片，Gustavson flush 也已改为有序连续输出；下一步将 Gustavson 的逐项寄存器插入替换为 SRAM 双流 merge，并根据综合关键路径增加可配置寄存器切分；
 5. 再尝试生成和综合 128 x 128 paper 配置；
 6. 建立吞吐、利用率、面积、频率和存储流量统计。

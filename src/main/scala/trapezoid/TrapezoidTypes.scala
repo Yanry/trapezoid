@@ -78,6 +78,8 @@ case class IntersectionRoute(cfg: TrapezoidConfig) extends Bundle {
   val coordinate = UInt(cfg.fiberValueIndexWidth bits)
   val aValueIndex = UInt(cfg.fiberValueIndexWidth bits)
   val bValueIndex = UInt(cfg.fiberValueIndexWidth bits)
+  val aSourceIndex = UInt(cfg.macLaneIndexWidth bits)
+  val bSourceIndex = UInt(cfg.macLaneIndexWidth bits)
 }
 
 case class LocalBufferWrite(cfg: TrapezoidConfig) extends Bundle {

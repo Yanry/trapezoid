@@ -24,7 +24,9 @@ class MultiFiberIntersectionSpec extends AnyFunSuite {
       bFiber: Int,
       coordinate: Int,
       aValueIndex: Int,
-      bValueIndex: Int)
+      bValueIndex: Int,
+      aSourceIndex: Int,
+      bSourceIndex: Int)
 
   test("hierarchical compactor preserves pair-major routes and overflow count") {
     SimConfig.withVerilator
@@ -44,8 +46,47 @@ class MultiFiberIntersectionSpec extends AnyFunSuite {
             dut.io.aMask(fiber) #= aMasks(fiber)
             dut.io.bValid(fiber) #= bValid(fiber)
             dut.io.bMask(fiber) #= bMasks(fiber)
+            for (value <- 0 until cfg.fiberWidth) {
+              dut.io.aValues(fiber)(value) #= fiber * 32 + value + 1
+              dut.io.bValues(fiber)(value) #= -(fiber * 32 + value + 1)
+            }
           }
           sleep(1)
+
+          val aCoordinateUnion = (0 until cfg.maxFibers)
+            .filter(fiber => aValid(fiber)).map(aMasks).foldLeft(0)(_ | _)
+          val bCoordinateUnion = (0 until cfg.maxFibers)
+            .filter(fiber => bValid(fiber)).map(bMasks).foldLeft(0)(_ | _)
+          val activeACoordinates = (0 until cfg.maxFibers).map { fiber =>
+            if (aValid(fiber)) aMasks(fiber) & bCoordinateUnion else 0
+          }
+          val activeBCoordinates = (0 until cfg.maxFibers).map { fiber =>
+            if (bValid(fiber)) bMasks(fiber) & aCoordinateUnion else 0
+          }
+          val aSourceBase = activeACoordinates.scanLeft(0) {
+            case (base, mask) => base + Integer.bitCount(mask)
+          }
+          val bSourceBase = activeBCoordinates.scanLeft(0) {
+            case (base, mask) => base + Integer.bitCount(mask)
+          }
+          val expectedASources = for {
+            fiber <- 0 until cfg.maxFibers
+            coordinate <- 0 until cfg.fiberWidth
+            if (activeACoordinates(fiber) & (1 << coordinate)) != 0
+          } yield {
+            val valueIndex = Integer.bitCount(aMasks(fiber) &
+              ((1 << coordinate) - 1))
+            fiber * 32 + valueIndex + 1
+          }
+          val expectedBSources = for {
+            fiber <- 0 until cfg.maxFibers
+            coordinate <- 0 until cfg.fiberWidth
+            if (activeBCoordinates(fiber) & (1 << coordinate)) != 0
+          } yield {
+            val valueIndex = Integer.bitCount(bMasks(fiber) &
+              ((1 << coordinate) - 1))
+            -(fiber * 32 + valueIndex + 1)
+          }
 
           val expected = for {
             a <- 0 until cfg.maxFibers
@@ -58,7 +99,11 @@ class MultiFiberIntersectionSpec extends AnyFunSuite {
             b,
             coordinate,
             Integer.bitCount(aMasks(a) & ((1 << coordinate) - 1)),
-            Integer.bitCount(bMasks(b) & ((1 << coordinate) - 1)))
+            Integer.bitCount(bMasks(b) & ((1 << coordinate) - 1)),
+            aSourceBase(a) + Integer.bitCount(activeACoordinates(a) &
+              ((1 << coordinate) - 1)),
+            bSourceBase(b) + Integer.bitCount(activeBCoordinates(b) &
+              ((1 << coordinate) - 1)))
 
           assert(dut.io.count.toInt == expected.length)
           assert(dut.io.overflow.toBoolean == (expected.length > cfg.macLanes))
@@ -72,8 +117,26 @@ class MultiFiberIntersectionSpec extends AnyFunSuite {
               assert(route.coordinate.toInt == reference.coordinate)
               assert(route.aValueIndex.toInt == reference.aValueIndex)
               assert(route.bValueIndex.toInt == reference.bValueIndex)
+              assert(route.aSourceIndex.toInt == reference.aSourceIndex)
+              assert(route.bSourceIndex.toInt == reference.bSourceIndex)
             } else {
               assert(!route.valid.toBoolean)
+            }
+          }
+          val observedAValid = dut.io.aSourceValid.toBigInt
+          val observedBValid = dut.io.bSourceValid.toBigInt
+          for (lane <- 0 until cfg.macLanes) {
+            if (lane < expectedASources.length) {
+              assert(observedAValid.testBit(lane))
+              assert(dut.io.aSources(lane).toInt == expectedASources(lane))
+            } else {
+              assert(!observedAValid.testBit(lane))
+            }
+            if (lane < expectedBSources.length) {
+              assert(observedBValid.testBit(lane))
+              assert(dut.io.bSources(lane).toInt == expectedBSources(lane))
+            } else {
+              assert(!observedBValid.testBit(lane))
             }
           }
         }

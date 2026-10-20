@@ -18,9 +18,14 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
   private val routeCoordinateOffset = routeBFiberOffset + cfg.fiberIndexWidth
   private val routeAValueOffset = routeCoordinateOffset + cfg.fiberValueIndexWidth
   private val routeBValueOffset = routeAValueOffset + cfg.fiberValueIndexWidth
-  private val routeWidth = routeBValueOffset + cfg.fiberValueIndexWidth
+  private val routeASourceOffset = routeBValueOffset + cfg.fiberValueIndexWidth
+  private val routeBSourceOffset = routeASourceOffset + cfg.macLaneIndexWidth
+  private val routeWidth = routeBSourceOffset + cfg.macLaneIndexWidth
+  private val sourceValidOffset = 0
+  private val sourceValueOffset = sourceValidOffset + 1
+  private val sourceWidth = sourceValueOffset + cfg.dataWidth
 
-  private case class CompactedRoutes(entries: Vector[Bits], count: UInt)
+  private case class CompactedEntries(entries: Vector[Bits], count: UInt)
 
   private def parallelPrefix(values: Seq[UInt]): Seq[UInt] = {
     var level = values.map(_.resize(cfg.matchCountWidth))
@@ -45,17 +50,20 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
     * right stream by the number of valid entries on the left. The barrel
     * stages avoid the old output-lane by candidate all-to-all comparison.
     */
-  private def compactRoutes(inputs: IndexedSeq[Bits]): CompactedRoutes = {
+  private def compactEntries(
+      inputs: IndexedSeq[Bits],
+      entryWidth: Int,
+      capacityLimit: Int = cfg.macLanes): CompactedEntries = {
     require(inputs.nonEmpty)
     if (inputs.length == 1) {
       val count = UInt(cfg.matchCountWidth bits)
-      count := inputs.head(routeValidOffset).asUInt.resize(cfg.matchCountWidth)
-      CompactedRoutes(Vector(inputs.head), count)
+      count := inputs.head(0).asUInt.resize(cfg.matchCountWidth)
+      CompactedEntries(Vector(inputs.head), count)
     } else {
       val split = inputs.length / 2
-      val left = compactRoutes(inputs.take(split))
-      val right = compactRoutes(inputs.drop(split))
-      val capacity = scala.math.min(cfg.macLanes,
+      val left = compactEntries(inputs.take(split), entryWidth, capacityLimit)
+      val right = compactEntries(inputs.drop(split), entryWidth, capacityLimit)
+      val capacity = scala.math.min(capacityLimit,
         left.entries.length + right.entries.length)
       val storedCountWidth = log2Up(capacity + 1)
       val leftStoredCount = UInt(storedCountWidth bits)
@@ -63,16 +71,17 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
       leftStoredCount := Mux(leftFillsOutput,
         U(capacity, storedCountWidth bits), left.count.resize(storedCountWidth))
 
-      val zeroRoute = B(0, routeWidth bits)
+      val zeroEntry = B(0, entryWidth bits)
       var shiftedRight = Vector.tabulate(capacity) { index =>
-        if (index < right.entries.length) right.entries(index) else zeroRoute
+        if (index < right.entries.length) right.entries(index) else zeroEntry
       }
       var distance = 1
       var stage = 0
       while (distance < capacity) {
         val previous = shiftedRight
         shiftedRight = Vector.tabulate(capacity) { index =>
-          val shifted = if (index >= distance) previous(index - distance) else zeroRoute
+          val shifted = if (index >= distance) previous(index - distance)
+            else zeroEntry
           Mux(leftStoredCount(stage), shifted, previous(index))
         }
         distance *= 2
@@ -80,23 +89,32 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
       }
 
       val entries = Vector.tabulate(capacity) { index =>
-        val leftEntry = if (index < left.entries.length) left.entries(index) else zeroRoute
+        val leftEntry = if (index < left.entries.length) left.entries(index)
+          else zeroEntry
         Mux(leftFillsOutput ||
           U(index, storedCountWidth bits) < leftStoredCount,
           leftEntry, shiftedRight(index))
       }
       val count = UInt(cfg.matchCountWidth bits)
       count := (left.count + right.count).resize(cfg.matchCountWidth)
-      CompactedRoutes(entries, count)
+      CompactedEntries(entries, count)
     }
   }
 
   val io = new Bundle {
     val aValid = in Vec(Bool(), cfg.maxFibers)
     val aMask = in Vec(Bits(cfg.fiberWidth bits), cfg.maxFibers)
+    val aValues = in Vec(
+      Vec(SInt(cfg.dataWidth bits), cfg.fiberWidth), cfg.maxFibers)
     val bValid = in Vec(Bool(), cfg.maxFibers)
     val bMask = in Vec(Bits(cfg.fiberWidth bits), cfg.maxFibers)
+    val bValues = in Vec(
+      Vec(SInt(cfg.dataWidth bits), cfg.fiberWidth), cfg.maxFibers)
     val routes = out Vec(IntersectionRoute(cfg), cfg.macLanes)
+    val aSourceValid = out Bits(cfg.macLanes bits)
+    val aSources = out Vec(SInt(cfg.dataWidth bits), cfg.macLanes)
+    val bSourceValid = out Bits(cfg.macLanes bits)
+    val bSources = out Vec(SInt(cfg.dataWidth bits), cfg.macLanes)
     val count = out UInt(cfg.matchCountWidth bits)
     val overflow = out Bool()
   }
@@ -132,6 +150,121 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
     }
   }
 
+  val aCoordinateUnion = (0 until cfg.maxFibers).map { fiber =>
+    Mux(io.aValid(fiber), io.aMask(fiber), B(0, cfg.fiberWidth bits))
+  }.reduce(_ | _)
+  val bCoordinateUnion = (0 until cfg.maxFibers).map { fiber =>
+    Mux(io.bValid(fiber), io.bMask(fiber), B(0, cfg.fiberWidth bits))
+  }.reduce(_ | _)
+  val aParticipatingMasks = Vec(Bits(cfg.fiberWidth bits), cfg.maxFibers)
+  val bParticipatingMasks = Vec(Bits(cfg.fiberWidth bits), cfg.maxFibers)
+  val aParticipatingRanks = Vec(
+    Vec(UInt(cfg.fiberValueIndexWidth bits), cfg.fiberWidth), cfg.maxFibers)
+  val bParticipatingRanks = Vec(
+    Vec(UInt(cfg.fiberValueIndexWidth bits), cfg.fiberWidth), cfg.maxFibers)
+  val aSourceOffsets = Vec(UInt(cfg.matchCountWidth bits), cfg.maxFibers)
+  val bSourceOffsets = Vec(UInt(cfg.matchCountWidth bits), cfg.maxFibers)
+
+  for (fiber <- 0 until cfg.maxFibers) {
+    aParticipatingMasks(fiber) := Mux(io.aValid(fiber),
+      io.aMask(fiber) & bCoordinateUnion, B(0, cfg.fiberWidth bits))
+    bParticipatingMasks(fiber) := Mux(io.bValid(fiber),
+      io.bMask(fiber) & aCoordinateUnion, B(0, cfg.fiberWidth bits))
+    val aPrefix = parallelPrefix((0 until cfg.fiberWidth).map { coordinate =>
+      aParticipatingMasks(fiber)(coordinate).asUInt.resize(cfg.matchCountWidth)
+    })
+    val bPrefix = parallelPrefix((0 until cfg.fiberWidth).map { coordinate =>
+      bParticipatingMasks(fiber)(coordinate).asUInt.resize(cfg.matchCountWidth)
+    })
+    aParticipatingRanks(fiber)(0) := 0
+    bParticipatingRanks(fiber)(0) := 0
+    for (coordinate <- 1 until cfg.fiberWidth) {
+      aParticipatingRanks(fiber)(coordinate) := aPrefix(coordinate - 1).resized
+      bParticipatingRanks(fiber)(coordinate) := bPrefix(coordinate - 1).resized
+    }
+    if (fiber == 0) {
+      aSourceOffsets(fiber) := 0
+      bSourceOffsets(fiber) := 0
+    } else {
+      aSourceOffsets(fiber) := (aSourceOffsets(fiber - 1) +
+        CountOne(aParticipatingMasks(fiber - 1))).resized
+      bSourceOffsets(fiber) := (bSourceOffsets(fiber - 1) +
+        CountOne(bParticipatingMasks(fiber - 1))).resized
+    }
+  }
+
+  private val packedActivityWidth = 2
+  private val packedActivityValidOffset = 0
+  private val packedActivityValueOffset = 1
+  private val aPackedActivity = (0 until cfg.maxFibers).map { fiber =>
+    val candidates = (0 until cfg.fiberWidth).map { coordinate =>
+      val entry = Bits(packedActivityWidth bits)
+      entry(packedActivityValidOffset) := io.aValid(fiber) &&
+        io.aMask(fiber)(coordinate)
+      entry(packedActivityValueOffset) :=
+        aParticipatingMasks(fiber)(coordinate)
+      entry
+    }
+    compactEntries(candidates, packedActivityWidth, cfg.fiberWidth).entries
+  }
+  private val bPackedActivity = (0 until cfg.maxFibers).map { fiber =>
+    val candidates = (0 until cfg.fiberWidth).map { coordinate =>
+      val entry = Bits(packedActivityWidth bits)
+      entry(packedActivityValidOffset) := io.bValid(fiber) &&
+        io.bMask(fiber)(coordinate)
+      entry(packedActivityValueOffset) :=
+        bParticipatingMasks(fiber)(coordinate)
+      entry
+    }
+    compactEntries(candidates, packedActivityWidth, cfg.fiberWidth).entries
+  }
+
+  private val aSourceCandidates = for {
+    fiber <- 0 until cfg.maxFibers
+    valueIndex <- 0 until cfg.fiberWidth
+  } yield {
+    val source = Bits(sourceWidth bits)
+    source := 0
+    source(sourceValidOffset) :=
+      aPackedActivity(fiber)(valueIndex)(packedActivityValidOffset) &&
+        aPackedActivity(fiber)(valueIndex)(packedActivityValueOffset)
+    source(sourceValueOffset + cfg.dataWidth - 1 downto sourceValueOffset) :=
+      io.aValues(fiber)(valueIndex).asBits
+    source
+  }
+  private val bSourceCandidates = for {
+    fiber <- 0 until cfg.maxFibers
+    valueIndex <- 0 until cfg.fiberWidth
+  } yield {
+    val source = Bits(sourceWidth bits)
+    source := 0
+    source(sourceValidOffset) :=
+      bPackedActivity(fiber)(valueIndex)(packedActivityValidOffset) &&
+        bPackedActivity(fiber)(valueIndex)(packedActivityValueOffset)
+    source(sourceValueOffset + cfg.dataWidth - 1 downto sourceValueOffset) :=
+      io.bValues(fiber)(valueIndex).asBits
+    source
+  }
+  private val compactedASources = compactEntries(aSourceCandidates, sourceWidth)
+  private val compactedBSources = compactEntries(bSourceCandidates, sourceWidth)
+  require(compactedASources.entries.length == cfg.macLanes)
+  require(compactedBSources.entries.length == cfg.macLanes)
+
+  for (lane <- 0 until cfg.macLanes) {
+    val aSource = compactedASources.entries(lane)
+    val bSource = compactedBSources.entries(lane)
+    io.aSourceValid(lane) := aSource(sourceValidOffset)
+    io.bSourceValid(lane) := bSource(sourceValidOffset)
+    io.aSources(lane) := Mux(aSource(sourceValidOffset),
+      aSource(sourceValueOffset + cfg.dataWidth - 1 downto
+        sourceValueOffset).asSInt,
+      S(0, cfg.dataWidth bits))
+    io.bSources(lane) := Mux(bSource(sourceValidOffset),
+      bSource(sourceValueOffset + cfg.dataWidth - 1 downto
+        sourceValueOffset).asSInt,
+      S(0, cfg.dataWidth bits))
+  }
+
   private val candidates = for {
     a <- 0 until cfg.maxFibers
     b <- 0 until cfg.maxFibers
@@ -151,9 +284,15 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
       routeAValueOffset) := aValueRanks(a)(coordinate).asBits
     route(routeBValueOffset + cfg.fiberValueIndexWidth - 1 downto
       routeBValueOffset) := bValueRanks(b)(coordinate).asBits
+    route(routeASourceOffset + cfg.macLaneIndexWidth - 1 downto
+      routeASourceOffset) := (aSourceOffsets(a) +
+        aParticipatingRanks(a)(coordinate)).resize(cfg.macLaneIndexWidth).asBits
+    route(routeBSourceOffset + cfg.macLaneIndexWidth - 1 downto
+      routeBSourceOffset) := (bSourceOffsets(b) +
+        bParticipatingRanks(b)(coordinate)).resize(cfg.macLaneIndexWidth).asBits
     route
   }
-  private val compacted = compactRoutes(candidates)
+  private val compacted = compactEntries(candidates, routeWidth)
   require(compacted.entries.length == cfg.macLanes)
   io.count := compacted.count
   io.overflow := compacted.count > cfg.macLanes
@@ -174,7 +313,40 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
     io.routes(lane).bValueIndex := route(
       routeBValueOffset + cfg.fiberValueIndexWidth - 1 downto
         routeBValueOffset).asUInt
+    io.routes(lane).aSourceIndex := route(
+      routeASourceOffset + cfg.macLaneIndexWidth - 1 downto
+        routeASourceOffset).asUInt
+    io.routes(lane).bSourceIndex := route(
+      routeBSourceOffset + cfg.macLaneIndexWidth - 1 downto
+        routeBSourceOffset).asUInt
   }
+}
+
+/** Logical boundary of one paper-style N-to-N operand distribution network.
+  *
+  * The MFIU/shift path presents at most `macLanes` contiguous source values.
+  * Keeping source packing outside this block matches the interface expected by
+  * a Benes switch fabric and avoids selecting directly from maxFibers complete
+  * compressed-value arrays at every MAC lane.
+  */
+class OperandDistributionNetwork(cfg: TrapezoidConfig) extends Component {
+  val io = new Bundle {
+    val sources = in Vec(SInt(cfg.dataWidth bits), cfg.macLanes)
+    val sourceValid = in Bits(cfg.macLanes bits)
+    val laneValid = in Bits(cfg.macLanes bits)
+    val sourceIndex = in Vec(UInt(cfg.macLaneIndexWidth bits), cfg.macLanes)
+    val outputs = out Vec(SInt(cfg.dataWidth bits), cfg.macLanes)
+    val routeError = out Bool()
+  }
+
+  val laneErrors = Bits(cfg.macLanes bits)
+  for (lane <- 0 until cfg.macLanes) {
+    val selectedValid = io.sourceValid(io.sourceIndex(lane))
+    laneErrors(lane) := io.laneValid(lane) && !selectedValid
+    io.outputs(lane) := Mux(io.laneValid(lane) && selectedValid,
+      io.sources(io.sourceIndex(lane)), S(0, cfg.dataWidth bits))
+  }
+  io.routeError := laneErrors.orR
 }
 
 /** Chooses the largest prefix (one through four) of B columns that fits in a

@@ -324,6 +324,27 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     }
   }
 
+  test("TrGS reports same-bank spatial accumulator conflicts") {
+    simConfig.compile(new TrGsSpatialEngine(tileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      initializeTrGs(dut)
+      dut.io.result.ready #= true
+
+      // Columns 0 and 4 share bank 0 under the four-bank interleaved
+      // accumulator mapping. They must not be written in the same cycle.
+      issueTrGs(dut, k = 0, aValue = 2,
+        Seq(Some(0 -> 3), Some(4 -> 5), None, None), endOfTile = true)
+
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 200) {
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(dut.io.done.toBoolean)
+      assert(dut.io.overflow.toBoolean)
+    }
+  }
+
   test("TrGS wide writeback emits one cache-line batch per cycle") {
     val wideTileCfg = tileCfg.copy(accumulatorEntries = 16)
     simConfig.compile(new TrGsSpatialEngine(

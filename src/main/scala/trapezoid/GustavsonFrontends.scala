@@ -126,6 +126,7 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
     Vec((0 until cfg.macLanesPerSubrow).map(_ => RegInit(False))))
   val running = RegInit(False)
   val finishSeen = RegInit(False)
+  val aLoadRequiresReset = RegInit(True)
   val modeError = RegInit(False)
   val controlDone = RegInit(False)
   val acceptedBElements = Reg(UInt(32 bits)) init 0
@@ -152,6 +153,13 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
 
   io.aLoad.ready := !io.clear && !running && !engine.io.busy && !io.start.valid
   when(io.aLoad.fire) {
+    when(aLoadRequiresReset) {
+      for (subrow <- 0 until subrows;
+           offset <- 0 until cfg.macLanesPerSubrow) {
+        aLoaded(subrow)(offset) := False
+      }
+      aLoadRequiresReset := False
+    }
     for (subrow <- 0 until subrows;
          offset <- 0 until cfg.macLanesPerSubrow) {
       val index = subrow * cfg.macLanesPerSubrow + offset
@@ -167,10 +175,6 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
     controlDone := False
     acceptedBElements := 0
     issuedBElements := 0
-    for (subrow <- 0 until subrows;
-         offset <- 0 until cfg.macLanesPerSubrow) {
-      aLoaded(subrow)(offset) := False
-    }
     modeError := io.start.payload.mode =/= TrapezoidDataflow.TrGt
     when(io.start.payload.mode === TrapezoidDataflow.TrGt) {
       running := True
@@ -238,6 +242,9 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
   when(engine.io.command.fire && issueFinal) {
     running := False
     finishSeen := False
+    // A remains stationary during the tile.  The next A load starts a new
+    // temporal tile and invalidates the previous register contents.
+    aLoadRequiresReset := True
   }
 
   when(io.clear) {
@@ -247,6 +254,7 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
     }
     running := False
     finishSeen := False
+    aLoadRequiresReset := True
     modeError := False
     controlDone := False
     acceptedBElements := 0
@@ -356,8 +364,6 @@ class TrGsSpatialEngine(
 
   val commandFire = io.command.fire && supportedMode
   val responseFire = pe.io.response.fire
-  val accumulateResponse = responseFire && state === TrGsSpatialState.Run &&
-    !pe.io.response.payload.overflow
   pe.io.response.ready := !io.clear &&
     (state === TrGsSpatialState.Run || state === TrGsSpatialState.AbortDrain)
 
@@ -390,6 +396,7 @@ class TrGsSpatialEngine(
   }
 
   var responseConflict: Bool = False
+  var responseBankConflict: Bool = False
   for (lane <- 0 until cfg.outputLanes;
        earlier <- 0 until lane) {
     val laneResult = response.results(lane)
@@ -398,7 +405,19 @@ class TrGsSpatialEngine(
       (laneResult.valid && earlierResult.valid &&
         laneResult.column(tileCfg.entryIndexWidth - 1 downto 0) ===
           earlierResult.column(tileCfg.entryIndexWidth - 1 downto 0))
+    // Each physical TrGS accumulator bank accepts one update per cycle.
+    // The spatial distributor must therefore avoid two distinct columns
+    // targeting the same bank in one response.
+    responseBankConflict = responseBankConflict ||
+      (laneResult.valid && earlierResult.valid &&
+        laneResult.column(log2Up(cfg.localBanks) - 1 downto 0) ===
+          earlierResult.column(log2Up(cfg.localBanks) - 1 downto 0) &&
+        laneResult.column(tileCfg.entryIndexWidth - 1 downto 0) =/=
+          earlierResult.column(tileCfg.entryIndexWidth - 1 downto 0))
   }
+
+  val accumulateResponse = responseFire && state === TrGsSpatialState.Run &&
+    !pe.io.response.payload.overflow && !responseBankConflict
 
   val newEntry = Bits(cfg.outputLanes bits)
   for (lane <- 0 until cfg.outputLanes) {
@@ -571,10 +590,13 @@ class TrGsSpatialEngine(
         inputClosed := True
       }
       when(responseFire) {
-        when(responseConflict || response.overflow) { overflowReg := True }
+        when(responseConflict || responseBankConflict || response.overflow) {
+          overflowReg := True
+        }
         when(response.results(0).endOfTile) {
           inputClosed := False
-          when(slotValidBits.orR || (!responseConflict && newEntry.orR)) {
+          when(slotValidBits.orR ||
+              (!responseConflict && !responseBankConflict && newEntry.orR)) {
             outputCursor := 0
             outputGroupCursor := 0
             state := TrGsSpatialState.Output

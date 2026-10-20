@@ -287,6 +287,11 @@ sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 
 这些模块已经实现论文数据移动方式的功能等价路径。paper 生成入口启用 16-result 宽写回：128 个 accumulator 槽被划分为 8 个对齐 line，全空 line 会被跳过，每个非空 line 使用一拍排空，满 C row 从 128 拍降为 8 拍。该结构避免了把任意 128 个槽全局压缩到 16 lane 所需的大型 compactor，更接近本地 bank/line 读取。TrGT 的四路 FIFO 已统一到一个四 bank `BankedLocalBuffer`，但该实例还没有与 TrIP controller 的结果 buffer 进行 mode 级共享。TrGS accumulator 现在只为每个 slot 保存 valid/value，整行共享一个 row 和对齐 column-block 基址，删除了 128 份重复 row/column 寄存器及其翻转；跨 row 或跨 column block 的输入会置 overflow。当前仍通过带坐标的组合适配完成分发，尚未替换为流水化物理分发网络。
 
+当前 Gustavson 前端还增加了两项物理约束：
+
+- `TrGtSubrowScheduler` 的 A register 按四个 temporal subrow 分组保存。A 在 tile 内保持驻留；tile 结束后下一次 `aLoad` 自动开启新的装载会话并失效旧的 A valid 位，避免跨 tile 复用陈旧值，同时不破坏同一 tile 内的 stationary-A 复用。
+- `TrGsSpatialEngine` 的 accumulator slot 按 `column % localBanks` 交错映射到四个 bank，word 地址由剩余 column index 给出。同一个 PE response 如果包含两个不同 column 且落在同一 bank，硬件会置 `overflow` 并丢弃该次更新，而不会把不可综合的同 bank 多写误当作一个周期完成。上层调度器需要在后续版本中将该 response 拆分或重放；因此这项检测是物理正确性保护，不是最终的无冲突分发网络。
+
 ### 2.12 矩阵描述符与外层 M/N/K 循环
 
 `TrIpMatrixController` 在 tile controller 外增加了完整的外层循环边界：

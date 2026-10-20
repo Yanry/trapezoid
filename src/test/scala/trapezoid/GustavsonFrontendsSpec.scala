@@ -243,6 +243,9 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
       assert(!dut.io.overflow.toBoolean)
       assert(!dut.io.unsupportedMode.toBoolean)
       assert(observed == Seq((6, 0, 17L), (6, 1, 4L), (6, 2, 27L), (6, 3, 8L)))
+      assert(dut.io.accumulatorCycles.toLong == 2)
+      assert(dut.io.accumulatorUpdates.toLong == 6)
+      assert(dut.io.bankReplayCycles.toLong == 0)
     }
   }
 
@@ -350,6 +353,9 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
       assert(dut.io.done.toBoolean)
       assert(!dut.io.overflow.toBoolean)
       assert(observed == Seq((6, 0, 6L), (6, 4, 10L)))
+      assert(dut.io.accumulatorCycles.toLong == 2)
+      assert(dut.io.accumulatorUpdates.toLong == 2)
+      assert(dut.io.bankReplayCycles.toLong == 1)
     }
   }
 

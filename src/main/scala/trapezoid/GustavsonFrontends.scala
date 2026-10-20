@@ -279,6 +279,7 @@ class TrGsSpatialEngine(
   private val writebackGroupIndexWidth = scala.math.max(1, log2Up(writebackGroups))
   private val inFlightWidth = log2Up(cfg.responseFifoDepth + 5)
   private val responseIndexWidth = scala.math.max(1, log2Up(cfg.outputLanes))
+  private val bankIndexWidth = log2Up(cfg.localBanks)
   require((slots & (slots - 1)) == 0,
     "TrGS spatial accumulator entries must be a power of two")
   require(slots >= cfg.macLanes,
@@ -296,6 +297,9 @@ class TrGsSpatialEngine(
     val done = out Bool()
     val overflow = out Bool()
     val unsupportedMode = out Bool()
+    val accumulatorCycles = out UInt(32 bits)
+    val accumulatorUpdates = out UInt(32 bits)
+    val bankReplayCycles = out UInt(32 bits)
   }
 
   val state = RegInit(TrGsSpatialState.Idle)
@@ -304,12 +308,17 @@ class TrGsSpatialEngine(
   val overflowReg = RegInit(False)
   val modeErrorReg = RegInit(False)
   val inFlight = Reg(UInt(inFlightWidth bits)) init 0
-  val responseCursor = Reg(UInt(responseIndexWidth bits)) init 0
+  val responseActive = RegInit(False)
+  val responseReg = Reg(PERowResponse(cfg))
+  val pendingResults = Reg(Bits(cfg.outputLanes bits)) init 0
   val outputCursor = Reg(UInt(tileCfg.entryIndexWidth bits)) init 0
   val outputGroupCursor = Reg(UInt(writebackGroupIndexWidth bits)) init 0
   val tileRow = Reg(UInt(cfg.coordinateWidth bits)) init 0
   val tileColumnBase = Reg(UInt(cfg.coordinateWidth bits)) init 0
   val columnBlockValid = RegInit(False)
+  val accumulatorCycles = Reg(UInt(32 bits)) init 0
+  val accumulatorUpdates = Reg(UInt(32 bits)) init 0
+  val bankReplayCycles = Reg(UInt(32 bits)) init 0
 
   private val accumulatorWordsPerBank = slots / cfg.localBanks
 
@@ -337,6 +346,9 @@ class TrGsSpatialEngine(
   io.done := doneReg
   io.overflow := overflowReg
   io.unsupportedMode := modeErrorReg
+  io.accumulatorCycles := accumulatorCycles
+  io.accumulatorUpdates := accumulatorUpdates
+  io.bankReplayCycles := bankReplayCycles
 
   val adapted = PERowCommand(cfg)
   adapted.mode := io.command.payload.mode
@@ -366,18 +378,9 @@ class TrGsSpatialEngine(
 
   val commandFire = io.command.fire && supportedMode
   val responseFire = pe.io.response.fire
-  val response = pe.io.response.payload
-  val responseAvailable = pe.io.response.valid &&
-    state === TrGsSpatialState.Run && response.count =/= 0
-  val responseLast = responseAvailable &&
-    (responseCursor.resize(cfg.outputCountWidth) + 1) >= response.count
-  // A response can contain several columns targeting the same physical bank.
-  // Hold it at the PE boundary and consume one result lane per cycle so the
-  // accumulator still has one write per bank per cycle.
   pe.io.response.ready := !io.clear &&
     (state === TrGsSpatialState.AbortDrain ||
-      (state === TrGsSpatialState.Run &&
-        (!pe.io.response.valid || response.count === 0 || responseLast)))
+      (state === TrGsSpatialState.Run && !responseActive))
   val commandColumnChoices = Vec(Bool(), cfg.cacheLineWords)
   var earlierCommandColumn: Bool = False
   for (lane <- 0 until cfg.cacheLineWords) {
@@ -405,32 +408,71 @@ class TrGsSpatialEngine(
       (io.command.payload.b(lane).valid && laneColumnBase =/= commandColumnBase)
   }
 
-  val currentResult = response.results(responseCursor)
-  val currentSlot = currentResult.column(tileCfg.entryIndexWidth - 1 downto 0)
-  val expectedColumn = UInt(cfg.coordinateWidth bits)
-  expectedColumn := tileColumnBase | currentSlot.resize(cfg.coordinateWidth)
-  val coordinateCollision = tileRow =/= currentResult.row ||
-    expectedColumn =/= currentResult.column
-  val currentSlotValid = Bool()
-  currentSlotValid := False
-  for (entry <- 0 until slots) {
-    when(currentSlot === entry) { currentSlotValid := slotValidAt(entry) }
+  val bankGrants = Vec(Bits(cfg.outputLanes bits), cfg.localBanks)
+  for (bank <- 0 until cfg.localBanks) {
+    var earlierMatch: Bool = False
+    for (lane <- 0 until cfg.outputLanes) {
+      val result = responseReg.results(lane)
+      val bankMatches = pendingResults(lane) && result.valid &&
+        result.column(bankIndexWidth - 1 downto 0) === bank
+      bankGrants(bank)(lane) := bankMatches && !earlierMatch
+      earlierMatch = earlierMatch || bankMatches
+    }
   }
-  val currentNewEntry = responseAvailable && currentResult.valid &&
-    !coordinateCollision && !currentSlotValid
 
-  when(responseAvailable && currentResult.valid && !response.overflow) {
-    when(coordinateCollision) {
-      overflowReg := True
-    } otherwise {
-      for (entry <- 0 until slots) {
-        when(currentSlot === entry) {
-          when(slotValidAt(entry)) {
-            slotValueAt(entry) :=
-              (slotValueAt(entry) + currentResult.value).resized
-          } otherwise {
-            slotValidAt(entry) := True
-            slotValueAt(entry) := currentResult.value
+  val issuedResults = Bits(cfg.outputLanes bits)
+  for (lane <- 0 until cfg.outputLanes) {
+    issuedResults(lane) := (0 until cfg.localBanks)
+      .map(bank => bankGrants(bank)(lane)).reduce(_ || _)
+  }
+  val remainingResults = pendingResults & ~issuedResults
+  val capturedResults = Bits(cfg.outputLanes bits)
+  for (lane <- 0 until cfg.outputLanes) {
+    capturedResults(lane) := pe.io.response.payload.results(lane).valid
+  }
+  val responseDrained = responseActive &&
+    (!pendingResults.orR || !remainingResults.orR)
+  val grantedNewEntry = Bits(cfg.localBanks bits)
+  val grantedUpdates = Bits(cfg.localBanks bits)
+  grantedNewEntry := 0
+  grantedUpdates := 0
+
+  for (bank <- 0 until cfg.localBanks) {
+    val grantLane = UInt(responseIndexWidth bits)
+    grantLane := 0
+    for (lane <- 0 until cfg.outputLanes) {
+      when(bankGrants(bank)(lane)) { grantLane := lane }
+    }
+    val grantFound = bankGrants(bank).orR
+    val result = responseReg.results(grantLane)
+    val slot = result.column(tileCfg.entryIndexWidth - 1 downto 0)
+    val expectedColumn = UInt(cfg.coordinateWidth bits)
+    expectedColumn := tileColumnBase | slot.resize(cfg.coordinateWidth)
+    val coordinateCollision = tileRow =/= result.row ||
+      expectedColumn =/= result.column
+    val selectedSlotValid = Bool()
+    selectedSlotValid := False
+    for (entry <- 0 until slots) {
+      when(slot === entry) { selectedSlotValid := slotValidAt(entry) }
+    }
+    grantedNewEntry(bank) := responseActive && grantFound &&
+      !coordinateCollision && !selectedSlotValid
+    grantedUpdates(bank) := responseActive && grantFound &&
+      !coordinateCollision && !responseReg.overflow
+
+    when(responseActive && grantFound && !responseReg.overflow) {
+      when(coordinateCollision) {
+        overflowReg := True
+      } otherwise {
+        for (entry <- 0 until slots) {
+          when(slot === entry) {
+            when(slotValidAt(entry)) {
+              slotValueAt(entry) :=
+                (slotValueAt(entry) + result.value).resized
+            } otherwise {
+              slotValidAt(entry) := True
+              slotValueAt(entry) := result.value
+            }
           }
         }
       }
@@ -537,10 +579,23 @@ class TrGsSpatialEngine(
     when(commandFire) { inFlight := inFlight + 1 }
       .otherwise { inFlight := inFlight - 1 }
   }
-  when(responseFire) {
-    responseCursor := 0
-  } elsewhen (responseAvailable) {
-    responseCursor := responseCursor + 1
+  when(responseFire && state === TrGsSpatialState.Run) {
+    responseReg := pe.io.response.payload
+    pendingResults := capturedResults
+    responseActive := True
+  } elsewhen (responseActive) {
+    pendingResults := remainingResults
+    when(responseDrained) {
+      responseActive := False
+      pendingResults := 0
+    }
+  }
+  when(responseActive && pendingResults.orR) {
+    accumulatorCycles := accumulatorCycles + 1
+    accumulatorUpdates := accumulatorUpdates + CountOne(grantedUpdates).resize(32)
+    when(remainingResults.orR) {
+      bankReplayCycles := bankReplayCycles + 1
+    }
   }
 
   switch(state) {
@@ -554,6 +609,9 @@ class TrGsSpatialEngine(
           columnBlockValid := commandHasColumn
           overflowReg := commandColumnMismatch
           modeErrorReg := False
+          accumulatorCycles := 0
+          accumulatorUpdates := 0
+          bankReplayCycles := 0
           inputClosed := io.command.payload.endOfTile
           state := TrGsSpatialState.Run
         } otherwise {
@@ -578,12 +636,14 @@ class TrGsSpatialEngine(
       when(commandFire && io.command.payload.endOfTile) {
         inputClosed := True
       }
-      when(responseFire) {
-        when(response.overflow) { overflowReg := True }
-        when(response.results(0).endOfTile) {
+      when(responseActive && responseReg.overflow) {
+        overflowReg := True
+      }
+      when(responseDrained) {
+        when(responseReg.results(0).endOfTile) {
           inputClosed := False
           when(slotValidBits.orR ||
-              currentNewEntry) {
+              grantedNewEntry.orR) {
             outputCursor := 0
             outputGroupCursor := 0
             state := TrGsSpatialState.Output
@@ -634,7 +694,11 @@ class TrGsSpatialEngine(
     doneReg := False
     overflowReg := False
     modeErrorReg := False
-    responseCursor := 0
+    accumulatorCycles := 0
+    accumulatorUpdates := 0
+    bankReplayCycles := 0
+    responseActive := False
+    pendingResults := 0
     when(inFlight === 0) { state := TrGsSpatialState.Idle }
       .otherwise { state := TrGsSpatialState.AbortDrain }
   }
@@ -658,6 +722,9 @@ class TrGsSpatialArray(
     val done = out Bits(cfg.peRows bits)
     val overflow = out Bits(cfg.peRows bits)
     val unsupportedMode = out Bits(cfg.peRows bits)
+    val accumulatorCycles = out Vec(UInt(32 bits), cfg.peRows)
+    val accumulatorUpdates = out Vec(UInt(32 bits), cfg.peRows)
+    val bankReplayCycles = out Vec(UInt(32 bits), cfg.peRows)
   }
 
   val engines = Array.fill(cfg.peRows)(
@@ -671,6 +738,9 @@ class TrGsSpatialArray(
     io.done(row) := engines(row).io.done
     io.overflow(row) := engines(row).io.overflow
     io.unsupportedMode(row) := engines(row).io.unsupportedMode
+    io.accumulatorCycles(row) := engines(row).io.accumulatorCycles
+    io.accumulatorUpdates(row) := engines(row).io.accumulatorUpdates
+    io.bankReplayCycles(row) := engines(row).io.bankReplayCycles
   }
 }
 

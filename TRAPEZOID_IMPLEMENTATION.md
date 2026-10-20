@@ -506,26 +506,30 @@ paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用�
 
 ### 3.5 Cache-to-result 端到端 RTL 周期仿真
 
-`EndToEndCycleSimulation` 使用同一个确定性 `16 x 16` 矩阵分别运行四种 mode，逐元素检查 RTL 输出，并从任务边界持续计数到最后结果握手。该入口使用显式的 4 PE row、每行 16 MAC 配置而不是 `TrapezoidConfig.small`，同时包含冷 cache lookup、bank 仲裁、固定 12-cycle HBM refill、PE 流水、跨命令或跨 K tile 累加以及结果排空：
+`EndToEndCycleSimulation` 使用真实 Verilator RTL 对六类稀疏度组合和四种 mode 做完整交叉测试，共运行 `6 categories x 4 modes x 3 samples = 72` 次。每次运行都逐元素检查 RTL 输出，并从任务边界持续计数到最后结果或无结果 tile 的 `done`。该入口使用可在当前机器稳定运行的 `4 PE rows x 16 MACs` 缩比配置，同时包含冷 cache lookup、bank 仲裁、固定 12-cycle HBM refill、PE 流水、跨命令或跨 K tile 累加以及结果排空：
 
 ```bash
 sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
 ```
 
-输出表包含总周期、首结果周期、输入接收完成周期、HBM active 周期、refill/hit/miss 数量、结果数量和 checksum。DenseIp/TrIP 的起点是 cached matrix descriptor 握手；TrGT/TrGS 当前缺少矩阵描述符前端，因此起点是第一条 cached B-row command 握手。终点是最后一个结果完成握手且所有 output tile 完成。测试使用始终 ready 的结果接收端，因此没有人为加入输出背压。
+六类为 `HS x HS`、`HS x MS`、`HS x D`、`MS x MS`、`MS x D` 和 `D x D`。目标密度是 `HS=0.5%`、`MS=20%`、`D=100%`；受 `16 x 16` 离散粒度限制，实际精确非零率为 `0.39%`、`19.92%` 和 `100%`，且每个样本强制保留一个共同 K 坐标以避免 HS workload 全部退化为空乘法。四种 mode 都运行所有六类，不按 density 限制接口。
 
-当前固定输入的运行结果如下。四种 mode 均输出 256 个结果并得到相同 checksum `2099851`：
+输出表包含总周期、首结果周期、输入接收完成周期、HBM active 周期、refill/hit/miss 数量、有效 MAC、结果数量和 checksum。DenseIp/TrIP 的起点是 cached matrix descriptor 握手；TrGT/TrGS 当前缺少矩阵描述符前端，因此起点是第一条 cached B-row command 握手。终点是最后一个结果完成握手且所有 output tile 完成。测试使用始终 ready 的结果接收端，因此没有人为加入输出背压。
 
-| Mode | 总周期 | 首结果周期 | 输入接收完成周期 | HBM active 周期 | Refill | Hit | Miss |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `DenseIp` | 2219 | 875 | 1 | 611 | 64 | 32 | 64 |
-| `TrIp` | 2283 | 907 | 1 | 611 | 64 | 32 | 64 |
-| `TrGt` | 28842 | 1975 | 28707 | 768 | 64 | 960 | 64 |
-| `TrGs` | 4439 | 1062 | 4403 | 768 | 64 | 960 | 64 |
+当前固定种子的顶层 `Total cycles` 平均值如下。每个数字都来自 Verilator 时钟边沿计数，不使用解析 compute-cycle 公式：
 
-这里使用全稠密矩阵来保证四种数据流执行完全相同的 MAC 集合。TrGT 的大部分周期来自当前 temporal adapter 逐个发送 B 元素；TrGS 以 cache line 为单位空间展开，因此明显缩短输入阶段。该差异反映当前 RTL 的真实握手行为，但不能直接替代论文在各 mode 推荐稀疏度和完整系统配置下的性能结果。
+| 类别 | A密度 | B密度 | 论文mode | `DenseIp` | `TrIp` | `TrGt` | `TrGs` |
+| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: |
+| HS x HS | 0.39% | 0.39% | `TrGt` | 1360.0 | 1360.0 | 100.0 | 100.0 |
+| HS x MS | 0.39% | 19.92% | `TrGs` | 1381.0 | 1381.0 | 488.0 | 140.7 |
+| HS x D | 0.39% | 100.00% | `TrGs` | 1405.0 | 1405.0 | 1555.0 | 283.0 |
+| MS x MS | 19.92% | 19.92% | `TrIp` | 1724.0 | 1724.0 | 1237.0 | 550.7 |
+| MS x D | 19.92% | 100.00% | `TrIp` | 1995.0 | 1995.0 | 5910.0 | 1534.3 |
+| D x D | 100.00% | 100.00% | `DenseIp` | 2219.0 | 2283.0 | 28842.0 | 4439.0 |
 
-该数字是当前 RTL 的 cache-to-result 端到端周期，而不是论文完整系统周期。Gustavson A/CSR pointer 读取、四 cluster cache、真实 HBM channel/queue、DMA 和最终 C 写回仍在边界之外；这些模块完成后，应保持同一个计时接口，将起点前移到统一矩阵描述符，将终点后移到最后一次 C 写响应。
+表中小数来自三个整数周期样本的平均值。IP路径使用固定宽度 bitmask fiber，因此冷 cache 下不同稀疏度仍请求相同的64条输入cache line，低密度结果主要体现计算和输出排空差异；Gustavson路径使用压缩B row cache区域，refill数量会随B密度变化。TrGT逐个发送B元素，TrGS按cache line空间发送，因此B较密时TrGS明显更快。
+
+这些数字是当前缩比 RTL 的 cache-to-result 顶层周期，而不是论文 `128 x 128` full-array 周期。Gustavson A/CSR pointer 读取、四 cluster cache、真实 HBM channel/queue、DMA 和最终 C 写回仍在边界之外；这些模块完成后，应保持同一个计时接口，将起点前移到统一矩阵描述符，将终点后移到最后一次 C 写响应。论文配置 full-array Verilator 在当前机器上仍会因生成规模和内存占用失败。
 
 ### 3.6 论文配置的稀疏度端到端周期仿真
 

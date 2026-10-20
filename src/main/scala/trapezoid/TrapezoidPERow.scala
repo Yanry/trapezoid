@@ -13,17 +13,13 @@ case class PERowRoutePayload(cfg: TrapezoidConfig) extends Bundle {
 
   val tripATags = Vec(UInt(cfg.coordinateWidth bits), cfg.maxFibers)
   val tripBTags = Vec(UInt(cfg.coordinateWidth bits), cfg.maxFibers)
-  val tripValid = Vec(Bool(), cfg.macLanes)
-  val tripAFiber = Vec(UInt(cfg.fiberIndexWidth bits), cfg.macLanes)
-  val tripBFiber = Vec(UInt(cfg.fiberIndexWidth bits), cfg.macLanes)
-  val tripAOperand = Vec(SInt(cfg.dataWidth bits), cfg.macLanes)
-  val tripBOperand = Vec(SInt(cfg.dataWidth bits), cfg.macLanes)
-
-  val gustValid = Vec(Bool(), cfg.cacheLineWords)
+  val laneValid = Vec(Bool(), cfg.macLanes)
+  val laneAFiber = Vec(UInt(cfg.fiberIndexWidth bits), cfg.macLanes)
+  val laneBFiber = Vec(UInt(cfg.fiberIndexWidth bits), cfg.macLanes)
+  val laneAOperand = Vec(SInt(cfg.dataWidth bits), cfg.macLanes)
+  val laneBOperand = Vec(SInt(cfg.dataWidth bits), cfg.macLanes)
   val gustRow = Vec(UInt(cfg.coordinateWidth bits), cfg.cacheLineWords)
   val gustColumn = Vec(UInt(cfg.coordinateWidth bits), cfg.cacheLineWords)
-  val gustAOperand = Vec(SInt(cfg.dataWidth bits), cfg.cacheLineWords)
-  val gustBOperand = Vec(SInt(cfg.dataWidth bits), cfg.cacheLineWords)
 }
 
 /** Products and routing metadata captured before coordinate reduction. */
@@ -36,12 +32,10 @@ case class PERowMacPayload(cfg: TrapezoidConfig) extends Bundle {
 
   val tripATags = Vec(UInt(cfg.coordinateWidth bits), cfg.maxFibers)
   val tripBTags = Vec(UInt(cfg.coordinateWidth bits), cfg.maxFibers)
-  val tripValid = Vec(Bool(), cfg.macLanes)
-  val tripAFiber = Vec(UInt(cfg.fiberIndexWidth bits), cfg.macLanes)
-  val tripBFiber = Vec(UInt(cfg.fiberIndexWidth bits), cfg.macLanes)
+  val laneValid = Vec(Bool(), cfg.macLanes)
+  val laneAFiber = Vec(UInt(cfg.fiberIndexWidth bits), cfg.macLanes)
+  val laneBFiber = Vec(UInt(cfg.fiberIndexWidth bits), cfg.macLanes)
   val product = Vec(SInt(cfg.accumulatorWidth bits), cfg.macLanes)
-
-  val gustValid = Vec(Bool(), cfg.cacheLineWords)
   val gustRow = Vec(UInt(cfg.coordinateWidth bits), cfg.cacheLineWords)
   val gustColumn = Vec(UInt(cfg.coordinateWidth bits), cfg.cacheLineWords)
 }
@@ -256,63 +250,89 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   routed.effectualMacs := Mux(denseFastPath,
     U(cfg.fiberWidth, cfg.matchCountWidth bits), mfiu.io.count)
 
+  val inputTripMode = input.mode === TrapezoidDataflow.DenseIp ||
+    input.mode === TrapezoidDataflow.TrIp
+  val gustRouteErrors = Bits(cfg.cacheLineWords bits)
   for (fiber <- 0 until cfg.maxFibers) {
-    routed.tripATags(fiber) := input.trip.a(fiber).tag
-    routed.tripBTags(fiber) := input.trip.b(fiber).tag
+    routed.tripATags(fiber) := Mux(inputTripMode,
+      input.trip.a(fiber).tag, U(0, cfg.coordinateWidth bits))
+    routed.tripBTags(fiber) := Mux(inputTripMode,
+      input.trip.b(fiber).tag, U(0, cfg.coordinateWidth bits))
   }
   for (lane <- 0 until cfg.macLanes) {
     val laneRoute = mfiu.io.routes(lane)
-    val aFiber = input.trip.a(laneRoute.aFiber)
-    val bFiber = input.trip.b(laneRoute.bFiber)
+    val tripAFiber = UInt(cfg.fiberIndexWidth bits)
+    val tripBFiber = UInt(cfg.fiberIndexWidth bits)
+    val tripValid = Bool()
+    val tripAOperand = SInt(cfg.dataWidth bits)
+    val tripBOperand = SInt(cfg.dataWidth bits)
     if (lane < cfg.fiberWidth) {
-      routed.tripValid(lane) := Mux(denseFastPath, True, laneRoute.valid)
-      routed.tripAFiber(lane) := Mux(denseFastPath,
-        denseAFiber, laneRoute.aFiber)
-      routed.tripBFiber(lane) := Mux(denseFastPath,
-        denseBFiber, laneRoute.bFiber)
-      routed.tripAOperand(lane) := Mux(denseFastPath,
-        denseA.values(lane), aFiber.values(laneRoute.aValueIndex))
-      routed.tripBOperand(lane) := Mux(denseFastPath,
-        denseB.values(lane), bFiber.values(laneRoute.bValueIndex))
+      tripValid := Mux(denseFastPath, True, laneRoute.valid)
+      tripAFiber := Mux(denseFastPath, denseAFiber, laneRoute.aFiber)
+      tripBFiber := Mux(denseFastPath, denseBFiber, laneRoute.bFiber)
+      tripAOperand := Mux(denseFastPath, denseA.values(lane),
+        input.trip.a(laneRoute.aFiber).values(laneRoute.aValueIndex))
+      tripBOperand := Mux(denseFastPath, denseB.values(lane),
+        input.trip.b(laneRoute.bFiber).values(laneRoute.bValueIndex))
     } else {
-      routed.tripValid(lane) := laneRoute.valid
-      routed.tripAFiber(lane) := laneRoute.aFiber
-      routed.tripBFiber(lane) := laneRoute.bFiber
-      routed.tripAOperand(lane) := aFiber.values(laneRoute.aValueIndex)
-      routed.tripBOperand(lane) := bFiber.values(laneRoute.bValueIndex)
+      tripValid := laneRoute.valid
+      tripAFiber := laneRoute.aFiber
+      tripBFiber := laneRoute.bFiber
+      tripAOperand := input.trip.a(laneRoute.aFiber)
+        .values(laneRoute.aValueIndex)
+      tripBOperand := input.trip.b(laneRoute.bFiber)
+        .values(laneRoute.bValueIndex)
     }
-  }
-  val gustRouteErrors = Bits(cfg.cacheLineWords bits)
-  for (lane <- 0 until cfg.cacheLineWords) {
-    val b = input.gustavson.b(lane)
-    val trGtA = GustavsonA(cfg)
-    trGtA := GustavsonA(cfg).getZero
-    val trGtRouteValid = Bool()
-    trGtRouteValid := False
-    if (lane < cfg.localBanks) {
-      val firstA = lane * cfg.macLanesPerSubrow
-      val lastA = firstA + cfg.macLanesPerSubrow
-      for (index <- firstA until lastA) {
-        when(b.aIndex === index) {
-          trGtA := input.gustavson.a(index)
-          trGtRouteValid := True
+
+    val gustValid = Bool()
+    val gustAOperand = SInt(cfg.dataWidth bits)
+    val gustBOperand = SInt(cfg.dataWidth bits)
+
+    if (lane < cfg.cacheLineWords) {
+      val b = input.gustavson.b(lane)
+      val trGtA = GustavsonA(cfg)
+      trGtA := GustavsonA(cfg).getZero
+      val trGtRouteValid = Bool()
+      trGtRouteValid := False
+      if (lane < cfg.localBanks) {
+        val firstA = lane * cfg.macLanesPerSubrow
+        val lastA = firstA + cfg.macLanesPerSubrow
+        for (index <- firstA until lastA) {
+          when(b.aIndex === index) {
+            trGtA := input.gustavson.a(index)
+            trGtRouteValid := True
+          }
         }
       }
+      val trGsA = input.gustavson.a(0)
+      val trGsMode = input.mode === TrapezoidDataflow.TrGs
+      val selectedA = Mux(trGsMode, trGsA, trGtA)
+      val routeValid = Mux(trGsMode, b.aIndex === 0, trGtRouteValid)
+      gustRouteErrors(lane) := b.valid && !routeValid
+      gustValid := b.valid && routeValid && selectedA.valid &&
+        selectedA.k === b.k
+      gustAOperand := selectedA.value
+      gustBOperand := b.value
+      routed.gustRow(lane) := Mux(inputTripMode,
+        U(0, cfg.coordinateWidth bits), selectedA.row)
+      routed.gustColumn(lane) := Mux(inputTripMode,
+        U(0, cfg.coordinateWidth bits), b.column)
+    } else {
+      gustValid := False
+      gustAOperand := 0
+      gustBOperand := 0
     }
-    val trGsA = input.gustavson.a(0)
-    val trGsMode = input.mode === TrapezoidDataflow.TrGs
-    val selectedA = Mux(trGsMode, trGsA, trGtA)
-    val routeValid = Mux(trGsMode, b.aIndex === 0, trGtRouteValid)
-    gustRouteErrors(lane) := b.valid && !routeValid
-    routed.gustValid(lane) := b.valid && routeValid && selectedA.valid &&
-      selectedA.k === b.k
-    routed.gustRow(lane) := selectedA.row
-    routed.gustColumn(lane) := b.column
-    routed.gustAOperand(lane) := selectedA.value
-    routed.gustBOperand(lane) := b.value
+
+    routed.laneValid(lane) := Mux(inputTripMode, tripValid, gustValid)
+    routed.laneAFiber(lane) := Mux(inputTripMode, tripAFiber,
+      U(0, cfg.fiberIndexWidth bits))
+    routed.laneBFiber(lane) := Mux(inputTripMode, tripBFiber,
+      U(0, cfg.fiberIndexWidth bits))
+    routed.laneAOperand(lane) := Mux(inputTripMode,
+      tripAOperand, gustAOperand)
+    routed.laneBOperand(lane) := Mux(inputTripMode,
+      tripBOperand, gustBOperand)
   }
-  val inputTripMode = input.mode === TrapezoidDataflow.DenseIp ||
-    input.mode === TrapezoidDataflow.TrIp
   routed.overflow := Mux(denseFastPath, False,
     Mux(inputTripMode, mfiu.io.overflow, gustRouteErrors.orR))
 
@@ -330,33 +350,19 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   multiplied.overflow := route.overflow
   multiplied.selectedColumns := route.selectedColumns
   multiplied.effectualMacs := route.effectualMacs
-  val routeTripMode = route.mode === TrapezoidDataflow.DenseIp ||
-    route.mode === TrapezoidDataflow.TrIp
   for (fiber <- 0 until cfg.maxFibers) {
     multiplied.tripATags(fiber) := route.tripATags(fiber)
     multiplied.tripBTags(fiber) := route.tripBTags(fiber)
   }
   for (lane <- 0 until cfg.macLanes) {
-    multiplied.tripValid(lane) := route.tripValid(lane)
-    multiplied.tripAFiber(lane) := route.tripAFiber(lane)
-    multiplied.tripBFiber(lane) := route.tripBFiber(lane)
-    val gustValid = if (lane < cfg.cacheLineWords)
-      route.gustValid(lane) else False
-    val gustAOperand = if (lane < cfg.cacheLineWords)
-      route.gustAOperand(lane) else S(0, cfg.dataWidth bits)
-    val gustBOperand = if (lane < cfg.cacheLineWords)
-      route.gustBOperand(lane) else S(0, cfg.dataWidth bits)
-    val selectedValid = Mux(routeTripMode, route.tripValid(lane), gustValid)
-    val selectedAOperand = Mux(routeTripMode,
-      route.tripAOperand(lane), gustAOperand)
-    val selectedBOperand = Mux(routeTripMode,
-      route.tripBOperand(lane), gustBOperand)
-    val laneProduct = selectedAOperand * selectedBOperand
-    multiplied.product(lane) := Mux(selectedValid,
+    multiplied.laneValid(lane) := route.laneValid(lane)
+    multiplied.laneAFiber(lane) := route.laneAFiber(lane)
+    multiplied.laneBFiber(lane) := route.laneBFiber(lane)
+    val laneProduct = route.laneAOperand(lane) * route.laneBOperand(lane)
+    multiplied.product(lane) := Mux(route.laneValid(lane),
       laneProduct.resize(cfg.accumulatorWidth), S(0, cfg.accumulatorWidth bits))
   }
   for (lane <- 0 until cfg.cacheLineWords) {
-    multiplied.gustValid(lane) := route.gustValid(lane)
     multiplied.gustRow(lane) := route.gustRow(lane)
     multiplied.gustColumn(lane) := route.gustColumn(lane)
   }
@@ -387,11 +393,11 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     mac.mode === TrapezoidDataflow.TrIp
   val tripLeaves = (0 until cfg.macLanes).map { lane =>
     val leaf = PERowReducedProduct(cfg)
-    leaf.valid := mac.tripValid(lane)
-    leaf.aFiber := mac.tripAFiber(lane)
-    leaf.bFiber := mac.tripBFiber(lane)
-    leaf.row := mac.tripATags(mac.tripAFiber(lane))
-    leaf.column := mac.tripBTags(mac.tripBFiber(lane))
+    leaf.valid := mac.laneValid(lane)
+    leaf.aFiber := mac.laneAFiber(lane)
+    leaf.bFiber := mac.laneBFiber(lane)
+    leaf.row := mac.tripATags(mac.laneAFiber(lane))
+    leaf.column := mac.tripBTags(mac.laneBFiber(lane))
     leaf.value := mac.product(lane)
     leaf
   }
@@ -416,11 +422,10 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
 
   // TrGT merges four coordinate-sorted subrow heads. TrGS receives one
   // coordinate-ordered cache line and only needs stable valid-lane compaction.
-  // Keeping these mode-specific inputs removes the old 16x16 all-to-all rank
-  // network while retaining the shared segmented reduction tree below.
+  // Both consume the same physical lane records and segmented reduction tree.
   val gustLeaves = (0 until cfg.cacheLineWords).map { lane =>
     val leaf = PERowReducedProduct(cfg)
-    leaf.valid := mac.gustValid(lane)
+    leaf.valid := mac.laneValid(lane)
     leaf.aFiber := 0
     leaf.bFiber := 0
     leaf.row := mac.gustRow(lane)
@@ -457,7 +462,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
         } else {
           False
         }
-        precedes(other) := mac.gustValid(other) &&
+        precedes(other) := mac.laneValid(other) &&
           (lowerCoordinate || sameCoordinateEarlier)
       }
     }
@@ -469,7 +474,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     trGtSorted(position) := PERowReducedProduct(cfg).getZero
     if (position < cfg.localBanks) {
       for (source <- 0 until cfg.localBanks) {
-        when(mac.gustValid(source) && trGtRank(source) === position) {
+        when(mac.laneValid(source) && trGtRank(source) === position) {
           trGtSorted(position) := gustLeaves(source)
         }
       }

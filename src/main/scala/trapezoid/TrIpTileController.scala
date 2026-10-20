@@ -8,6 +8,101 @@ object TrIpTileState extends SpinalEnum {
     ReadPlan, ReadWait, Output, AbortDrain = newElement()
 }
 
+/** Packed hierarchy around one PE row.  Keeping the full Gustavson-capable PE
+  * interface below this boundary prevents the TrIP array controller from
+  * duplicating thousands of unused scalar port connections for every row.
+  */
+case class ChunkedTrIpFiber(cfg: TrapezoidConfig) extends Bundle {
+  private val valuesPerChunk = scala.math.min(32, cfg.fiberWidth)
+  private val chunkCount = (cfg.fiberWidth + valuesPerChunk - 1) / valuesPerChunk
+
+  val valid = Bool()
+  val tag = UInt(cfg.coordinateWidth bits)
+  val mask = Bits(cfg.fiberWidth bits)
+  val values = Vec(Bits((valuesPerChunk * cfg.dataWidth) bits), chunkCount)
+}
+
+class PackedTrIpPERow(
+    cfg: TrapezoidConfig,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent
+) extends Component {
+  private val responseWidth = PERowResponse(cfg).getBitsWidth
+  private val valuesPerChunk = scala.math.min(32, cfg.fiberWidth)
+
+  val io = new Bundle {
+    val commandValid = in Bool()
+    val commandReady = out Bool()
+    val mode = in(TrapezoidDataflow())
+    val endOfTile = in Bool()
+    val a = in Vec(ChunkedTrIpFiber(cfg), cfg.maxFibers)
+    val b = in Vec(ChunkedTrIpFiber(cfg), cfg.maxFibers)
+    val responseValid = out Bool()
+    val responseReady = in Bool()
+    val responsePayload = out Bits(responseWidth bits)
+  }
+
+  val pe = peFactory(cfg)
+  val command = PERowCommand(cfg)
+  command.mode := io.mode
+  command.endOfTile := io.endOfTile
+  command.gustavson := GustavsonPayload(cfg).getZero
+  for (fiber <- 0 until cfg.maxFibers) {
+    command.trip.a(fiber).valid := io.a(fiber).valid
+    command.trip.a(fiber).tag := io.a(fiber).tag
+    command.trip.a(fiber).mask := io.a(fiber).mask
+    command.trip.b(fiber).valid := io.b(fiber).valid
+    command.trip.b(fiber).tag := io.b(fiber).tag
+    command.trip.b(fiber).mask := io.b(fiber).mask
+    for (value <- 0 until cfg.fiberWidth) {
+      val chunk = value / valuesPerChunk
+      val offset = (value % valuesPerChunk) * cfg.dataWidth
+      command.trip.a(fiber).values(value) :=
+        io.a(fiber).values(chunk)(offset + cfg.dataWidth - 1 downto offset).asSInt
+      command.trip.b(fiber).values(value) :=
+        io.b(fiber).values(chunk)(offset + cfg.dataWidth - 1 downto offset).asSInt
+    }
+  }
+  pe.io.command.valid := io.commandValid
+  pe.io.command.payload := command
+  io.commandReady := pe.io.command.ready
+  io.responseValid := pe.io.response.valid
+  pe.io.response.ready := io.responseReady
+  io.responsePayload := pe.io.response.payload.asBits
+}
+
+/** Packed, reusable hierarchy for all PE rows in the TrIP array. */
+class TrIpPERowArray(
+    cfg: TrapezoidConfig,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent
+) extends Component {
+  private val responseWidth = PERowResponse(cfg).getBitsWidth
+
+  val io = new Bundle {
+    val commandValid = in Bool()
+    val commandReady = out Bits(cfg.peRows bits)
+    val mode = in(TrapezoidDataflow())
+    val endOfTile = in Bool()
+    val a = in Vec(Vec(ChunkedTrIpFiber(cfg), cfg.maxFibers), cfg.peRows)
+    val b = in Vec(ChunkedTrIpFiber(cfg), cfg.maxFibers)
+    val responseValid = out Bits(cfg.peRows bits)
+    val responseReady = in Bool()
+    val responsePayload = out Vec(Bits(responseWidth bits), cfg.peRows)
+  }
+
+  val rows = Array.fill(cfg.peRows)(new PackedTrIpPERow(cfg, peFactory))
+  for (row <- 0 until cfg.peRows) {
+    rows(row).io.commandValid := io.commandValid
+    rows(row).io.mode := io.mode
+    rows(row).io.endOfTile := io.endOfTile
+    rows(row).io.a := io.a(row)
+    rows(row).io.b := io.b
+    io.commandReady(row) := rows(row).io.commandReady
+    io.responseValid(row) := rows(row).io.responseValid
+    rows(row).io.responseReady := io.responseReady
+    io.responsePayload(row) := rows(row).io.responsePayload
+  }
+}
+
 /** Matrix-tile scheduler for the bitmask inner-product path.
   *
   * Rows of A and columns of B are loaded as compressed fibers.  The scheduler
@@ -53,7 +148,13 @@ class TrIpTileController(
   }
 
   val aStorage = Vec((0 until tileCfg.maxRows).map(_ => Reg(CompressedFiber(cfg))))
-  val bStorage = Vec((0 until tileCfg.maxColumns).map(_ => Reg(CompressedFiber(cfg))))
+  val bStorageValid = Vec((0 until tileCfg.maxColumns).map(_ => Reg(Bool())))
+  val bStorageTag = Vec((0 until tileCfg.maxColumns).map(_ =>
+    Reg(UInt(cfg.coordinateWidth bits))))
+  val bStorageMask = Vec((0 until tileCfg.maxColumns).map(_ =>
+    Reg(Bits(cfg.fiberWidth bits))))
+  val bStorageValues = Vec((0 until tileCfg.maxColumns).map(_ =>
+    Reg(Bits((cfg.fiberWidth * cfg.dataWidth) bits))))
   val sequenceARowTags = Vec((0 until tileCfg.maxRows).map(_ =>
     Reg(UInt(cfg.coordinateWidth bits)) init 0))
   val sequenceBColumnTags = Vec((0 until tileCfg.maxColumns).map(_ =>
@@ -84,7 +185,8 @@ class TrIpTileController(
   val pendingWordValue = Vec((0 until pendingWordCount).map(_ =>
     Reg(SInt(cfg.accumulatorWidth bits)) init 0))
   val outputReg = Reg(MatrixResult(cfg))
-  val resultValid = Vec((0 until cellCount).map(_ => RegInit(False)))
+  val resultValid = Vec((0 until tileCfg.maxRows).map(_ =>
+    Reg(Bits(tileCfg.maxColumns bits)) init 0))
 
   io.busy := state =/= TrIpTileState.Idle
   io.done := doneReg
@@ -107,7 +209,7 @@ class TrIpTileController(
     modeError := False
     denseBypassActive := False
     doneReg := False
-    for (cell <- 0 until cellCount) resultValid(cell) := False
+    for (row <- 0 until tileCfg.maxRows) resultValid(row) := 0
   }
 
   when(io.aLoad.fire) {
@@ -121,13 +223,20 @@ class TrIpTileController(
   when(io.bLoad.fire) {
     for (index <- 0 until tileCfg.maxColumns) {
       when(io.bLoad.payload.index === index) {
-        bStorage(index) := io.bLoad.payload.fiber
+        bStorageValid(index) := io.bLoad.payload.fiber.valid
+        bStorageTag(index) := io.bLoad.payload.fiber.tag
+        bStorageMask(index) := io.bLoad.payload.fiber.mask
+        bStorageValues(index) := io.bLoad.payload.fiber.values.asBits
         bLoaded(index) := True
       }
     }
   }
 
-  val pes = Array.fill(cfg.peRows)(peFactory(cfg))
+  val peResponses = Vec(PERowResponse(cfg), cfg.peRows)
+  val peArray = new TrIpPERowArray(cfg, peFactory)
+  for (pe <- 0 until cfg.peRows) {
+    peResponses(pe).assignFromBits(peArray.io.responsePayload(pe))
+  }
   val packers = Array.fill(cfg.peRows)(new DynamicColumnPacker(cfg))
 
   val candidateColumns = UInt(fiberCounterWidth bits)
@@ -140,6 +249,42 @@ class TrIpTileController(
     lineOffset.resize(cfg.localWordIndexWidth + 1)
   candidateColumns := Mux(fiberLimitedColumns.resize(cfg.localWordIndexWidth + 1) >
     lineRemaining, lineRemaining.resize(fiberCounterWidth), fiberLimitedColumns)
+
+  val selectedBFibers = Vec(CompressedFiber(cfg), cfg.maxFibers)
+  val selectedBValid = Vec(Bool(), cfg.maxFibers)
+  for (fiber <- 0 until cfg.maxFibers) {
+    val columnIndex = (bBase + fiber).resized
+    selectedBFibers(fiber).valid := bStorageValid(columnIndex)
+    selectedBFibers(fiber).tag := bStorageTag(columnIndex)
+    selectedBFibers(fiber).mask := bStorageMask(columnIndex)
+    val selectedValues = bStorageValues(columnIndex)
+    for (value <- 0 until cfg.fiberWidth) {
+      val offset = value * cfg.dataWidth
+      selectedBFibers(fiber).values(value) :=
+        selectedValues(offset + cfg.dataWidth - 1 downto offset).asSInt
+    }
+    selectedBValid(fiber) := U(fiber, fiberCounterWidth bits) < candidateColumns &&
+      bLoaded(columnIndex) && bStorageValid(columnIndex)
+  }
+
+  private val valuesPerChunk = scala.math.min(32, cfg.fiberWidth)
+  private val valueChunkCount =
+    (cfg.fiberWidth + valuesPerChunk - 1) / valuesPerChunk
+  for (fiber <- 0 until cfg.maxFibers) {
+    peArray.io.b(fiber).valid := selectedBValid(fiber) &&
+      U(fiber, fiberCounterWidth bits) < batchColumns
+    peArray.io.b(fiber).tag := selectedBFibers(fiber).tag
+    peArray.io.b(fiber).mask := selectedBFibers(fiber).mask
+    for (chunk <- 0 until valueChunkCount) {
+      peArray.io.b(fiber).values(chunk) := 0
+    }
+    for (value <- 0 until cfg.fiberWidth) {
+      val chunk = value / valuesPerChunk
+      val offset = (value % valuesPerChunk) * cfg.dataWidth
+      peArray.io.b(fiber).values(chunk)(offset + cfg.dataWidth - 1 downto offset) :=
+        selectedBFibers(fiber).values(value).asBits
+    }
+  }
 
   val rowActive = Vec(Bool(), cfg.peRows)
   for (pe <- 0 until cfg.peRows) {
@@ -156,39 +301,31 @@ class TrIpTileController(
         packers(pe).io.aMask(fiber) := aStorage(globalRow).mask
         when(validA) { rowActive(pe) := True }
 
-        pes(pe).io.command.payload.trip.a(fiber).valid := validA
-        pes(pe).io.command.payload.trip.a(fiber).tag := aStorage(globalRow).tag
-        pes(pe).io.command.payload.trip.a(fiber).mask := aStorage(globalRow).mask
+        peArray.io.a(pe)(fiber).valid := validA
+        peArray.io.a(pe)(fiber).tag := aStorage(globalRow).tag
+        peArray.io.a(pe)(fiber).mask := aStorage(globalRow).mask
+        for (chunk <- 0 until valueChunkCount) {
+          peArray.io.a(pe)(fiber).values(chunk) := 0
+        }
         for (value <- 0 until cfg.fiberWidth) {
-          pes(pe).io.command.payload.trip.a(fiber).values(value) :=
-            aStorage(globalRow).values(value)
+          val chunk = value / valuesPerChunk
+          val offset = (value % valuesPerChunk) * cfg.dataWidth
+          peArray.io.a(pe)(fiber).values(chunk)(
+            offset + cfg.dataWidth - 1 downto offset) :=
+            aStorage(globalRow).values(value).asBits
         }
       } else {
         packers(pe).io.aValid(fiber) := False
         packers(pe).io.aMask(fiber) := 0
-        pes(pe).io.command.payload.trip.a(fiber) := CompressedFiber(cfg).getZero
+        peArray.io.a(pe)(fiber) := ChunkedTrIpFiber(cfg).getZero
       }
 
-      val columnIndex = (bBase + fiber).resized
-      val validB = U(fiber, fiberCounterWidth bits) < candidateColumns &&
-        bLoaded(columnIndex) && bStorage(columnIndex).valid
-      packers(pe).io.bValid(fiber) := validB
-      packers(pe).io.bMask(fiber) := bStorage(columnIndex).mask
-
-      pes(pe).io.command.payload.trip.b(fiber).valid := validB &&
-        U(fiber, fiberCounterWidth bits) < batchColumns
-      pes(pe).io.command.payload.trip.b(fiber).tag := bStorage(columnIndex).tag
-      pes(pe).io.command.payload.trip.b(fiber).mask := bStorage(columnIndex).mask
-      for (value <- 0 until cfg.fiberWidth) {
-        pes(pe).io.command.payload.trip.b(fiber).values(value) :=
-          bStorage(columnIndex).values(value)
-      }
+      packers(pe).io.bValid(fiber) := selectedBValid(fiber)
+      packers(pe).io.bMask(fiber) := selectedBFibers(fiber).mask
     }
-
-    pes(pe).io.command.payload.mode := modeReg
-    pes(pe).io.command.payload.endOfTile := False
-    pes(pe).io.command.payload.gustavson := GustavsonPayload(cfg).getZero
   }
+  peArray.io.mode := modeReg
+  peArray.io.endOfTile := False
 
   // The usable B prefix is the minimum capacity of every active PE row.
   var globalChoice = candidateColumns
@@ -202,18 +339,17 @@ class TrIpTileController(
   io.candidateColumnCount := candidateColumns
   io.activeRows := rowActive.asBits
 
-  val allPeReady = pes.map(_.io.command.ready).reduce(_ && _)
-  for (pe <- 0 until cfg.peRows) {
-    pes(pe).io.command.valid := !io.clear && state === TrIpTileState.Dispatch && allPeReady
-  }
+  val allPeReady = peArray.io.commandReady.andR
+  val peCommandValid = !io.clear && state === TrIpTileState.Dispatch && allPeReady
+  peArray.io.commandValid := peCommandValid
 
   val responseRegs = Vec((0 until cfg.peRows).map(_ => Reg(PERowResponse(cfg))))
-  val allResponsesValid = pes.map(_.io.response.valid).reduce(_ && _)
-  for (pe <- 0 until cfg.peRows) {
-    pes(pe).io.response.ready :=
-      (!io.clear && state === TrIpTileState.Collect && allResponsesValid) ||
-        state === TrIpTileState.AbortDrain
-  }
+  val peResponseValid = peArray.io.responseValid
+  val allResponsesValid = peResponseValid.andR
+  val peResponseReady =
+    (!io.clear && state === TrIpTileState.Collect && allResponsesValid) ||
+      state === TrIpTileState.AbortDrain
+  peArray.io.responseReady := peResponseReady
 
   val localBuffers = Array.fill(cfg.peRows)(new BankedLocalBuffer(cfg))
   val scatterWordValid = Vec(Bool(), pendingWordCount)
@@ -229,16 +365,33 @@ class TrIpTileController(
   val scatterLineBase = (bBase.resize(tileCfg.columnCountWidth + 1) >>
     cfg.localWordIndexWidth) << cfg.localWordIndexWidth
 
+  val scatterColumnWide = Vec(UInt((tileCfg.columnCountWidth + 1) bits),
+    cfg.localWordsPerBank)
+  val scatterColumnIndex = Vec(UInt(tileCfg.columnIndexWidth bits),
+    cfg.localWordsPerBank)
+  val scatterColumnSelected = Vec(Bool(), cfg.localWordsPerBank)
+  val scatterColumnAvailable = Vec(Bool(), cfg.localWordsPerBank)
+  val scatterColumnTag = Vec(UInt(cfg.coordinateWidth bits),
+    cfg.localWordsPerBank)
+  for (word <- 0 until cfg.localWordsPerBank) {
+    scatterColumnWide(word) := scatterLineBase + word
+    scatterColumnIndex(word) := scatterColumnWide(word).resized
+    scatterColumnSelected(word) :=
+      scatterColumnWide(word) >= bBase.resize(tileCfg.columnCountWidth + 1) &&
+        scatterColumnWide(word) < (bBase.resize(tileCfg.columnCountWidth + 1) +
+          batchColumns.resize(tileCfg.columnCountWidth + 1))
+    scatterColumnAvailable(word) :=
+      scatterColumnWide(word) < columnCount.resize(tileCfg.columnCountWidth + 1) &&
+        bLoaded(scatterColumnIndex(word)) &&
+        bStorageValid(scatterColumnIndex(word))
+    scatterColumnTag(word) := bStorageTag(scatterColumnIndex(word))
+  }
+
   for (pe <- 0 until cfg.peRows; fiber <- 0 until cfg.maxFibers;
        word <- 0 until cfg.localWordsPerBank) {
     val line = pe * cfg.localBanks + fiber
     val slot = line * cfg.localWordsPerBank + word
     val globalRow = pe * cfg.maxFibers + fiber
-    val columnWide = scatterLineBase + word
-    val columnIndex = columnWide.resize(tileCfg.columnIndexWidth)
-    val wordSelected = columnWide >= bBase.resize(tileCfg.columnCountWidth + 1) &&
-      columnWide < (bBase.resize(tileCfg.columnCountWidth + 1) +
-        batchColumns.resize(tileCfg.columnCountWidth + 1))
     val rowAvailable = Bool()
     if (globalRow < tileCfg.maxRows) {
       rowAvailable := U(globalRow, tileCfg.rowCountWidth bits) < rowCount &&
@@ -246,40 +399,37 @@ class TrIpTileController(
     } else {
       rowAvailable := False
     }
-    val columnAvailable = columnWide < columnCount.resize(tileCfg.columnCountWidth + 1) &&
-      bLoaded(columnIndex) && bStorage(columnIndex).valid
-
     if (globalRow < tileCfg.maxRows) {
       for (lane <- 0 until cfg.outputLanes) {
         val result = responseRegs(pe).results(lane)
-        when(state === TrIpTileState.Scatter && wordSelected && rowAvailable &&
-            columnAvailable && result.valid && result.row === aStorage(globalRow).tag &&
-            result.column === bStorage(columnIndex).tag) {
+        when(state === TrIpTileState.Scatter && scatterColumnSelected(word) &&
+            rowAvailable && scatterColumnAvailable(word) && result.valid &&
+            result.row === aStorage(globalRow).tag &&
+            result.column === scatterColumnTag(word)) {
           scatterWordValid(slot) := True
           scatterWordValue(slot) := result.value
         }
       }
 
-      val rowResultValid = Vec((0 until tileCfg.maxColumns).map(column =>
-        resultValid(globalRow * tileCfg.maxColumns + column)))
       scatterWordExisting(slot) := scatterWordValid(slot) &&
-        rowResultValid(columnIndex)
+        resultValid(globalRow)(scatterColumnIndex(word))
     } else {
       scatterWordExisting(slot) := False
     }
   }
-  for (row <- 0 until tileCfg.maxRows; column <- 0 until tileCfg.maxColumns) {
+  for (row <- 0 until tileCfg.maxRows) {
     val pe = row / cfg.maxFibers
     val fiber = row % cfg.maxFibers
-    val writesCoordinate = Vec(Bool(), cfg.localWordsPerBank)
+    var writeMask: Bits = B(0, tileCfg.maxColumns bits)
     for (word <- 0 until cfg.localWordsPerBank) {
       val slot = (pe * cfg.localBanks + fiber) * cfg.localWordsPerBank + word
-      val columnWide = scatterLineBase + word
-      writesCoordinate(word) := scatterWordValid(slot) &&
-        columnWide === column
+      val oneHot = (B(1, tileCfg.maxColumns bits) |<<
+        scatterColumnIndex(word)).resize(tileCfg.maxColumns)
+      writeMask = writeMask | Mux(scatterWordValid(slot), oneHot,
+        B(0, tileCfg.maxColumns bits))
     }
-    when(writesCoordinate.asBits.orR) {
-      resultValid(row * tileCfg.maxColumns + column) := True
+    when(writeMask.orR) {
+      resultValid(row) := resultValid(row) | writeMask
     }
   }
   for (pe <- 0 until cfg.peRows; bank <- cfg.maxFibers until cfg.localBanks;
@@ -315,6 +465,8 @@ class TrIpTileController(
   val outputWord = outputColumnSlot.resize(cfg.localWordIndexWidth)
   val outputAddress = (outputColumnSlot >> cfg.localWordIndexWidth)
     .resize(cfg.localAddressWidth)
+  val outputRowValid = resultValid(outputRowSlot)
+  val outputCellValid = outputRowValid(outputColumnSlot)
 
   for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
     val buffer = localBuffers(pe)
@@ -375,7 +527,7 @@ class TrIpTileController(
       buffer.io.bus.writes(bank).payload.mask := accumulatedMask
     }
 
-    when(state === TrIpTileState.ReadPlan && resultValid(outputCell) &&
+    when(state === TrIpTileState.ReadPlan && outputCellValid &&
         outputPe === pe && outputBank === bank) {
       buffer.io.bus.readCommands(bank).valid := True
       buffer.io.bus.readCommands(bank).payload := outputAddress
@@ -419,8 +571,15 @@ class TrIpTileController(
   val finalAGroup = aOffset + groupSize >= cfg.maxFibers
   val hasLaterCell = Bool()
   hasLaterCell := False
-  for (cell <- 1 until cellCount) {
-    when(U(cell, cellIndexWidth bits) > outputCell && resultValid(cell)) {
+  for (column <- 0 until tileCfg.maxColumns) {
+    when(U(column, tileCfg.columnIndexWidth bits) > outputColumnSlot &&
+        outputRowValid(column)) {
+      hasLaterCell := True
+    }
+  }
+  for (row <- 0 until tileCfg.maxRows) {
+    when(U(row, tileCfg.rowIndexWidth bits) > outputRowSlot &&
+        resultValid(row).orR) {
       hasLaterCell := True
     }
   }
@@ -435,7 +594,7 @@ class TrIpTileController(
   }
   for (column <- 0 until tileCfg.maxColumns) {
     when(U(column, tileCfg.columnCountWidth bits) < io.start.payload.columnCount &&
-        bLoaded(column) && bStorage(column).tag =/= sequenceBColumnTags(column)) {
+        bLoaded(column) && bStorageTag(column) =/= sequenceBColumnTags(column)) {
       sequenceTagMismatch := True
     }
   }
@@ -454,8 +613,8 @@ class TrIpTileController(
     val declared = U(column, tileCfg.columnCountWidth bits) <
       io.start.payload.columnCount
     allDeclaredBColumnsDense = allDeclaredBColumnsDense &&
-      (!declared || (bLoaded(column) && bStorage(column).valid &&
-        bStorage(column).mask === fullFiberMask))
+      (!declared || (bLoaded(column) && bStorageValid(column) &&
+        bStorageMask(column) === fullFiberMask))
   }
   val denseStartBypass = io.start.payload.mode === TrapezoidDataflow.DenseIp &&
     allDeclaredARowsDense && allDeclaredBColumnsDense
@@ -511,10 +670,10 @@ class TrIpTileController(
             io.start.payload.columnCount =/= columnCount || sequenceTagMismatch))
         modeError := invalidStart
         when(io.start.payload.firstKTile) {
-          for (cell <- 0 until cellCount) resultValid(cell) := False
+          for (row <- 0 until tileCfg.maxRows) resultValid(row) := 0
           for (row <- 0 until tileCfg.maxRows) sequenceARowTags(row) := aStorage(row).tag
           for (column <- 0 until tileCfg.maxColumns) {
-            sequenceBColumnTags(column) := bStorage(column).tag
+            sequenceBColumnTags(column) := bStorageTag(column)
           }
         }
         when(!invalidStart) {
@@ -581,7 +740,7 @@ class TrIpTileController(
 
     is(TrIpTileState.Collect) {
       when(allResponsesValid) {
-        for (pe <- 0 until cfg.peRows) responseRegs(pe) := pes(pe).io.response.payload
+        for (pe <- 0 until cfg.peRows) responseRegs(pe) := peResponses(pe)
         commandInFlight := False
         state := TrIpTileState.Scatter
       }
@@ -616,7 +775,7 @@ class TrIpTileController(
     }
 
     is(TrIpTileState.ReadPlan) {
-      when(resultValid(outputCell)) {
+      when(outputCellValid) {
         state := TrIpTileState.ReadWait
       } elsewhen(outputCell === cellCount - 1) {
         state := TrIpTileState.Idle
@@ -637,7 +796,7 @@ class TrIpTileController(
         val outputColumnSlot = outputCell(tileCfg.columnIndexWidth - 1 downto 0)
         outputReg.valid := True
         outputReg.row := aStorage(outputRowSlot).tag
-        outputReg.column := bStorage(outputColumnSlot).tag
+        outputReg.column := bStorageTag(outputColumnSlot)
         outputReg.value := selectedReadData.asSInt
         outputReg.endOfTile := !hasLaterCell
         state := TrIpTileState.Output

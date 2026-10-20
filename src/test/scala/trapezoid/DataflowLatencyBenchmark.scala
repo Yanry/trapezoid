@@ -463,13 +463,11 @@ object FullPaperRtlDataflowLatencyBenchmark extends App {
     val dut = new TrIpTileController(ipCfg,
       paperPe(kernelSources.take(2)))
     dut.batchColumns.simPublic()
-    dut.pes.foreach { pe =>
-      pe.io.command.valid.simPublic()
-      pe.io.command.ready.simPublic()
-      pe.io.response.valid.simPublic()
-      pe.io.response.ready.simPublic()
-      pe.io.response.payload.effectualMacs.simPublic()
-    }
+    dut.peCommandValid.simPublic()
+    dut.allPeReady.simPublic()
+    dut.peResponseValid.simPublic()
+    dut.peResponseReady.simPublic()
+    dut.peResponses.foreach(_.effectualMacs.simPublic())
     dut
   }.doSim { dut =>
     dut.clockDomain.forkStimulus(10)
@@ -537,16 +535,17 @@ object FullPaperRtlDataflowLatencyBenchmark extends App {
       val observed = mutable.Map.empty[(Int, Int), Long]
       while (!dut.io.done.toBoolean && executionCycles < 1000000) {
         sleep(1)
-        val commandFire = dut.pes.forall(pe =>
-          pe.io.command.valid.toBoolean && pe.io.command.ready.toBoolean)
+        val commandFire = dut.peCommandValid.toBoolean &&
+          dut.allPeReady.toBoolean
         if (commandFire) {
           issueCount += 1
           issueSlots += dut.io.activeRows.toBigInt.bitCount * cfg.macLanes
           packedColumns += dut.batchColumns.toLong
         }
-        for (pe <- dut.pes if pe.io.response.valid.toBoolean &&
-            pe.io.response.ready.toBoolean) {
-          observedMacs += pe.io.response.payload.effectualMacs.toLong
+        for (pe <- 0 until cfg.peRows
+             if dut.peResponseValid.toBigInt.testBit(pe) &&
+               dut.peResponseReady.toBoolean) {
+          observedMacs += dut.peResponses(pe).effectualMacs.toLong
         }
         if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
           observed((dut.io.result.payload.row.toInt,

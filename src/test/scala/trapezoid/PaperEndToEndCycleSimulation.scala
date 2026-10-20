@@ -47,6 +47,7 @@ object PaperEndToEndCycleSimulation extends App {
   private case class Measurement(
       category: Category,
       sample: Int,
+      mode: String,
       effectualMacs: Long,
       inputBytes: Long,
       outputBytes: Long,
@@ -70,6 +71,7 @@ object PaperEndToEndCycleSimulation extends App {
     Category("MS x D", mildlySparseBasisPoints, denseBasisPoints, "TrIp"),
     Category("D x D", denseBasisPoints, denseBasisPoints, "DenseIp")
   )
+  private val modes = Vector("DenseIp", "TrIp", "TrGt", "TrGs")
 
   private def ceilDiv(value: Long, divisor: Long): Long =
     if (value == 0) 0 else (value + divisor - 1) / divisor
@@ -249,21 +251,29 @@ object PaperEndToEndCycleSimulation extends App {
     val hbmReadCycles = ceilDiv(inputBytes, hbmBytesPerCycle)
     val cacheReadCycles = ceilDiv(inputLines, cacheBanks)
     val inputCycles = math.max(hbmReadCycles, cacheReadCycles)
-    val compute = computeCycles(category.mode, product, a, b)
     val hbmWriteCycles = ceilDiv(cBytes, hbmBytesPerCycle)
     val cacheWriteCycles = ceilDiv(outputLines, cacheBanks)
     val outputCycles = math.max(hbmWriteCycles, cacheWriteCycles)
     val pipelineCycles = pePipelineStages - 1
-    val streamedCycles = math.max(inputCycles, compute) + pipelineCycles + outputCycles
-    val serializedCycles = inputCycles + compute + pipelineCycles + outputCycles
+    for (mode <- modes) {
+      val compute = computeCycles(mode, product, a, b)
+      val streamedCycles = math.max(inputCycles, compute) +
+        pipelineCycles + outputCycles
+      val serializedCycles = inputCycles + compute +
+        pipelineCycles + outputCycles
 
-    measurements += Measurement(category, sample, product.effectualMacs,
-      inputBytes, cBytes, hbmReadCycles, cacheReadCycles, compute,
-      outputCycles, streamedCycles, serializedCycles, product.checksum)
+      measurements += Measurement(category, sample, mode,
+        product.effectualMacs, inputBytes, cBytes, hbmReadCycles,
+        cacheReadCycles, compute, outputCycles, streamedCycles,
+        serializedCycles, product.checksum)
+    }
   }
 
-  private def average(category: Category)(select: Measurement => Long): Double = {
-    val selected = measurements.filter(_.category == category)
+  private def average(category: Category, mode: String)
+                     (select: Measurement => Long): Double = {
+    val selected = measurements.filter(measurement =>
+      measurement.category == category && measurement.mode == mode)
+    require(selected.size == samplesPerCategory)
     selected.map(select).sum.toDouble / selected.size
   }
 
@@ -280,25 +290,34 @@ object PaperEndToEndCycleSimulation extends App {
     s"MS=${densityText(mildlySparseBasisPoints)}, D=${densityText(denseBasisPoints)}; " +
     s"$samplesPerCategory deterministic samples/category")
   println("Boundary: descriptor acceptance with operands in HBM through C writeback to HBM.")
-  println("| Category | A density | B density | Mode | Useful MACs | Input KiB | " +
-    "Output KiB | HBM read | Cache read | Compute | Output | E2E streamed | " +
-    "E2E serialized |")
-  println("| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | " +
-    "---: | ---: | ---: | ---: |")
+  println("| Category | A density | B density | Paper mode | DenseIp | TrIp | TrGt | TrGs |")
+  println("| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: |")
   categories.foreach { category =>
-    println(f"| ${category.name}%s | ${densityText(category.aBasisPoints)}%s | " +
-      f"${densityText(category.bBasisPoints)}%s | ${category.mode}%s | " +
-      f"${average(category)(_.effectualMacs)}%.1f | " +
-      f"${average(category)(_.inputBytes) / 1024.0}%.2f | " +
-      f"${average(category)(_.outputBytes) / 1024.0}%.2f | " +
-      f"${average(category)(_.hbmReadCycles)}%.1f | " +
-      f"${average(category)(_.cacheReadCycles)}%.1f | " +
-      f"${average(category)(_.computeCycles)}%.1f | " +
-      f"${average(category)(_.outputCycles)}%.1f | " +
-      f"${average(category)(_.streamedCycles)}%.1f | " +
-      f"${average(category)(_.serializedCycles)}%.1f |")
+    val cycleColumns = modes.map(mode =>
+      f"${average(category, mode)(_.streamedCycles)}%.1f")
+    println(s"| ${category.name} | ${densityText(category.aBasisPoints)} | " +
+      s"${densityText(category.bBasisPoints)} | ${category.mode} | " +
+      s"${cycleColumns.mkString(" | ")} |")
   }
-  val combinedChecksum = measurements.map(_.checksum).foldLeft(0L)(_ ^ _)
+  println("\nDetailed paper-configuration model")
+  println("| Category | Mode | Useful MACs | Input KiB | Output KiB | HBM read | " +
+    "Cache read | Compute | Output | E2E streamed | E2E serialized |")
+  println("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+  for (category <- categories; mode <- modes) {
+    println(f"| ${category.name}%s | $mode%s | " +
+      f"${average(category, mode)(_.effectualMacs)}%.1f | " +
+      f"${average(category, mode)(_.inputBytes) / 1024.0}%.2f | " +
+      f"${average(category, mode)(_.outputBytes) / 1024.0}%.2f | " +
+      f"${average(category, mode)(_.hbmReadCycles)}%.1f | " +
+      f"${average(category, mode)(_.cacheReadCycles)}%.1f | " +
+      f"${average(category, mode)(_.computeCycles)}%.1f | " +
+      f"${average(category, mode)(_.outputCycles)}%.1f | " +
+      f"${average(category, mode)(_.streamedCycles)}%.1f | " +
+      f"${average(category, mode)(_.serializedCycles)}%.1f |")
+  }
+  val combinedChecksum = measurements.filter(measurement =>
+    measurement.mode == measurement.category.mode).map(_.checksum)
+    .foldLeft(0L)(_ ^ _)
   println(s"Combined result checksum: $combinedChecksum")
   println("E2E streamed overlaps operand transfer with execution; E2E serialized " +
     "is the no-overlap upper bound.")

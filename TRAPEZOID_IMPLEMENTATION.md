@@ -483,7 +483,7 @@ sbt -batch 'Test/runMain trapezoid.DataflowLatencyBenchmark'
 sbt -batch 'Test/runMain trapezoid.FullPaperRtlDataflowLatencyBenchmark'
 ```
 
-该入口保持 `128 x 128` paper PE/MAC 配置，并通过层次化 blackbox 只生成一次 paper PE-row 内核；但当前 TrIP controller 生成的顶层 Verilog仍约 767MB。在 30GiB 主机上 Spinal elaboration 可以完成，Verilator translation 会被系统以 `SIGKILL(9)` 终止，因此该入口只适合更高内存的机器，不应作为本机默认测试。`PaperRtlDataflowLatencyBenchmark` 作为兼容入口会打印说明并转到可运行的 paper cycle model，不再触发 OOM。
+该入口保持 `128 x 128` paper PE/MAC 配置，并通过 blackbox 只生成一次 paper PE-row 内核。TrIP controller 现把 128 个 PE row 封装为 packed 层次、只广播一份 B fiber，并把 output-valid 从逐 cell 寄存器改为逐行位图；paper 顶层 Verilog 已从约 767MB 降到约 23MB（约 37 万行）。但是在当前 30GiB 主机上，Verilator 5.022 translation 仍会被系统以 `SIGKILL(9)` 终止，因此该入口仍只适合更高内存机器，不应作为本机默认测试。`PaperRtlDataflowLatencyBenchmark` 作为兼容入口会打印说明并转到可运行的 paper cycle model，不再触发 OOM。
 
 paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用同一个 `TrIpTileController` 调度和 PE 数据通路。`TrGt` 仍通过通用 `GustavsonRowScheduler` 的有序 merge accumulator 执行；`TrGs` 已切换到启用宽写回的 `TrGsSpatialRowScheduler`，使用 128 个 paper PE row、连续 cache-line 发射、按列空间累加和每拍最多 16 个结果的排空，因此两种 Gustavson mode 的 RTL 周期不再被同一个逐项 merge/输出状态机人为拉齐。完整 cache/HBM 流量以及写回端口、bank 和 NoC 争用仍未包含。
 
@@ -533,26 +533,26 @@ sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
 
 ### 3.6 论文配置的稀疏度端到端周期仿真
 
-`PaperEndToEndCycleSimulation` 使用 `TrapezoidConfig.paper` 和论文方法中的 `1 GHz`、`128 x 128 FP32 MAC`、4 个 cache cluster、每 cluster 32 banks/4 MB、总计 16 MB global cache、1 MB local buffer、64B cache line 和 2 TB/s HBM。测试覆盖 `HS x HS`、`HS x MS`、`HS x D`、`MS x MS`、`MS x D` 和 `D x D`，分别使用论文推荐的 `TrGt`、`TrGs`、`TrGs`、`TrIp`、`TrIp` 和 `DenseIp`：
+`PaperEndToEndCycleSimulation` 使用 `TrapezoidConfig.paper` 和论文方法中的 `1 GHz`、`128 x 128 FP32 MAC`、4 个 cache cluster、每 cluster 32 banks/4 MB、总计 16 MB global cache、1 MB local buffer、64B cache line 和 2 TB/s HBM。测试覆盖 `HS x HS`、`HS x MS`、`HS x D`、`MS x MS`、`MS x D` 和 `D x D`，每一类都计算 `DenseIp`、`TrIp`、`TrGt` 和 `TrGs`，并同时标出论文推荐 mode：
 
 ```bash
 sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 ```
 
-默认矩阵为 `256 x 256`，`HS=0.5%`、`MS=20%`、`D=100%`，每类使用 3 个固定随机样本。HS 输入按 CSR/CSC 的 FP32 value、32-bit coordinate 和 pointer 计算流量，MS 输入按 bitmask fiber 和 FP32 nonzero value 计算流量，D 输入按未压缩 FP32 计算流量；输出根据实际非零密度选择相同的格式规则。计时从矩阵描述符接受且 A/B 位于 HBM 开始，到 C 写回 HBM 结束，包含输入格式流量、global cache/HBM 服务周期、推荐数据流的 issue 周期、五级 PE pipeline fill/drain 和输出写回周期。
+默认矩阵为 `256 x 256`，`HS=0.5%`、`MS=20%`、`D=100%`，每类使用 3 个固定随机样本。HS 输入按 CSR/CSC 的 FP32 value、32-bit coordinate 和 pointer 计算流量，MS 输入按 bitmask fiber 和 FP32 nonzero value 计算流量，D 输入按未压缩 FP32 计算流量；输出根据实际非零密度选择相同的格式规则。计时从矩阵描述符接受且 A/B 位于 HBM 开始，到 C 写回 HBM 结束，包含输入格式流量、global cache/HBM 服务周期、所选数据流的 issue 周期、五级 PE pipeline fill/drain 和输出写回周期。
 
 固定种子的运行结果如下，均为每类 3 个样本的算术平均值；周期在 1 GHz 下也等于 ns。
 
-| 类别 | A 密度 | B 密度 | mode | 有效 MAC | 输入 KiB | 输出 KiB | HBM 读 | cache 读 | 计算 | 输出 | 流式 E2E | 串行 E2E |
-| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| HS x HS | 0.50% | 0.50% | `TrGt` | 421.7 | 7.25 | 4.33 | 4.0 | 1.0 | 10.7 | 3.0 | 17.7 | 21.7 |
-| HS x MS | 0.50% | 20.00% | `TrGs` | 16779.7 | 62.88 | 66.13 | 33.0 | 8.0 | 30.0 | 34.0 | 71.0 | 101.0 |
-| HS x D | 0.50% | 100.00% | `TrGs` | 83968.0 | 259.63 | 195.00 | 133.0 | 33.0 | 160.0 | 100.3 | 264.3 | 397.3 |
-| MS x MS | 20.00% | 20.00% | `TrIp` | 670620.0 | 118.50 | 264.00 | 61.0 | 15.0 | 129.7 | 136.0 | 269.7 | 330.7 |
-| MS x D | 20.00% | 100.00% | `TrIp` | 3355392.0 | 315.25 | 256.00 | 162.0 | 40.0 | 569.3 | 132.0 | 705.3 | 867.3 |
-| D x D | 100.00% | 100.00% | `DenseIp` | 16777216.0 | 512.00 | 256.00 | 263.0 | 64.0 | 1024.0 | 132.0 | 1160.0 | 1423.0 |
+| 类别 | A 密度 | B 密度 | 论文 mode | `DenseIp` | `TrIp` | `TrGt` | `TrGs` |
+| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: |
+| HS x HS | 0.50% | 0.50% | `TrGt` | 1031.0 | 135.0 | 17.7 | 11.0 |
+| HS x MS | 0.50% | 20.00% | `TrGs` | 1062.0 | 166.0 | 287.3 | 71.0 |
+| HS x D | 0.50% | 100.00% | `TrGs` | 1128.3 | 237.3 | 1469.7 | 264.3 |
+| MS x MS | 20.00% | 20.00% | `TrIp` | 1164.0 | 269.7 | 3715.3 | 576.7 |
+| MS x D | 20.00% | 100.00% | `TrIp` | 1160.0 | 705.3 | 17629.3 | 2280.0 |
+| D x D | 100.00% | 100.00% | `DenseIp` | 1160.0 | 2184.0 | 65672.0 | 8328.0 |
 
-输出同时报告两个边界：`E2E streamed` 允许输入传输与执行重叠，是默认端到端周期；`E2E serialized` 将输入、计算和输出完全串行，是无重叠上界。论文没有公开固定 HBM command latency，因此模型使用论文给出的 2 TB/s 带宽，不额外虚构 first-line latency。当前实现是可重复的 paper-configuration cycle model，不是论文模拟器的逐地址复刻，也不是 full-chip Verilator：它尚未模拟 cache 地址级 bank conflict、NoC 仲裁、DMA command latency 和随机背压；full-chip Verilator 在当前机器上仍受 128-row RTL 规模限制。
+主表为 `E2E streamed`：允许输入传输与执行重叠。程序还为全部 24 个 category/mode 组合输出详细表，其中 `E2E serialized` 将输入、计算和输出完全串行，是无重叠上界。论文没有公开固定 HBM command latency，因此模型使用论文给出的 2 TB/s 带宽，不额外虚构 first-line latency。当前实现是可重复的 paper-configuration cycle model，不是论文模拟器的逐地址复刻，也不是 full-chip Verilator：它尚未模拟 cache 地址级 bank conflict、NoC 仲裁、DMA command latency 和随机背压；full-chip Verilator 在当前机器上仍受 128-row RTL 翻译内存限制。
 
 论文使用 128 个真实 workload，而不是统一的 `256 x 256` 随机矩阵；因此这里遵循的是论文硬件配置、稀疏度分类、存储格式和 mode 映射，不能把表中绝对周期与论文图中的 workload 周期直接逐项比较。要复现论文最终图表，还需要导入论文 Table III/IV 对应矩阵、执行 coordinate/occupancy tiling，并补齐上述逐地址争用模型。
 

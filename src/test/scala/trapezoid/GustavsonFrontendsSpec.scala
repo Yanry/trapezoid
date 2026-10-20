@@ -324,24 +324,32 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     }
   }
 
-  test("TrGS reports same-bank spatial accumulator conflicts") {
+  test("TrGS serializes same-bank spatial accumulator updates") {
     simConfig.compile(new TrGsSpatialEngine(tileCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       initializeTrGs(dut)
       dut.io.result.ready #= true
 
       // Columns 0 and 4 share bank 0 under the four-bank interleaved
-      // accumulator mapping. They must not be written in the same cycle.
+      // accumulator mapping. The response must be serialized rather than
+      // dropped or reported as an overflow.
       issueTrGs(dut, k = 0, aValue = 2,
         Seq(Some(0 -> 3), Some(4 -> 5), None, None), endOfTile = true)
 
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
       var timeout = 0
       while (!dut.io.done.toBoolean && timeout < 200) {
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong))
+        }
         dut.clockDomain.waitSampling()
         timeout += 1
       }
       assert(dut.io.done.toBoolean)
-      assert(dut.io.overflow.toBoolean)
+      assert(!dut.io.overflow.toBoolean)
+      assert(observed == Seq((6, 0, 6L), (6, 4, 10L)))
     }
   }
 

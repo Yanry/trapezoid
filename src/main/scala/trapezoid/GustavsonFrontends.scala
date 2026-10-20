@@ -278,6 +278,7 @@ class TrGsSpatialEngine(
   private val writebackGroups = slots / cfg.cacheLineWords
   private val writebackGroupIndexWidth = scala.math.max(1, log2Up(writebackGroups))
   private val inFlightWidth = log2Up(cfg.responseFifoDepth + 5)
+  private val responseIndexWidth = scala.math.max(1, log2Up(cfg.outputLanes))
   require((slots & (slots - 1)) == 0,
     "TrGS spatial accumulator entries must be a power of two")
   require(slots >= cfg.macLanes,
@@ -303,6 +304,7 @@ class TrGsSpatialEngine(
   val overflowReg = RegInit(False)
   val modeErrorReg = RegInit(False)
   val inFlight = Reg(UInt(inFlightWidth bits)) init 0
+  val responseCursor = Reg(UInt(responseIndexWidth bits)) init 0
   val outputCursor = Reg(UInt(tileCfg.entryIndexWidth bits)) init 0
   val outputGroupCursor = Reg(UInt(writebackGroupIndexWidth bits)) init 0
   val tileRow = Reg(UInt(cfg.coordinateWidth bits)) init 0
@@ -364,10 +366,18 @@ class TrGsSpatialEngine(
 
   val commandFire = io.command.fire && supportedMode
   val responseFire = pe.io.response.fire
-  pe.io.response.ready := !io.clear &&
-    (state === TrGsSpatialState.Run || state === TrGsSpatialState.AbortDrain)
-
   val response = pe.io.response.payload
+  val responseAvailable = pe.io.response.valid &&
+    state === TrGsSpatialState.Run && response.count =/= 0
+  val responseLast = responseAvailable &&
+    (responseCursor.resize(cfg.outputCountWidth) + 1) >= response.count
+  // A response can contain several columns targeting the same physical bank.
+  // Hold it at the PE boundary and consume one result lane per cycle so the
+  // accumulator still has one write per bank per cycle.
+  pe.io.response.ready := !io.clear &&
+    (state === TrGsSpatialState.AbortDrain ||
+      (state === TrGsSpatialState.Run &&
+        (!pe.io.response.valid || response.count === 0 || responseLast)))
   val commandColumnChoices = Vec(Bool(), cfg.cacheLineWords)
   var earlierCommandColumn: Bool = False
   for (lane <- 0 until cfg.cacheLineWords) {
@@ -395,58 +405,32 @@ class TrGsSpatialEngine(
       (io.command.payload.b(lane).valid && laneColumnBase =/= commandColumnBase)
   }
 
-  var responseConflict: Bool = False
-  var responseBankConflict: Bool = False
-  for (lane <- 0 until cfg.outputLanes;
-       earlier <- 0 until lane) {
-    val laneResult = response.results(lane)
-    val earlierResult = response.results(earlier)
-    responseConflict = responseConflict ||
-      (laneResult.valid && earlierResult.valid &&
-        laneResult.column(tileCfg.entryIndexWidth - 1 downto 0) ===
-          earlierResult.column(tileCfg.entryIndexWidth - 1 downto 0))
-    // Each physical TrGS accumulator bank accepts one update per cycle.
-    // The spatial distributor must therefore avoid two distinct columns
-    // targeting the same bank in one response.
-    responseBankConflict = responseBankConflict ||
-      (laneResult.valid && earlierResult.valid &&
-        laneResult.column(log2Up(cfg.localBanks) - 1 downto 0) ===
-          earlierResult.column(log2Up(cfg.localBanks) - 1 downto 0) &&
-        laneResult.column(tileCfg.entryIndexWidth - 1 downto 0) =/=
-          earlierResult.column(tileCfg.entryIndexWidth - 1 downto 0))
+  val currentResult = response.results(responseCursor)
+  val currentSlot = currentResult.column(tileCfg.entryIndexWidth - 1 downto 0)
+  val expectedColumn = UInt(cfg.coordinateWidth bits)
+  expectedColumn := tileColumnBase | currentSlot.resize(cfg.coordinateWidth)
+  val coordinateCollision = tileRow =/= currentResult.row ||
+    expectedColumn =/= currentResult.column
+  val currentSlotValid = Bool()
+  currentSlotValid := False
+  for (entry <- 0 until slots) {
+    when(currentSlot === entry) { currentSlotValid := slotValidAt(entry) }
   }
+  val currentNewEntry = responseAvailable && currentResult.valid &&
+    !coordinateCollision && !currentSlotValid
 
-  val accumulateResponse = responseFire && state === TrGsSpatialState.Run &&
-    !pe.io.response.payload.overflow && !responseBankConflict
-
-  val newEntry = Bits(cfg.outputLanes bits)
-  for (lane <- 0 until cfg.outputLanes) {
-    val result = response.results(lane)
-    val slot = result.column(tileCfg.entryIndexWidth - 1 downto 0)
-    val expectedColumn = UInt(cfg.coordinateWidth bits)
-    expectedColumn := tileColumnBase |
-      slot.resize(cfg.coordinateWidth)
-    val coordinateCollision = tileRow =/= result.row ||
-      expectedColumn =/= result.column
-    val selectedSlotValid = Bool()
-    selectedSlotValid := False
-    for (entry <- 0 until slots) {
-      when(slot === entry) { selectedSlotValid := slotValidAt(entry) }
-    }
-    newEntry(lane) := result.valid && !coordinateCollision && !selectedSlotValid
-    when(accumulateResponse && result.valid && !responseConflict) {
-      when(coordinateCollision) {
-        overflowReg := True
-      } otherwise {
-        for (entry <- 0 until slots) {
-          when(slot === entry) {
-            when(slotValidAt(entry)) {
-              slotValueAt(entry) :=
-                (slotValueAt(entry) + result.value).resized
-            } otherwise {
-              slotValidAt(entry) := True
-              slotValueAt(entry) := result.value
-            }
+  when(responseAvailable && currentResult.valid && !response.overflow) {
+    when(coordinateCollision) {
+      overflowReg := True
+    } otherwise {
+      for (entry <- 0 until slots) {
+        when(currentSlot === entry) {
+          when(slotValidAt(entry)) {
+            slotValueAt(entry) :=
+              (slotValueAt(entry) + currentResult.value).resized
+          } otherwise {
+            slotValidAt(entry) := True
+            slotValueAt(entry) := currentResult.value
           }
         }
       }
@@ -553,6 +537,11 @@ class TrGsSpatialEngine(
     when(commandFire) { inFlight := inFlight + 1 }
       .otherwise { inFlight := inFlight - 1 }
   }
+  when(responseFire) {
+    responseCursor := 0
+  } elsewhen (responseAvailable) {
+    responseCursor := responseCursor + 1
+  }
 
   switch(state) {
     is(TrGsSpatialState.Idle) {
@@ -590,13 +579,11 @@ class TrGsSpatialEngine(
         inputClosed := True
       }
       when(responseFire) {
-        when(responseConflict || responseBankConflict || response.overflow) {
-          overflowReg := True
-        }
+        when(response.overflow) { overflowReg := True }
         when(response.results(0).endOfTile) {
           inputClosed := False
           when(slotValidBits.orR ||
-              (!responseConflict && !responseBankConflict && newEntry.orR)) {
+              currentNewEntry) {
             outputCursor := 0
             outputGroupCursor := 0
             state := TrGsSpatialState.Output
@@ -647,6 +634,7 @@ class TrGsSpatialEngine(
     doneReg := False
     overflowReg := False
     modeErrorReg := False
+    responseCursor := 0
     when(inFlight === 0) { state := TrGsSpatialState.Idle }
       .otherwise { state := TrGsSpatialState.AbortDrain }
   }

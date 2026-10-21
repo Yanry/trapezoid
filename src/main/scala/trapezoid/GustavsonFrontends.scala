@@ -39,7 +39,7 @@ class BankedGustavsonBFifoCore(cfg: TrapezoidConfig, depth: Int)
     Reg(UInt(countWidth bits)) init 0))
   val outputValids = Vec((0 until cfg.localBanks).map(_ => RegInit(False)))
   val previousActive = RegNext(io.active) init True
-  val activeChanged = previousActive =/= io.active
+  val deactivated = previousActive && !io.active
 
   for (bank <- 0 until cfg.localBanks) {
     io.pushes(bank).ready := !io.clear && io.active &&
@@ -86,7 +86,7 @@ class BankedGustavsonBFifoCore(cfg: TrapezoidConfig, depth: Int)
       is(B"01") { occupancies(bank) := occupancies(bank) - 1 }
     }
 
-    when(io.clear || activeChanged) {
+    when(io.clear || deactivated) {
       readPointers(bank) := 0
       writePointers(bank) := 0
       occupancies(bank) := 0

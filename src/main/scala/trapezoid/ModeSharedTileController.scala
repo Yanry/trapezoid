@@ -3,12 +3,12 @@ package trapezoid
 import spinal.core._
 import spinal.lib._
 
-/** Tile-level TrIP/TrGT integration around one physical local buffer per row.
+/** Tile-level TrIP/TrGT integration around one PE and local buffer per row.
   *
   * TrIP reserves every PE row for one matrix tile. TrGT reserves rows
   * independently, allowing temporal Gustavson tiles to overlap when TrIP is
-  * idle. The compute schedulers are still separate; this component closes the
-  * paper-style local-buffer ownership and tile-boundary arbitration first.
+  * idle. Both schedulers issue into the same physical TrapezoidPERow, matching
+  * the paper's mode-selected compute and local-buffer organization.
   */
 class ModeSharedTileController(
     tripCfg: TrIpTileConfig,
@@ -45,9 +45,11 @@ class ModeSharedTileController(
   }
 
   val trip = new TrIpTileController(
-    tripCfg, modeSharedLocalBuffers = true)
+    tripCfg, modeSharedLocalBuffers = true, externalPeArray = true)
   val trgt = Array.fill(cfg.peRows)(
-    new TrGtSubrowScheduler(gustavsonCfg, externalFifoStorage = true))
+    new TrGtSubrowScheduler(gustavsonCfg,
+      externalFifoStorage = true, externalPe = true))
+  val peRows = Array.fill(cfg.peRows)(new TrapezoidPERow(cfg))
   val trgtOwned = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
 
   trip.io.clear := io.clear
@@ -72,6 +74,7 @@ class ModeSharedTileController(
   val tripClaimsArray = io.tripStart.valid && tripMayStart
   for (row <- 0 until cfg.peRows) {
     val scheduler = trgt(row)
+    val pe = peRows(row)
     val rowMayStart = !trip.io.busy && !tripClaimsArray && !trgtOwned(row)
 
     scheduler.io.clear := io.clear
@@ -93,6 +96,29 @@ class ModeSharedTileController(
     io.trgtDone(row) := scheduler.io.done
     io.trgtOverflow(row) := scheduler.io.overflow
     io.trgtUnsupportedMode(row) := scheduler.io.unsupportedMode
+
+    val commandFromTrgt = trgtOwned(row)
+    pe.io.command.valid := Mux(commandFromTrgt,
+      scheduler.io.peCommand.valid, trip.io.peCommands(row).valid)
+    pe.io.command.payload := Mux(commandFromTrgt,
+      scheduler.io.peCommand.payload, trip.io.peCommands(row).payload)
+    scheduler.io.peCommand.ready := pe.io.command.ready && commandFromTrgt
+    trip.io.peCommands(row).ready := pe.io.command.ready && !commandFromTrgt
+
+    // Response ownership is captured with the command so a clear or mode
+    // transition cannot redirect an in-flight PE response to the other client.
+    val responseForTrgt = RegInit(False)
+    when(pe.io.command.fire) {
+      responseForTrgt := commandFromTrgt
+    }
+    scheduler.io.peResponse.valid :=
+      pe.io.response.valid && responseForTrgt
+    scheduler.io.peResponse.payload := pe.io.response.payload
+    trip.io.peResponses(row).valid :=
+      pe.io.response.valid && !responseForTrgt
+    trip.io.peResponses(row).payload := pe.io.response.payload
+    pe.io.response.ready := Mux(responseForTrgt,
+      scheduler.io.peResponse.ready, trip.io.peResponses(row).ready)
 
     val owner = Mux(trgtOwned(row),
       LocalBufferOwner.Gustavson, LocalBufferOwner.TrIp)

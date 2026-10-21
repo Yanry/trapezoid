@@ -26,7 +26,7 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
     .addSimulatorFlag("-CFLAGS -std=c++14")
     .addSimulatorFlag("-LDFLAGS -std=c++14")
 
-  test("TrIP and TrGT switch ownership of the same local SRAM at tile boundaries") {
+  test("TrIP and TrGT share one PE row and local SRAM across tile boundaries") {
     simConfig.compile(new ModeSharedTileController(
       tripCfg, gustavsonCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)

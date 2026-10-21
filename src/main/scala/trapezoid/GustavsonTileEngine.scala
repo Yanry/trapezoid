@@ -17,7 +17,8 @@ object GustavsonTileState extends SpinalEnum {
 class GustavsonTileEngine(
     tileCfg: GustavsonTileConfig,
     peFactory: TrapezoidConfig => TrapezoidPERowComponent =
-      cfg => new TrapezoidPERow(cfg)
+      cfg => new TrapezoidPERow(cfg),
+    externalPe: Boolean = false
 ) extends Component {
   private val cfg = tileCfg.core
   private val responseIndexWidth = scala.math.max(1, log2Up(cfg.outputLanes))
@@ -31,6 +32,8 @@ class GustavsonTileEngine(
     val overflow = out Bool()
     val unsupportedMode = out Bool()
     val activeEntries = out UInt(tileCfg.entryCountWidth bits)
+    val peCommand = if (externalPe) master(Stream(PERowCommand(cfg))) else null
+    val peResponse = if (externalPe) slave(Stream(PERowResponse(cfg))) else null
   }
 
   val state = RegInit(GustavsonTileState.Accept)
@@ -67,13 +70,31 @@ class GustavsonTileEngine(
 
   val supportedMode = io.command.payload.mode === TrapezoidDataflow.TrGt ||
     io.command.payload.mode === TrapezoidDataflow.TrGs
-  val pe = peFactory(cfg)
-  pe.io.command.payload := io.command.payload
-  pe.io.command.valid := !io.clear && state === GustavsonTileState.Accept &&
+  val peCommandReady = Bool()
+  val peResponseValid = Bool()
+  val peResponsePayload = PERowResponse(cfg)
+  val peResponseReady = Bool()
+  val peCommandValid = !io.clear && state === GustavsonTileState.Accept &&
     io.command.valid && supportedMode
+  if (externalPe) {
+    io.peCommand.valid := peCommandValid
+    io.peCommand.payload := io.command.payload
+    peCommandReady := io.peCommand.ready
+    peResponseValid := io.peResponse.valid
+    peResponsePayload := io.peResponse.payload
+    io.peResponse.ready := peResponseReady
+  } else {
+    val pe = peFactory(cfg)
+    pe.io.command.valid := peCommandValid
+    pe.io.command.payload := io.command.payload
+    peCommandReady := pe.io.command.ready
+    peResponseValid := pe.io.response.valid
+    peResponsePayload := pe.io.response.payload
+    pe.io.response.ready := peResponseReady
+  }
   io.command.ready := !io.clear && state === GustavsonTileState.Accept &&
-    Mux(supportedMode, pe.io.command.ready, True)
-  pe.io.response.ready :=
+    Mux(supportedMode, peCommandReady, True)
+  peResponseReady :=
     (!io.clear && state === GustavsonTileState.WaitResponse) ||
       state === GustavsonTileState.AbortDrain
 
@@ -131,12 +152,12 @@ class GustavsonTileEngine(
     }
 
     is(GustavsonTileState.WaitResponse) {
-      when(pe.io.response.fire) {
-        responseReg := pe.io.response.payload
+      when(peResponseValid && peResponseReady) {
+        responseReg := peResponsePayload
         responseIndex := 0
         commandInFlight := False
-        when(pe.io.response.payload.overflow) { overflowReg := True }
-        when(pe.io.response.payload.count === 0) {
+        when(peResponsePayload.overflow) { overflowReg := True }
+        when(peResponsePayload.count === 0) {
           when(finalCommand) {
             when(entryCount === 0) {
               tileOpen := False
@@ -215,7 +236,7 @@ class GustavsonTileEngine(
     }
 
     is(GustavsonTileState.AbortDrain) {
-      when(!commandInFlight || pe.io.response.valid) {
+      when(!commandInFlight || peResponseValid) {
         commandInFlight := False
         state := GustavsonTileState.Accept
       }

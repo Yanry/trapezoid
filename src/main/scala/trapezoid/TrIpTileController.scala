@@ -119,7 +119,8 @@ class TrIpTileController(
     tileCfg: TrIpTileConfig,
     peFactory: TrapezoidConfig => TrapezoidPERowComponent =
       cfg => new TrapezoidPERow(cfg),
-    modeSharedLocalBuffers: Boolean = false
+    modeSharedLocalBuffers: Boolean = false,
+    externalPeArray: Boolean = false
 ) extends Component {
   private val cfg = tileCfg.core
   private val fiberCounterWidth = log2Up(cfg.maxFibers + 1)
@@ -151,6 +152,10 @@ class TrIpTileController(
       in Vec(LocalBufferOwner(), cfg.peRows) else null
     val gustavsonLocalBuffers = if (modeSharedLocalBuffers)
       Vec(slave(LocalBufferBus(cfg)), cfg.peRows) else null
+    val peCommands = if (externalPeArray)
+      Vec(master(Stream(PERowCommand(cfg))), cfg.peRows) else null
+    val peResponses = if (externalPeArray)
+      Vec(slave(Stream(PERowResponse(cfg))), cfg.peRows) else null
   }
 
   val aStorage = Vec((0 until tileCfg.maxRows).map(_ => Reg(CompressedFiber(cfg))))
@@ -239,10 +244,12 @@ class TrIpTileController(
   }
 
   val peResponses = Vec(PERowResponse(cfg), cfg.peRows)
-  val peArray = new TrIpPERowArray(cfg, peFactory)
-  for (pe <- 0 until cfg.peRows) {
-    peResponses(pe).assignFromBits(peArray.io.responsePayload(pe))
-  }
+  val peCommandReady = Bits(cfg.peRows bits)
+  val peResponseValid = Bits(cfg.peRows bits)
+  val commandA = Vec(Vec(CompressedFiber(cfg), cfg.maxFibers), cfg.peRows)
+  val commandB = Vec(CompressedFiber(cfg), cfg.maxFibers)
+  val peArray = if (externalPeArray) null
+    else new TrIpPERowArray(cfg, peFactory)
   val packers = Array.fill(cfg.peRows)(new DynamicColumnPacker(cfg))
 
   val candidateColumns = UInt(fiberCounterWidth bits)
@@ -273,22 +280,13 @@ class TrIpTileController(
       bLoaded(columnIndex) && bStorageValid(columnIndex)
   }
 
-  private val valuesPerChunk = scala.math.min(32, cfg.fiberWidth)
-  private val valueChunkCount =
-    (cfg.fiberWidth + valuesPerChunk - 1) / valuesPerChunk
   for (fiber <- 0 until cfg.maxFibers) {
-    peArray.io.b(fiber).valid := selectedBValid(fiber) &&
+    commandB(fiber).valid := selectedBValid(fiber) &&
       U(fiber, fiberCounterWidth bits) < batchColumns
-    peArray.io.b(fiber).tag := selectedBFibers(fiber).tag
-    peArray.io.b(fiber).mask := selectedBFibers(fiber).mask
-    for (chunk <- 0 until valueChunkCount) {
-      peArray.io.b(fiber).values(chunk) := 0
-    }
+    commandB(fiber).tag := selectedBFibers(fiber).tag
+    commandB(fiber).mask := selectedBFibers(fiber).mask
     for (value <- 0 until cfg.fiberWidth) {
-      val chunk = value / valuesPerChunk
-      val offset = (value % valuesPerChunk) * cfg.dataWidth
-      peArray.io.b(fiber).values(chunk)(offset + cfg.dataWidth - 1 downto offset) :=
-        selectedBFibers(fiber).values(value).asBits
+      commandB(fiber).values(value) := selectedBFibers(fiber).values(value)
     }
   }
 
@@ -307,31 +305,77 @@ class TrIpTileController(
         packers(pe).io.aMask(fiber) := aStorage(globalRow).mask
         when(validA) { rowActive(pe) := True }
 
-        peArray.io.a(pe)(fiber).valid := validA
-        peArray.io.a(pe)(fiber).tag := aStorage(globalRow).tag
-        peArray.io.a(pe)(fiber).mask := aStorage(globalRow).mask
-        for (chunk <- 0 until valueChunkCount) {
-          peArray.io.a(pe)(fiber).values(chunk) := 0
-        }
+        commandA(pe)(fiber).valid := validA
+        commandA(pe)(fiber).tag := aStorage(globalRow).tag
+        commandA(pe)(fiber).mask := aStorage(globalRow).mask
         for (value <- 0 until cfg.fiberWidth) {
-          val chunk = value / valuesPerChunk
-          val offset = (value % valuesPerChunk) * cfg.dataWidth
-          peArray.io.a(pe)(fiber).values(chunk)(
-            offset + cfg.dataWidth - 1 downto offset) :=
-            aStorage(globalRow).values(value).asBits
+          commandA(pe)(fiber).values(value) :=
+            aStorage(globalRow).values(value)
         }
       } else {
         packers(pe).io.aValid(fiber) := False
         packers(pe).io.aMask(fiber) := 0
-        peArray.io.a(pe)(fiber) := ChunkedTrIpFiber(cfg).getZero
+        commandA(pe)(fiber) := CompressedFiber(cfg).getZero
       }
 
       packers(pe).io.bValid(fiber) := selectedBValid(fiber)
       packers(pe).io.bMask(fiber) := selectedBFibers(fiber).mask
     }
   }
-  peArray.io.mode := modeReg
-  peArray.io.endOfTile := False
+
+  if (externalPeArray) {
+    for (pe <- 0 until cfg.peRows) {
+      io.peCommands(pe).payload.mode := modeReg
+      io.peCommands(pe).payload.endOfTile := False
+      io.peCommands(pe).payload.trip.a := commandA(pe)
+      io.peCommands(pe).payload.trip.b := commandB
+      io.peCommands(pe).payload.gustavson := GustavsonPayload(cfg).getZero
+      peCommandReady(pe) := io.peCommands(pe).ready
+      peResponseValid(pe) := io.peResponses(pe).valid
+      peResponses(pe) := io.peResponses(pe).payload
+    }
+  } else {
+    val valuesPerChunk = scala.math.min(32, cfg.fiberWidth)
+    val valueChunkCount =
+      (cfg.fiberWidth + valuesPerChunk - 1) / valuesPerChunk
+    for (fiber <- 0 until cfg.maxFibers) {
+      peArray.io.b(fiber).valid := commandB(fiber).valid
+      peArray.io.b(fiber).tag := commandB(fiber).tag
+      peArray.io.b(fiber).mask := commandB(fiber).mask
+      for (chunk <- 0 until valueChunkCount) {
+        peArray.io.b(fiber).values(chunk) := 0
+      }
+      for (value <- 0 until cfg.fiberWidth) {
+        val chunk = value / valuesPerChunk
+        val offset = (value % valuesPerChunk) * cfg.dataWidth
+        peArray.io.b(fiber).values(chunk)(
+          offset + cfg.dataWidth - 1 downto offset) :=
+          commandB(fiber).values(value).asBits
+      }
+    }
+    for (pe <- 0 until cfg.peRows; fiber <- 0 until cfg.maxFibers) {
+      peArray.io.a(pe)(fiber).valid := commandA(pe)(fiber).valid
+      peArray.io.a(pe)(fiber).tag := commandA(pe)(fiber).tag
+      peArray.io.a(pe)(fiber).mask := commandA(pe)(fiber).mask
+      for (chunk <- 0 until valueChunkCount) {
+        peArray.io.a(pe)(fiber).values(chunk) := 0
+      }
+      for (value <- 0 until cfg.fiberWidth) {
+        val chunk = value / valuesPerChunk
+        val offset = (value % valuesPerChunk) * cfg.dataWidth
+        peArray.io.a(pe)(fiber).values(chunk)(
+          offset + cfg.dataWidth - 1 downto offset) :=
+          commandA(pe)(fiber).values(value).asBits
+      }
+    }
+    peArray.io.mode := modeReg
+    peArray.io.endOfTile := False
+    peCommandReady := peArray.io.commandReady
+    peResponseValid := peArray.io.responseValid
+    for (pe <- 0 until cfg.peRows) {
+      peResponses(pe).assignFromBits(peArray.io.responsePayload(pe))
+    }
+  }
 
   // The usable B prefix is the minimum capacity of every active PE row.
   var globalChoice = candidateColumns
@@ -345,17 +389,24 @@ class TrIpTileController(
   io.candidateColumnCount := candidateColumns
   io.activeRows := rowActive.asBits
 
-  val allPeReady = peArray.io.commandReady.andR
+  val allPeReady = peCommandReady.andR
   val peCommandValid = !io.clear && state === TrIpTileState.Dispatch && allPeReady
-  peArray.io.commandValid := peCommandValid
+  if (externalPeArray) {
+    for (pe <- 0 until cfg.peRows) io.peCommands(pe).valid := peCommandValid
+  } else {
+    peArray.io.commandValid := peCommandValid
+  }
 
   val responseRegs = Vec((0 until cfg.peRows).map(_ => Reg(PERowResponse(cfg))))
-  val peResponseValid = peArray.io.responseValid
   val allResponsesValid = peResponseValid.andR
   val peResponseReady =
     (!io.clear && state === TrIpTileState.Collect && allResponsesValid) ||
       state === TrIpTileState.AbortDrain
-  peArray.io.responseReady := peResponseReady
+  if (externalPeArray) {
+    for (pe <- 0 until cfg.peRows) io.peResponses(pe).ready := peResponseReady
+  } else {
+    peArray.io.responseReady := peResponseReady
+  }
 
   val privateLocalBuffers = if (modeSharedLocalBuffers) {
     Array.empty[BankedLocalBuffer]

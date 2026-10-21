@@ -149,7 +149,8 @@ class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
   */
 class TrGtSubrowScheduler(
     tileCfg: GustavsonTileConfig,
-    externalFifoStorage: Boolean = false
+    externalFifoStorage: Boolean = false,
+    externalPe: Boolean = false
 ) extends Component {
   private val cfg = tileCfg.core
   private val subrows = cfg.localBanks
@@ -171,6 +172,8 @@ class TrGtSubrowScheduler(
     val fifoStorageActive = if (externalFifoStorage) in Bool() else null
     val fifoStorage = if (externalFifoStorage)
       master(LocalBufferBus(cfg)) else null
+    val peCommand = if (externalPe) master(Stream(PERowCommand(cfg))) else null
+    val peResponse = if (externalPe) slave(Stream(PERowResponse(cfg))) else null
   }
 
   // Keep the stationary A values in the same four logical subrows used by
@@ -218,8 +221,16 @@ class TrGtSubrowScheduler(
     io.fifoOccupancy(subrow) := fifos.io.occupancy(subrow)
   }
 
-  val engine = new GustavsonTileEngine(tileCfg)
+  val engine = new GustavsonTileEngine(tileCfg, externalPe = externalPe)
   engine.io.clear := io.clear
+  if (externalPe) {
+    io.peCommand.valid := engine.io.peCommand.valid
+    io.peCommand.payload := engine.io.peCommand.payload
+    engine.io.peCommand.ready := io.peCommand.ready
+    engine.io.peResponse.valid := io.peResponse.valid
+    engine.io.peResponse.payload := io.peResponse.payload
+    io.peResponse.ready := engine.io.peResponse.ready
+  }
   io.result <> engine.io.result
   io.busy := running || engine.io.busy
   io.done := controlDone || (!running && engine.io.done)

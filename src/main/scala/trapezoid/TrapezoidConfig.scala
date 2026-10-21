@@ -48,6 +48,21 @@ case class TrapezoidConfig(
   val fiberIndexWidth: Int = math.max(1, log2Up(maxFibers))
   val fiberValueIndexWidth: Int = math.max(1, log2Up(fiberWidth))
   val macLaneIndexWidth: Int = math.max(1, log2Up(macLanes))
+  val distributionWidth: Int = {
+    var width = 1
+    while (width < macLanes) width *= 2
+    width
+  }
+  val benesStageCount: Int = {
+    var levels = 0
+    var width = distributionWidth
+    while (width > 1) {
+      levels += 1
+      width /= 2
+    }
+    math.max(1, levels * 2 - 1)
+  }
+  val benesControlWidth: Int = distributionWidth * benesStageCount
   val aRegisterIndexWidth: Int = math.max(1, log2Up(macLanes))
   val macLanesPerSubrow: Int = macLanes / localBanks
   val matchCountWidth: Int = log2Up(maxFibers * maxFibers * fiberWidth + 1)

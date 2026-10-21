@@ -32,6 +32,14 @@ class TrapezoidStructureSpec extends AnyFunSuite {
     elaborate(new OperandDistributionNetwork(cfg))
   }
 
+  test("programmable Benes fabric elaborates") {
+    elaborate(new BenesDistributionFabric(cfg))
+  }
+
+  test("Benes broadcast controller elaborates") {
+    elaborate(new BenesBroadcastNetwork(cfg))
+  }
+
   test("four-bank local buffer elaborates") {
     elaborate(new BankedLocalBuffer(cfg))
   }

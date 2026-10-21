@@ -63,6 +63,8 @@
 
 当前实现完成了论文 MFIU 和 shift-unit 的等价逻辑功能。最多 `4 x 4 x fiberWidth` 个 pair-major 候选先并行形成，随后进入分层稳定 compaction tree：每个节点根据左子树有效数，通过多级 shift 将右侧紧凑流拼接到左侧，而不是让每个 MAC lane 比较全部候选的全交叉网络。该网络保持 fiber-pair 和 K-coordinate 顺序，并只保留前 `macLanes` 项；独立计数路径仍报告完整 effectual computation 数和 overflow。shift unit 首先计算每条 A/B fiber 中真正参与至少一次乘法的 coordinate，再用原 bitmask 把 participating bit 分层压缩到 compressed-value 顺序，最后按 fiber offset 合并成最多 `macLanes` 个连续物理 source 槽。每个 effectual route 同时携带原 fiber/value index 和新的全局 source index；同一个非零值被多个乘法复用时，这些 route 指向同一 source 槽。PE row 已实例化两套独立 `OperandDistributionNetwork` 边界，A/B 网络都只接收 `macLanes` 个 source，而不再让每个 MAC lane 直接从 `maxFibers x fiberWidth` 个命令值中动态读取。当前 network 已将 source-index selector 展开为显式 radix-2 分发树，控制扇入为 2、逻辑深度为 O(`log N`)，并保留同一 source 被多个 MAC lane 复用的多播语义；它仍不是论文的 O(`N log N`) Benes switch fabric，runtime Benes 控制生成尚未接入。
 
+`BenesDistributionFabric` 已作为独立可综合组件实现，控制位宽由 `TrapezoidConfig.benesControlWidth` 统一导出，并通过每个 2x2 switch 的独立输出选择支持 source multicast。当前已补充 `BenesBroadcastControlGenerator`，可由运行时 source index 生成单源全多播控制，并由 `BenesBroadcastNetwork` 做 RTL 验证；通用多源路由控制仍需由 scheduler/MFIU 生成。PE row 仍使用 radix-2 fallback，待通用 runtime control generator 验证后切换。
+
 ### 2.4 动态 B 列打包
 
 `DynamicColumnPacker` 会计算不同 B column 前缀产生的 effectual computation 数，并选择不会超过 PE row MAC 数量的最大列数。

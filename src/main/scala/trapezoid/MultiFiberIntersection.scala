@@ -330,12 +330,6 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
   * compressed-value arrays at every MAC lane.
   */
 class OperandDistributionNetwork(cfg: TrapezoidConfig) extends Component {
-  private val distributionWidth = {
-    var width = 1
-    while (width < cfg.macLanes) width *= 2
-    width
-  }
-
   private def selectValue(values: Seq[SInt], index: UInt): SInt = {
     var level = values.toVector
     var bit = 0
@@ -374,11 +368,11 @@ class OperandDistributionNetwork(cfg: TrapezoidConfig) extends Component {
   // A power-of-two radix tree makes the fan-in and logic depth explicit. The
   // input vector is padded with invalid sources when macLanes is not a power
   // of two; an out-of-range route therefore becomes a route error.
-  private val paddedSources = Vector.tabulate(distributionWidth) { index =>
+  private val paddedSources = Vector.tabulate(cfg.distributionWidth) { index =>
     if (index < cfg.macLanes) io.sources(index)
     else S(0, cfg.dataWidth bits)
   }
-  private val paddedSourceValid = Vector.tabulate(distributionWidth) { index =>
+  private val paddedSourceValid = Vector.tabulate(cfg.distributionWidth) { index =>
     if (index < cfg.macLanes) io.sourceValid(index) else False
   }
 
@@ -391,6 +385,139 @@ class OperandDistributionNetwork(cfg: TrapezoidConfig) extends Component {
       selectedValue, S(0, cfg.dataWidth bits))
   }
   io.routeError := laneErrors.orR
+}
+
+/** Programmable multicast Benes fabric used by the paper-style distribution
+  * network. Each 2x2 switch has an independent select bit per output, so a
+  * source can be copied to multiple destinations. The control generator is a
+  * separate block because its stateful routing algorithm is not part of the
+  * data path.
+  */
+class BenesDistributionFabric(cfg: TrapezoidConfig) extends Component {
+  private val fabricWidth = cfg.distributionWidth
+  private val controlWidth = cfg.benesControlWidth
+  private val payloadWidth = cfg.dataWidth + 1
+
+  val io = new Bundle {
+    val sources = in Vec(Bits(payloadWidth bits), cfg.macLanes)
+    val controls = in Bits(controlWidth bits)
+    val outputs = out Vec(Bits(payloadWidth bits), cfg.macLanes)
+  }
+
+  private def route(inputs: Vector[Bits], controls: Vector[Bool]): Vector[Bits] = {
+    require(inputs.nonEmpty && (inputs.length & (inputs.length - 1)) == 0)
+    if (inputs.length == 1) {
+      inputs
+    } else if (inputs.length == 2) {
+      Vector(
+        Mux(controls(0), inputs(1), inputs(0)),
+        Mux(controls(1), inputs(1), inputs(0)))
+    } else {
+      val width = inputs.length
+      val firstControls = controls.take(width)
+      val subnetWidth = width / 2
+      val subnetLevels = 2 * log2Up(subnetWidth) - 1
+      val subnetControlWidth = subnetWidth * subnetLevels
+      val firstHorizontal = Vector.tabulate(subnetWidth) { switch =>
+        Mux(firstControls(switch * 2), inputs(switch * 2 + 1),
+          inputs(switch * 2))
+      }
+      val firstDiagonal = Vector.tabulate(subnetWidth) { switch =>
+        Mux(firstControls(switch * 2 + 1), inputs(switch * 2 + 1),
+          inputs(switch * 2))
+      }
+      val upperControls = controls.slice(width, width + subnetControlWidth)
+      val lowerControls = controls.slice(width + subnetControlWidth,
+        width + subnetControlWidth * 2)
+      val upper = route(firstHorizontal, upperControls)
+      val lower = route(firstDiagonal, lowerControls)
+      val lastControls = controls.takeRight(width)
+      Vector.tabulate(width) { output =>
+        val switch = output / 2
+        val select = lastControls(output)
+        if (output % 2 == 0) Mux(select, lower(switch), upper(switch))
+        else Mux(select, lower(switch), upper(switch))
+      }
+    }
+  }
+
+  private val paddedSources = Vector.tabulate(fabricWidth) { index =>
+    if (index < cfg.macLanes) io.sources(index)
+    else B(0, payloadWidth bits)
+  }
+  private val routed = route(paddedSources, (0 until controlWidth)
+    .map(io.controls(_)).toVector)
+  for (index <- 0 until cfg.macLanes) {
+    io.outputs(index) := routed(index)
+  }
+}
+
+/** Generates a Benes schedule that broadcasts one selected source to every
+  * output. This is the common multicast case when one compressed operand is
+  * reused by several effectual products.
+  */
+class BenesBroadcastControlGenerator(cfg: TrapezoidConfig) extends Component {
+  val io = new Bundle {
+    val sourceIndex = in UInt(cfg.macLaneIndexWidth bits)
+    val controls = out Bits(cfg.benesControlWidth bits)
+  }
+
+  private def zeroControls(width: Int): Vector[Bool] =
+    Vector.fill(width)(False)
+
+  private def broadcastControls(
+      width: Int,
+      sourceIndex: UInt): Vector[Bool] = {
+    require(width >= 1 && (width & (width - 1)) == 0)
+    if (width == 1) {
+      Vector.empty
+    } else if (width == 2) {
+      Vector(sourceIndex(0), sourceIndex(0))
+    } else {
+      val subnetWidth = width / 2
+      val pairIndex = sourceIndex(sourceIndex.getWidth - 1 downto 1)
+      val first = Vector.tabulate(width) { control =>
+        if (control % 2 == 0) {
+          val pair = U(control / 2, pairIndex.getWidth bits)
+          pairIndex === pair && sourceIndex(0)
+        } else {
+          False
+        }
+      }
+      val upper = broadcastControls(subnetWidth, pairIndex)
+      val subnetLevels = 2 * log2Up(subnetWidth) - 1
+      val lower = zeroControls(subnetWidth * subnetLevels)
+      val last = zeroControls(width)
+      first ++ upper ++ lower ++ last
+    }
+  }
+
+  private val generated = broadcastControls(cfg.distributionWidth,
+    io.sourceIndex)
+  require(generated.length == cfg.benesControlWidth)
+  for (index <- generated.indices) {
+    io.controls(index) := generated(index)
+  }
+}
+
+/** Complete source-to-all-lanes multicast path used to validate the runtime
+  * Benes control interface independently from the PE-row scheduler.
+  */
+class BenesBroadcastNetwork(cfg: TrapezoidConfig) extends Component {
+  private val payloadWidth = cfg.dataWidth + 1
+
+  val io = new Bundle {
+    val sources = in Vec(Bits(payloadWidth bits), cfg.macLanes)
+    val sourceIndex = in UInt(cfg.macLaneIndexWidth bits)
+    val outputs = out Vec(Bits(payloadWidth bits), cfg.macLanes)
+  }
+
+  val controlGenerator = new BenesBroadcastControlGenerator(cfg)
+  val fabric = new BenesDistributionFabric(cfg)
+  controlGenerator.io.sourceIndex := io.sourceIndex
+  fabric.io.sources := io.sources
+  fabric.io.controls := controlGenerator.io.controls
+  io.outputs := fabric.io.outputs
 }
 
 /** Chooses the largest prefix (one through four) of B columns that fits in a

@@ -30,9 +30,12 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     simConfig.compile(new BankedGustavsonBFifo(cfg, depth = 2)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       dut.io.clear #= false
+      dut.io.owner #= LocalBufferOwner.Gustavson
       for (bank <- 0 until cfg.localBanks) {
         dut.io.pushes(bank).valid #= false
         dut.io.pops(bank).ready #= false
+        dut.io.tripBuffer.writes(bank).valid #= false
+        dut.io.tripBuffer.readCommands(bank).valid #= false
       }
 
       def drivePush(bank: Int, column: Int, value: Int): Unit = {
@@ -83,6 +86,39 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
       assert(popOne(0) == (0, 3, 33))
       assert(dut.io.occupancy(0).toInt == 0)
       assert(dut.io.occupancy(1).toInt == 0)
+    }
+  }
+
+  test("TrIP can own the physical FIFO SRAM and receives an in-flight read after owner changes") {
+    simConfig.compile(new BankedGustavsonBFifo(cfg, depth = 2)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.owner #= LocalBufferOwner.TrIp
+      for (bank <- 0 until cfg.localBanks) {
+        dut.io.pushes(bank).valid #= false
+        dut.io.pops(bank).ready #= false
+        dut.io.tripBuffer.writes(bank).valid #= false
+        dut.io.tripBuffer.readCommands(bank).valid #= false
+      }
+
+      val data = BigInt("123456789abcdef", 16)
+      dut.io.tripBuffer.writes(2).payload.address #= 3
+      dut.io.tripBuffer.writes(2).payload.data #= data
+      dut.io.tripBuffer.writes(2).payload.mask #=
+        ((BigInt(1) << cfg.localLineBytes) - 1)
+      dut.io.tripBuffer.writes(2).valid #= true
+      dut.clockDomain.waitSampling()
+      dut.io.tripBuffer.writes(2).valid #= false
+
+      dut.io.tripBuffer.readCommands(2).payload #= 3
+      dut.io.tripBuffer.readCommands(2).valid #= true
+      dut.clockDomain.waitSampling()
+      dut.io.tripBuffer.readCommands(2).valid #= false
+      dut.io.owner #= LocalBufferOwner.Gustavson
+      sleep(1)
+
+      assert(dut.io.tripBuffer.readResponses(2).valid.toBoolean)
+      assert(dut.io.tripBuffer.readResponses(2).payload.toBigInt == data)
     }
   }
 

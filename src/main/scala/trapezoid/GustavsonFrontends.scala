@@ -20,12 +20,15 @@ class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
 
   val io = new Bundle {
     val clear = in Bool()
+    val owner = in(LocalBufferOwner())
+    val tripBuffer = slave(LocalBufferBus(cfg))
     val pushes = Vec(slave(Stream(GustavsonB(cfg))), cfg.localBanks)
     val pops = Vec(master(Stream(GustavsonB(cfg))), cfg.localBanks)
     val occupancy = out Vec(UInt(countWidth bits), cfg.localBanks)
   }
 
-  val storage = new BankedLocalBuffer(cfg)
+  val storage = new ModeSharedLocalBuffer(cfg)
+  storage.io.owner := io.owner
   val readPointers = Vec((0 until cfg.localBanks).map(_ =>
     Reg(UInt(pointerWidth bits)) init 0))
   val writePointers = Vec((0 until cfg.localBanks).map(_ =>
@@ -35,27 +38,40 @@ class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
   val storedCounts = Vec((0 until cfg.localBanks).map(_ =>
     Reg(UInt(countWidth bits)) init 0))
   val outputValids = Vec((0 until cfg.localBanks).map(_ => RegInit(False)))
+  val previousOwner = RegNext(io.owner) init LocalBufferOwner.Gustavson
+  val ownerChanged = previousOwner =/= io.owner
 
   for (bank <- 0 until cfg.localBanks) {
-    io.pushes(bank).ready := !io.clear && occupancies(bank) =/= depth
-    io.pops(bank).valid := !io.clear && outputValids(bank)
+    storage.io.trip.writes(bank).valid := io.tripBuffer.writes(bank).valid
+    storage.io.trip.writes(bank).payload := io.tripBuffer.writes(bank).payload
+    storage.io.trip.readCommands(bank).valid :=
+      io.tripBuffer.readCommands(bank).valid
+    storage.io.trip.readCommands(bank).payload :=
+      io.tripBuffer.readCommands(bank).payload
+    io.tripBuffer.readResponses(bank) := storage.io.trip.readResponses(bank)
+
+    val gustavsonActive = io.owner === LocalBufferOwner.Gustavson
+    io.pushes(bank).ready := !io.clear && gustavsonActive &&
+      occupancies(bank) =/= depth
+    io.pops(bank).valid := !io.clear && gustavsonActive && outputValids(bank)
     io.pops(bank).payload.assignFromBits(
-      storage.io.bus.readResponses(bank).payload(recordWidth - 1 downto 0))
+      storage.io.gustavson.readResponses(bank).payload(
+        recordWidth - 1 downto 0))
     io.occupancy(bank) := occupancies(bank)
 
     val writeData = Bits(cfg.localLineWidth bits)
     writeData := 0
     writeData(recordWidth - 1 downto 0) := io.pushes(bank).payload.asBits
-    storage.io.bus.writes(bank).valid := io.pushes(bank).fire
-    storage.io.bus.writes(bank).payload.address :=
+    storage.io.gustavson.writes(bank).valid := io.pushes(bank).fire
+    storage.io.gustavson.writes(bank).payload.address :=
       writePointers(bank).resize(cfg.localAddressWidth)
-    storage.io.bus.writes(bank).payload.data := writeData
-    storage.io.bus.writes(bank).payload.mask.setAll()
+    storage.io.gustavson.writes(bank).payload.data := writeData
+    storage.io.gustavson.writes(bank).payload.mask.setAll()
 
-    val issueRead = !io.clear && storedCounts(bank) =/= 0 &&
+    val issueRead = !io.clear && gustavsonActive && storedCounts(bank) =/= 0 &&
       (!outputValids(bank) || io.pops(bank).fire)
-    storage.io.bus.readCommands(bank).valid := issueRead
-    storage.io.bus.readCommands(bank).payload :=
+    storage.io.gustavson.readCommands(bank).valid := issueRead
+    storage.io.gustavson.readCommands(bank).payload :=
       readPointers(bank).resize(cfg.localAddressWidth)
 
     when(io.pushes(bank).fire) {
@@ -79,7 +95,7 @@ class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
       is(B"01") { occupancies(bank) := occupancies(bank) - 1 }
     }
 
-    when(io.clear) {
+    when(io.clear || ownerChanged) {
       readPointers(bank) := 0
       writePointers(bank) := 0
       occupancies(bank) := 0
@@ -136,6 +152,13 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
 
   val fifos = new BankedGustavsonBFifo(cfg, tileCfg.fifoDepthPerSubrow)
   fifos.io.clear := io.clear
+  fifos.io.owner := LocalBufferOwner.Gustavson
+  for (bank <- 0 until cfg.localBanks) {
+    fifos.io.tripBuffer.writes(bank).valid := False
+    fifos.io.tripBuffer.writes(bank).payload := LocalBufferWrite(cfg).getZero
+    fifos.io.tripBuffer.readCommands(bank).valid := False
+    fifos.io.tripBuffer.readCommands(bank).payload := 0
+  }
   for (subrow <- 0 until subrows) {
     fifos.io.pushes(subrow).valid := io.bPush(subrow).valid && running && !finishSeen
     fifos.io.pushes(subrow).payload := io.bPush(subrow).payload

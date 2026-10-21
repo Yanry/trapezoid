@@ -44,6 +44,10 @@ class TrapezoidStructureSpec extends AnyFunSuite {
     elaborate(new BankedLocalBuffer(cfg))
   }
 
+  test("mode-shared four-bank local buffer elaborates") {
+    elaborate(new ModeSharedLocalBuffer(cfg))
+  }
+
   test("paper configuration uses sixteen result lanes and per-row buffer capacity") {
     assert(TrapezoidConfig.paper.outputLanes == 16)
     assert(TrapezoidConfig.paper.mrnReductionLevels == 7)

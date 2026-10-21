@@ -120,11 +120,13 @@ PE row 已拆分为以下弹性流水阶段：
 
 `ModeSharedLocalBuffer` 在一个物理 `BankedLocalBuffer` 前增加 TrIP/Gustavson mode ownership。新请求只进入当前 owner；每个 bank 独立保存同步读请求的 owner，因此即使下一拍切换 mode，返回数据仍送回原客户端。`BankedGustavsonBFifo` 已使用该共享实例：Gustavson owner 下四个 bank 作为四条 TrGT subrow FIFO，TrIP owner 下 FIFO 状态冻结，四 bank SRAM 可由 TrIP 端口直接访问；owner 改变时队列指针、occupancy 和预取 valid 自动失效，但 SRAM 本体不做高功耗清零。
 
-`TrIpTileController` 的 `modeSharedLocalBuffers` 配置现在会把每个 PE row 的 scatter、跨 K 读改写和结果读回直接连接到 `ModeSharedLocalBuffer.trip`，同时向统一顶层暴露 owner 和 Gustavson 客户端端口。RTL 测试已验证 TrIP 写入的结果在切换 owner 后可由 Gustavson 端口从同一 bank/address 读出。owner 必须在 TrIP controller 空闲时切换。默认配置仍保留私有 buffer，以维持已有生成入口的接口兼容；下一步需要让统一四 mode 顶层启用共享配置，并把实际 TrGT/TrGS 存储客户端连接到暴露端口。
+`TrIpTileController` 的 `modeSharedLocalBuffers` 配置现在会把每个 PE row 的 scatter、跨 K 读改写和结果读回直接连接到 `ModeSharedLocalBuffer.trip`，同时向统一顶层暴露 owner 和 Gustavson 客户端端口。RTL 测试已验证 TrIP 写入的结果在切换 owner 后可由 Gustavson 端口从同一 bank/address 读出。owner 必须在 TrIP controller 空闲时切换。默认配置仍保留私有 buffer，以维持已有生成入口的接口兼容。
+
+TrGT FIFO 已进一步拆分为不包含 SRAM 的 `BankedGustavsonBFifoCore` 和兼容旧接口的共享存储 wrapper。`TrGtSubrowScheduler(externalFifoStorage = true)` 可直接把四路 FIFO 的读写命令接到 `TrIpTileController.gustavsonLocalBuffers`，`fifoStorageActive` 负责模式隔离，所有权变化时只清除 FIFO 指针、occupancy 和预取 valid，不清空 SRAM 数据。Verilator 测试已把该外接 scheduler 连接到真实 `BankedLocalBuffer`，验证同步读预取、两次 B 元素写入/发射和最终乘加结果。下一步是增加统一四 mode 顶层的 owner 仲裁并连接这些现有端口，而不是再复制一套 TrGT SRAM。
 
 Gustavson cache adapter 对两种 mode 使用不同分发方式。TrGT 在 cache line 内用游标跳过无效槽，并把每个有效 B 元素送到 `aIndex` 所属的 subrow lane；因此一条含 `E` 个有效元素的缓存行需要 `E` 次 PE 命令握手，末元素才结束该行或 tile。TrGS 则把一条有序缓存行中的全部有效元素在一次命令中空间展开，并统一引用广播的 A0。上述发射周期属于 cache-to-PE 分发阶段，后面还要叠加 PE 流水、tile accumulator 和结果写回周期。
 
-该组织在 bank 数、word 数和深度上对应论文的 `4 banks x 4 words x 128 lines`。当前整数验证配置的 word 宽度是 `accumulatorWidth`，paper 配置仍为 72-bit 整数累加值；只有替换成 FP32 数据通路后，物理容量才严格等于论文的 8KB/PE row。TrGT 的四个 subrow FIFO 已通过一个 `BankedGustavsonBFifo` 共同使用单个四 bank `BankedLocalBuffer`，不再为四个 subrow 分别例化 typed `Mem`。当前 TrIP controller 和 TrGT frontend 仍是独立执行顶层，因此两者尚未通过 mode 所有权仲裁共享同一个物理实例。
+该组织在 bank 数、word 数和深度上对应论文的 `4 banks x 4 words x 128 lines`。当前整数验证配置的 word 宽度是 `accumulatorWidth`，paper 配置仍为 72-bit 整数累加值；只有替换成 FP32 数据通路后，物理容量才严格等于论文的 8KB/PE row。TrGT 的四个 subrow FIFO 共同使用一个四 bank `BankedLocalBuffer`，也可以通过外接总线使用 TrIP controller 内的 mode-shared 实例，不再为四个 subrow 分别例化 typed `Mem`。当前缺口位于系统集成层：TrIP controller 和 TrGT frontend 仍是独立执行顶层，尚无统一状态机在 tile 边界切换 owner 并复用同一套 PE row。
 
 ### 2.7 顶层阵列和 RTL 生成
 
@@ -292,7 +294,7 @@ sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialEngine'
 sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 ```
 
-这些模块已经实现论文数据移动方式的功能等价路径。paper 生成入口启用 16-result 宽写回：128 个 accumulator 槽被划分为 8 个对齐 line，全空 line 会被跳过，每个非空 line 使用一拍排空，满 C row 从 128 拍降为 8 拍。该结构避免了把任意 128 个槽全局压缩到 16 lane 所需的大型 compactor，更接近本地 bank/line 读取。TrGT 的四路 FIFO 已统一到一个四 bank `BankedLocalBuffer`，但该实例还没有与 TrIP controller 的结果 buffer 进行 mode 级共享。TrGS accumulator 现在只为每个 slot 保存 valid/value，整行共享一个 row 和对齐 column-block 基址，删除了 128 份重复 row/column 寄存器及其翻转；跨 row 或跨 column block 的输入会置 overflow。当前仍通过带坐标的组合适配完成分发，尚未替换为流水化物理分发网络。
+这些模块已经实现论文数据移动方式的功能等价路径。paper 生成入口启用 16-result 宽写回：128 个 accumulator 槽被划分为 8 个对齐 line，全空 line 会被跳过，每个非空 line 使用一拍排空，满 C row 从 128 拍降为 8 拍。该结构避免了把任意 128 个槽全局压缩到 16 lane 所需的大型 compactor，更接近本地 bank/line 读取。TrGT 的四路 FIFO 已统一到一个四 bank `BankedLocalBuffer`，FIFO 控制器也已支持直接外接 TrIP 的 mode-shared buffer；尚未完成的是统一顶层的 owner 切换和 PE row 复用。TrGS accumulator 现在只为每个 slot 保存 valid/value，整行共享一个 row 和对齐 column-block 基址，删除了 128 份重复 row/column 寄存器及其翻转；跨 row 或跨 column block 的输入会置 overflow。当前仍通过带坐标的组合适配完成分发，尚未替换为流水化物理分发网络。
 
 当前 Gustavson 前端还增加了两项物理约束：
 
@@ -584,13 +586,13 @@ sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 
 ### 4.2 缺少全局 cache 和 DMA
 
-当前已实现一个参数化 multi-client、multi-bank direct-mapped 读 cache，以及每 bank 一个独立 miss 的共享 refill 协议。TrIP 矩阵前端和 Gustavson B-row 前端都已经与实际 cache、外部 refill 端口封装成完整读系统，但仍未实现论文中的 4 个 cache cluster、完整 32 x 32 cluster 互连、写 cache/dirty eviction、HBM 请求和 DMA。通用顶层的每 PE row 本地 buffer 仍由外部端口控制；TrIP tile controller 已改为每个 PE row 独占一个四 bank 结果 buffer，完成并行 scatter 和有序读回。后续仍需把 TrIP 与 Gustavson 的两套存储封装统一成同一物理 SRAM。
+当前已实现一个参数化 multi-client、multi-bank direct-mapped 读 cache，以及每 bank 一个独立 miss 的共享 refill 协议。TrIP 矩阵前端和 Gustavson B-row 前端都已经与实际 cache、外部 refill 端口封装成完整读系统，但仍未实现论文中的 4 个 cache cluster、完整 32 x 32 cluster 互连、写 cache/dirty eviction、HBM 请求和 DMA。TrIP tile controller 已支持每个 PE row 使用 mode-shared 四 bank buffer，TrGT scheduler 也已支持作为外部存储客户端接入；后续需要在统一执行顶层完成连接、owner 仲裁和 tile 生命周期控制。
 
 ### 4.3 Gustavson 存储和并行调度仍待完成
 
 当前 TrGT/TrGS 已能在任意 lane density 下完成命令内归约、跨命令累加、有序 flush、SRAM subrow FIFO 调度、多 PE row 分配和共享结果仲裁，但尚未完成：
 
-- 在统一执行顶层中增加 mode 所有权仲裁，让 TrGT 的 `BankedLocalBuffer` 与 TrIP 结果 buffer 共享同一个物理实例；
+- 在统一执行顶层中连接现有共享端口并增加 mode 所有权仲裁，使 TrIP/TrGT 在 tile 边界切换同一个物理实例，同时复用同一套 PE row；
 - 将当前有序寄存器 accumulator 替换为可扩展的本地 buffer/双流 merge tree；
 - 在 first-free 分配之上增加 row 成本估计、公平仲裁和描述符驱动的负载均衡；
 - 从 CSR row pointer 自动生成 B-row cache 区间，以及 DMA/HBM refill 流程。
@@ -657,7 +659,7 @@ sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 
 验收标准：TrGT 和 TrGS 可以消费完整 CSR row，并直接输出完整、有序的 C row。
 
-六项均已完成可仿真的功能版本：第 2 项使用四个同步 `Mem` bank 推断 SRAM，但尚未与 TrIP 结果 buffer 复用同一物理实例。TrGS 已具有广播/列坐标分发路径，多个命令可持续累加相同坐标；有序寄存器 accumulator 已删除 flush 阶段的全表最小选择网络，并能在 `endOfTile` 后每周期输出一个结果。共享调度器可让多个 PE row 重叠执行，并保证一个 tile 的命令与输出边界不被拆散。固定宽度 B-row 区域已经通过统一 cache 完成 miss/refill/hit，后续重点是解析 CSR row pointer、统一物理 SRAM 和将逐项插入替换为流水化双流 merge tree。
+六项均已完成可仿真的功能版本：第 2 项使用四个同步 SRAM bank，TrGT FIFO 控制已经可以外接 TrIP 的 mode-shared buffer，并由 RTL 测试覆盖；统一四 mode 顶层尚未连接该路径。TrGS 已具有广播/列坐标分发路径，多个命令可持续累加相同坐标；有序寄存器 accumulator 已删除 flush 阶段的全表最小选择网络，并能在 `endOfTile` 后每周期输出一个结果。共享调度器可让多个 PE row 重叠执行，并保证一个 tile 的命令与输出边界不被拆散。固定宽度 B-row 区域已经通过统一 cache 完成 miss/refill/hit，后续重点是解析 CSR row pointer、统一 PE row/owner 控制和将逐项插入替换为流水化双流 merge tree。
 
 ### 阶段 4：实现多级存储系统（统一读协议、bank 仲裁与 refill 已完成）
 
@@ -695,7 +697,7 @@ sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 
 ## 6. 建议的近期任务
 
-PE row 方向下一轮应优先完成统一物理本地存储：把 TrGT typed FIFO、A register、TrIP 结果 scatter buffer 和 Gustavson partial-sum storage 映射到可按 mode 切换用途的同一组四 bank SRAM；随后用 16/32/64/128 lane 配置综合新的流水化 PE row，根据报告确定 MFIU、Benes 路由和 reduction tree 的附加寄存器位置。
+PE row 方向下一轮应优先完成统一执行顶层：把已经外接化的 TrGT FIFO 连接到 `TrIpTileController.gustavsonLocalBuffers`，在 tile 边界切换 owner，并让 TrIP/TrGT/TrGS 选择同一套 PE row 命令入口和响应出口。之后再把 TrGS partial-sum storage 映射到这组四 bank SRAM，并用 16/32/64/128 lane 配置综合新的流水化 PE row，根据报告确定 MFIU、Benes 路由和 reduction tree 的附加寄存器位置。
 
 系统方向仍需实现简单 DMA/AXI refill 和 CSR/CSC row/column pointer walker，使软件不再直接提供固定宽度 fiber/B-row 地址。cache/Gustavson 仲裁器也仍需增加 round-robin 公平策略。
 

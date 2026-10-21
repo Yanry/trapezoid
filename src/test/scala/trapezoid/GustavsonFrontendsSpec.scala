@@ -1,10 +1,63 @@
 package trapezoid
 
 import org.scalatest.funsuite.AnyFunSuite
+import spinal.core._
 import spinal.core.sim._
+import spinal.lib._
 
 import scala.collection.mutable
 import scala.util.Random
+
+class ExternalBufferedTrGtHarness(tileCfg: GustavsonTileConfig)
+    extends Component {
+  private val cfg = tileCfg.core
+
+  val io = new Bundle {
+    val clear = in Bool()
+    val aLoad = slave(Stream(IndexedGustavsonA(cfg)))
+    val start = slave(Stream(GustavsonStart()))
+    val bPush = Vec(slave(Stream(GustavsonB(cfg))), cfg.localBanks)
+    val finish = in Bool()
+    val result = master(Stream(MatrixResult(cfg)))
+    val done = out Bool()
+    val overflow = out Bool()
+    val unsupportedMode = out Bool()
+    val acceptedBElements = out UInt(32 bits)
+    val issuedBElements = out UInt(32 bits)
+  }
+
+  val scheduler = new TrGtSubrowScheduler(
+    tileCfg, externalFifoStorage = true)
+  val storage = new BankedLocalBuffer(cfg)
+
+  scheduler.io.clear := io.clear
+  scheduler.io.fifoStorageActive := True
+  scheduler.io.aLoad.valid := io.aLoad.valid
+  scheduler.io.aLoad.payload := io.aLoad.payload
+  io.aLoad.ready := scheduler.io.aLoad.ready
+  scheduler.io.start.valid := io.start.valid
+  scheduler.io.start.payload := io.start.payload
+  io.start.ready := scheduler.io.start.ready
+  scheduler.io.finish := io.finish
+  for (bank <- 0 until cfg.localBanks) {
+    scheduler.io.bPush(bank).valid := io.bPush(bank).valid
+    scheduler.io.bPush(bank).payload := io.bPush(bank).payload
+    io.bPush(bank).ready := scheduler.io.bPush(bank).ready
+    storage.io.bus.writes(bank) := scheduler.io.fifoStorage.writes(bank)
+    storage.io.bus.readCommands(bank) :=
+      scheduler.io.fifoStorage.readCommands(bank)
+    scheduler.io.fifoStorage.readResponses(bank) :=
+      storage.io.bus.readResponses(bank)
+  }
+  io.result.valid := scheduler.io.result.valid
+  io.result.payload := scheduler.io.result.payload
+  scheduler.io.result.ready := io.result.ready
+  io.done := scheduler.io.done
+  io.overflow := scheduler.io.overflow
+  io.unsupportedMode := scheduler.io.unsupportedMode
+  io.acceptedBElements := scheduler.io.acceptedBElements
+  io.issuedBElements := scheduler.io.issuedBElements
+}
 
 class GustavsonFrontendsSpec extends AnyFunSuite {
   private val cfg = TrapezoidConfig(
@@ -217,6 +270,79 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
         s"accepted=${dut.io.acceptedBElements.toLong}, " +
           s"issued=${dut.io.issuedBElements.toLong}")
       assert(observed.map(_._4) == Seq(false, false, false, false, false, true))
+    }
+  }
+
+  test("TrGT scheduler runs through an externally supplied synchronous SRAM") {
+    simConfig.compile(new ExternalBufferedTrGtHarness(tileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.aLoad.valid #= false
+      dut.io.start.valid #= false
+      dut.io.finish #= false
+      dut.io.result.ready #= false
+      for (subrow <- 0 until cfg.localBanks) {
+        dut.io.bPush(subrow).valid #= false
+      }
+
+      dut.io.aLoad.payload.index #= 0
+      dut.io.aLoad.payload.element.valid #= true
+      dut.io.aLoad.payload.element.row #= 5
+      dut.io.aLoad.payload.element.k #= 0
+      dut.io.aLoad.payload.element.value #= 3
+      dut.io.aLoad.valid #= true
+      sleep(1)
+      while (!dut.io.aLoad.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      dut.io.aLoad.valid #= false
+
+      dut.io.start.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.start.valid #= true
+      sleep(1)
+      while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      dut.io.start.valid #= false
+
+      def pushExternal(column: Int, value: Int): Unit = {
+        val stream = dut.io.bPush(0)
+        stream.payload.valid #= true
+        stream.payload.aIndex #= 0
+        stream.payload.k #= 0
+        stream.payload.column #= column
+        stream.payload.value #= value
+        stream.valid #= true
+        sleep(1)
+        while (!stream.ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        stream.valid #= false
+      }
+
+      pushExternal(column = 1, value = 4)
+      pushExternal(column = 2, value = 5)
+      dut.io.finish #= true
+      dut.clockDomain.waitSampling()
+      dut.io.finish #= false
+      dut.io.result.ready #= true
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 300) {
+        sleep(1)
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+
+      assert(dut.io.done.toBoolean)
+      assert(observed == Seq((5, 1, 12L), (5, 2, 15L)))
+      assert(dut.io.acceptedBElements.toLong == 2)
+      assert(dut.io.issuedBElements.toLong == 2)
+      assert(!dut.io.overflow.toBoolean)
+      assert(!dut.io.unsupportedMode.toBoolean)
     }
   }
 

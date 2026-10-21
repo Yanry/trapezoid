@@ -3,13 +3,15 @@ package trapezoid
 import spinal.core._
 import spinal.lib._
 
-/** Four independent TrGT queues stored in one physical PE-local buffer.
+/** Control path for four independent TrGT queues in a PE-local buffer.
   *
-  * Each subrow owns one bank. One prefetched element per bank keeps Stream
-  * payloads stable under backpressure while preserving one pop per subrow and
-  * cycle, as required by TrGT.
+  * Storage is deliberately external so the queue can use the same physical
+  * banks as TrIP. Each subrow owns one bank. One prefetched element per bank
+  * keeps Stream payloads stable under backpressure while preserving one pop
+  * per subrow and cycle, as required by TrGT.
   */
-class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
+class BankedGustavsonBFifoCore(cfg: TrapezoidConfig, depth: Int)
+    extends Component {
   private val pointerWidth = scala.math.max(1, log2Up(depth))
   private val countWidth = log2Up(depth + 1)
   private val recordWidth = 1 + cfg.aRegisterIndexWidth +
@@ -20,15 +22,13 @@ class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
 
   val io = new Bundle {
     val clear = in Bool()
-    val owner = in(LocalBufferOwner())
-    val tripBuffer = slave(LocalBufferBus(cfg))
+    val active = in Bool()
+    val storage = master(LocalBufferBus(cfg))
     val pushes = Vec(slave(Stream(GustavsonB(cfg))), cfg.localBanks)
     val pops = Vec(master(Stream(GustavsonB(cfg))), cfg.localBanks)
     val occupancy = out Vec(UInt(countWidth bits), cfg.localBanks)
   }
 
-  val storage = new ModeSharedLocalBuffer(cfg)
-  storage.io.owner := io.owner
   val readPointers = Vec((0 until cfg.localBanks).map(_ =>
     Reg(UInt(pointerWidth bits)) init 0))
   val writePointers = Vec((0 until cfg.localBanks).map(_ =>
@@ -38,40 +38,31 @@ class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
   val storedCounts = Vec((0 until cfg.localBanks).map(_ =>
     Reg(UInt(countWidth bits)) init 0))
   val outputValids = Vec((0 until cfg.localBanks).map(_ => RegInit(False)))
-  val previousOwner = RegNext(io.owner) init LocalBufferOwner.Gustavson
-  val ownerChanged = previousOwner =/= io.owner
+  val previousActive = RegNext(io.active) init True
+  val activeChanged = previousActive =/= io.active
 
   for (bank <- 0 until cfg.localBanks) {
-    storage.io.trip.writes(bank).valid := io.tripBuffer.writes(bank).valid
-    storage.io.trip.writes(bank).payload := io.tripBuffer.writes(bank).payload
-    storage.io.trip.readCommands(bank).valid :=
-      io.tripBuffer.readCommands(bank).valid
-    storage.io.trip.readCommands(bank).payload :=
-      io.tripBuffer.readCommands(bank).payload
-    io.tripBuffer.readResponses(bank) := storage.io.trip.readResponses(bank)
-
-    val gustavsonActive = io.owner === LocalBufferOwner.Gustavson
-    io.pushes(bank).ready := !io.clear && gustavsonActive &&
+    io.pushes(bank).ready := !io.clear && io.active &&
       occupancies(bank) =/= depth
-    io.pops(bank).valid := !io.clear && gustavsonActive && outputValids(bank)
+    io.pops(bank).valid := !io.clear && io.active && outputValids(bank)
     io.pops(bank).payload.assignFromBits(
-      storage.io.gustavson.readResponses(bank).payload(
+      io.storage.readResponses(bank).payload(
         recordWidth - 1 downto 0))
     io.occupancy(bank) := occupancies(bank)
 
     val writeData = Bits(cfg.localLineWidth bits)
     writeData := 0
     writeData(recordWidth - 1 downto 0) := io.pushes(bank).payload.asBits
-    storage.io.gustavson.writes(bank).valid := io.pushes(bank).fire
-    storage.io.gustavson.writes(bank).payload.address :=
+    io.storage.writes(bank).valid := io.pushes(bank).fire
+    io.storage.writes(bank).payload.address :=
       writePointers(bank).resize(cfg.localAddressWidth)
-    storage.io.gustavson.writes(bank).payload.data := writeData
-    storage.io.gustavson.writes(bank).payload.mask.setAll()
+    io.storage.writes(bank).payload.data := writeData
+    io.storage.writes(bank).payload.mask.setAll()
 
-    val issueRead = !io.clear && gustavsonActive && storedCounts(bank) =/= 0 &&
+    val issueRead = !io.clear && io.active && storedCounts(bank) =/= 0 &&
       (!outputValids(bank) || io.pops(bank).fire)
-    storage.io.gustavson.readCommands(bank).valid := issueRead
-    storage.io.gustavson.readCommands(bank).payload :=
+    io.storage.readCommands(bank).valid := issueRead
+    io.storage.readCommands(bank).payload :=
       readPointers(bank).resize(cfg.localAddressWidth)
 
     when(io.pushes(bank).fire) {
@@ -95,13 +86,57 @@ class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
       is(B"01") { occupancies(bank) := occupancies(bank) - 1 }
     }
 
-    when(io.clear || ownerChanged) {
+    when(io.clear || activeChanged) {
       readPointers(bank) := 0
       writePointers(bank) := 0
       occupancies(bank) := 0
       storedCounts(bank) := 0
       outputValids(bank) := False
     }
+  }
+}
+
+/** Backward-compatible standalone FIFO with an internally shared SRAM.
+  *
+  * TrIP can own the SRAM through `tripBuffer`; TrGT queue state is discarded
+  * whenever ownership changes.
+  */
+class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
+  private val countWidth = log2Up(depth + 1)
+
+  val io = new Bundle {
+    val clear = in Bool()
+    val owner = in(LocalBufferOwner())
+    val tripBuffer = slave(LocalBufferBus(cfg))
+    val pushes = Vec(slave(Stream(GustavsonB(cfg))), cfg.localBanks)
+    val pops = Vec(master(Stream(GustavsonB(cfg))), cfg.localBanks)
+    val occupancy = out Vec(UInt(countWidth bits), cfg.localBanks)
+  }
+
+  val storage = new ModeSharedLocalBuffer(cfg)
+  val core = new BankedGustavsonBFifoCore(cfg, depth)
+  storage.io.owner := io.owner
+  core.io.clear := io.clear
+  core.io.active := io.owner === LocalBufferOwner.Gustavson
+
+  for (bank <- 0 until cfg.localBanks) {
+    storage.io.trip.writes(bank) := io.tripBuffer.writes(bank)
+    storage.io.trip.readCommands(bank) := io.tripBuffer.readCommands(bank)
+    io.tripBuffer.readResponses(bank) := storage.io.trip.readResponses(bank)
+
+    storage.io.gustavson.writes(bank) := core.io.storage.writes(bank)
+    storage.io.gustavson.readCommands(bank) :=
+      core.io.storage.readCommands(bank)
+    core.io.storage.readResponses(bank) :=
+      storage.io.gustavson.readResponses(bank)
+
+    core.io.pushes(bank).valid := io.pushes(bank).valid
+    core.io.pushes(bank).payload := io.pushes(bank).payload
+    io.pushes(bank).ready := core.io.pushes(bank).ready
+    io.pops(bank).valid := core.io.pops(bank).valid
+    io.pops(bank).payload := core.io.pops(bank).payload
+    core.io.pops(bank).ready := io.pops(bank).ready
+    io.occupancy(bank) := core.io.occupancy(bank)
   }
 }
 
@@ -112,7 +147,10 @@ class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
   * temporal gather streams.  Lane population may range from zero to four and
   * is unrelated to whether TrGT is selected.
   */
-class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
+class TrGtSubrowScheduler(
+    tileCfg: GustavsonTileConfig,
+    externalFifoStorage: Boolean = false
+) extends Component {
   private val cfg = tileCfg.core
   private val subrows = cfg.localBanks
 
@@ -130,6 +168,9 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
     val fifoOccupancy = out Vec(UInt(tileCfg.fifoCountWidth bits), subrows)
     val acceptedBElements = out UInt(32 bits)
     val issuedBElements = out UInt(32 bits)
+    val fifoStorageActive = if (externalFifoStorage) in Bool() else null
+    val fifoStorage = if (externalFifoStorage)
+      master(LocalBufferBus(cfg)) else null
   }
 
   // Keep the stationary A values in the same four logical subrows used by
@@ -150,14 +191,25 @@ class TrGtSubrowScheduler(tileCfg: GustavsonTileConfig) extends Component {
   io.acceptedBElements := acceptedBElements
   io.issuedBElements := issuedBElements
 
-  val fifos = new BankedGustavsonBFifo(cfg, tileCfg.fifoDepthPerSubrow)
+  val fifos = new BankedGustavsonBFifoCore(cfg, tileCfg.fifoDepthPerSubrow)
   fifos.io.clear := io.clear
-  fifos.io.owner := LocalBufferOwner.Gustavson
-  for (bank <- 0 until cfg.localBanks) {
-    fifos.io.tripBuffer.writes(bank).valid := False
-    fifos.io.tripBuffer.writes(bank).payload := LocalBufferWrite(cfg).getZero
-    fifos.io.tripBuffer.readCommands(bank).valid := False
-    fifos.io.tripBuffer.readCommands(bank).payload := 0
+  fifos.io.active := (if (externalFifoStorage) io.fifoStorageActive else True)
+  if (externalFifoStorage) {
+    for (bank <- 0 until cfg.localBanks) {
+      io.fifoStorage.writes(bank) := fifos.io.storage.writes(bank)
+      io.fifoStorage.readCommands(bank) := fifos.io.storage.readCommands(bank)
+      fifos.io.storage.readResponses(bank) :=
+        io.fifoStorage.readResponses(bank)
+    }
+  } else {
+    val localStorage = new BankedLocalBuffer(cfg)
+    for (bank <- 0 until cfg.localBanks) {
+      localStorage.io.bus.writes(bank) := fifos.io.storage.writes(bank)
+      localStorage.io.bus.readCommands(bank) :=
+        fifos.io.storage.readCommands(bank)
+      fifos.io.storage.readResponses(bank) :=
+        localStorage.io.bus.readResponses(bank)
+    }
   }
   for (subrow <- 0 until subrows) {
     fifos.io.pushes(subrow).valid := io.bPush(subrow).valid && running && !finishSeen

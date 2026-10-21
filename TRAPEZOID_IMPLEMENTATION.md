@@ -98,7 +98,7 @@ PE row 已拆分为五个逻辑阶段：
 4. `Reduce/Merge`：按输出坐标归约部分积；
 5. `Output`：将完整响应写入可配置深度的弹性寄存器 FIFO。
 
-前三个阶段之间使用支持同周期出入的弹性 `Stream` 流水寄存器。在无背压时，流水线填满后可以每周期接收一条命令；任一级停顿都会沿 `ready` 反压到命令入口。DenseIp 在恰好一个全有效 A fiber 和一个全有效 B fiber 时直接按固定 K lane 送入 MAC，并把 MFIU 和动态列规划器输入隔离为零；这保持论文 dense IP 的固定路由和低稀疏控制翻转。显式选择 DenseIp 但输入并非该形态时仍回退到通用路径，保持 mode 与 density 解耦的接口语义。四种 mode 在 route stage 结束前选择同一组 lane `valid/A operand/B operand`，后续 MAC stage 不再保存或选择一套独立的 Gustavson operand bus，因此物理上只描述 `macLanes` 个共享乘法器和一套 operand 流水寄存器。TrIP 坐标继续用最多 4 个 A/B tag 加每 lane fiber index 表示，Gustavson 坐标只为前 `cacheLineWords` 条 lane 保存，避免为了统一接口而把坐标复制到全部 128 条 MAC lane。按 paper 参数，这一改动相对双 operand/valid payload 每个 PE row 减少 1056 bit route/MAC 流水寄存器，完整 128-row 阵列约减少 16.5 KiB 等效寄存器位；非当前 mode 的 TrIP tag 或 Gustavson 坐标 sideband 会在写入流水寄存器前清零，Gustavson 未使用的 MAC lane 也由 operand isolation 保持为零，以降低无效翻转。TrIP 利用 MFIU 输出按 fiber pair 连续排列的性质，通过共享的可切片 contiguous reduction tree 归约：每个树节点只比较并合并左右子树边界上的一个输出簇，而不是为最多 16 个候选输出分别复制一棵全宽加法树。这对应论文 MRN 的 reduction mode，并将加法器数量从 O(`maxFibers^2 * macLanes`) 降到 O(`macLanes`)。Gustavson 路径不再对整个 16-word cache line 构造全互比较排序器：TrGT 只对四个 subrow head 进行坐标排序，且每个 head 只能访问所属的 A-register slice；TrGS 固定广播 A0，并对已经按坐标排列的 cache-line 输入进行分层稳定压缩。之后两者复用对数深度 segmented prefix tree 合并相同坐标。跨 subrow 的 TrGT 路由或乱序的 TrGS cache line 都会置 overflow 并丢弃该响应。两条路径的组合加法深度均为 O(log2(lane 数))。默认响应 FIFO 深度为 2，并以 field-wise 弹性寄存器实现；下游停顿时会保持输出稳定，并允许前级继续运行到所有弹性存储占满。
+前三个阶段之间使用支持同周期出入的弹性 `Stream` 流水寄存器。在无背压时，流水线填满后可以每周期接收一条命令；任一级停顿都会沿 `ready` 反压到命令入口。DenseIp 在恰好一个全有效 A fiber 和一个全有效 B fiber 时直接按固定 K lane 送入 MAC，并把 MFIU 和动态列规划器输入隔离为零；这保持论文 dense IP 的固定路由和低稀疏控制翻转。显式选择 DenseIp 但输入并非该形态时仍回退到通用路径，保持 mode 与 density 解耦的接口语义。四种 mode 在 route stage 结束前选择同一组 lane `valid/A operand/B operand`，后续 MAC stage 不再保存或选择一套独立的 Gustavson operand bus，因此物理上只描述 `macLanes` 个共享乘法器和一套 operand 流水寄存器。TrIP 坐标继续用最多 4 个 A/B tag 加每 lane fiber index 表示，Gustavson 坐标只为前 `cacheLineWords` 条 lane 保存，避免为了统一接口而把坐标复制到全部 128 条 MAC lane。按 paper 参数，这一改动相对双 operand/valid payload 每个 PE row 减少 1056 bit route/MAC 流水寄存器，完整 128-row 阵列约减少 16.5 KiB 等效寄存器位；非当前 mode 的 TrIP tag 或 Gustavson 坐标 sideband 会在写入流水寄存器前清零，Gustavson 未使用的 MAC lane 也由 operand isolation 保持为零，以降低无效翻转。TrIP 利用 MFIU 输出按 fiber pair 连续排列且 valid-prefix 的性质，直接进入 segmented prefix reduction tree：每个树节点只在同一 fiber-pair segment 内累加，segment 尾部产生一个输出，不再先构造完整的中间压缩流。这更接近论文 MRN 的 reduction mode，并保持 O(log2(`macLanes`)) 加法深度。Gustavson 路径不再对整个 16-word cache line 构造全互比较排序器：TrGT 只对四个 subrow head 进行坐标排序，且每个 head 只能访问所属的 A-register slice；TrGS 固定广播 A0，并对已经按坐标排列的 cache-line 输入进行分层稳定压缩。之后两者复用对数深度 segmented prefix tree 合并相同坐标。跨 subrow 的 TrGT 路由或乱序的 TrGS cache line 都会置 overflow 并丢弃该响应。默认响应 FIFO 深度为 2，并以 field-wise 弹性寄存器实现；下游停顿时会保持输出稳定，并允许前级继续运行到所有弹性存储占满。
 
 这次流水化没有改变 `PERowCommand`/`PERowResponse` 外部协议，也没有根据 density 改写 mode。代价是 PE row 不再是一拍命令/响应模块，上层必须只依赖 Stream 握手，不能假定固定的一拍响应延迟。
 
@@ -680,7 +680,7 @@ sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 1. 先对 1、4、16 个 PE row 做综合；
 2. 检查 MFIU 前缀逻辑和路由网络的关键路径；
 3. 当前已完成 participating-value shift、连续 source packing、全局 source index 和两套 128-input distribution 边界；下一步实现 Benes runtime control generator，并把 boundary 内的 source-index selector 替换为 O(`N log N`) switch fabric；
-4. 当前 TrIP contiguous reduction tree 已按输出簇切片，Gustavson flush 也已改为有序连续输出；下一步将 Gustavson 的逐项寄存器插入替换为 SRAM 双流 merge，并根据综合关键路径增加可配置寄存器切分；
+4. 当前 TrIP reduction 已改为 valid-prefix segmented tree，Gustavson flush 也已改为有序连续输出；下一步将 Gustavson 的逐项寄存器插入替换为 SRAM 双流 merge，并根据综合关键路径增加可配置寄存器切分；
 5. 再尝试生成和综合 128 x 128 paper 配置；
 6. 建立吞吐、利用率、面积、频率和存储流量统计。
 

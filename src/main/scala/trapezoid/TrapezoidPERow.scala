@@ -119,81 +119,6 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     }
   }
 
-  /** Reduce adjacent products belonging to the same A/B fiber pair.
-    *
-    * MFIU packs products in pair-major order, so every output's products form
-    * one contiguous cluster. Each tree node concatenates its child clusters
-    * and needs only one boundary comparator/adder to join a cluster split
-    * across the children. This is the reduction-mode behavior of the paper's
-    * sliceable merge-reduction tree.
-    */
-  private def reduceContiguous(inputs: Seq[PERowReducedProduct]): ReductionGroup = {
-    require(inputs.nonEmpty)
-    if (inputs.length == 1) {
-      val entries = Vec(PERowReducedProduct(cfg), 1)
-      val count = UInt(1 bits)
-      entries(0) := inputs.head
-      count := inputs.head.valid.asUInt
-      ReductionGroup(entries, count)
-    } else {
-      val split = inputs.length / 2
-      val left = reduceContiguous(inputs.take(split))
-      val right = reduceContiguous(inputs.drop(split))
-      val entryCount = inputs.length
-      val countWidth = log2Up(entryCount + 1)
-      val entries = Vec(PERowReducedProduct(cfg), entryCount)
-      val count = UInt(countWidth bits)
-      val leftCount = left.count.resize(countWidth)
-      val rightCount = right.count.resize(countWidth)
-
-      val leftLast = PERowReducedProduct(cfg)
-      leftLast := left.entries(0)
-      for (index <- 1 until left.entries.length) {
-        when(left.count === index + 1) {
-          leftLast := left.entries(index)
-        }
-      }
-
-      val joinBoundary = leftCount =/= 0 && rightCount =/= 0 &&
-        leftLast.aFiber === right.entries(0).aFiber &&
-        leftLast.bFiber === right.entries(0).bFiber
-      count := (leftCount + rightCount - joinBoundary.asUInt).resize(countWidth)
-
-      for (output <- 0 until entryCount) {
-        if (output < left.entries.length) {
-          entries(output) := left.entries(output)
-        } else {
-          entries(output) := PERowReducedProduct(cfg).getZero
-        }
-
-        for (source <- 0 until right.entries.length) {
-          val appendSource = if (source == 0) {
-            right.entries(source).valid && !joinBoundary
-          } else {
-            right.entries(source).valid
-          }
-          val target = (leftCount + U(source, countWidth bits) -
-            joinBoundary.asUInt.resize(countWidth)).resize(countWidth)
-          when(appendSource && target === output) {
-            entries(output) := right.entries(source)
-          }
-        }
-
-        when(joinBoundary && leftCount === output + 1) {
-          entries(output).valid := True
-          entries(output).aFiber := leftLast.aFiber
-          entries(output).bFiber := leftLast.bFiber
-          entries(output).row := leftLast.row
-          entries(output).column := leftLast.column
-          entries(output).value :=
-            (leftLast.value + right.entries(0).value).resize(cfg.accumulatorWidth)
-        }
-      }
-
-      ReductionGroup(entries, count)
-    }
-  }
-
   // Stage 0: capture one complete command and decouple the scheduler from MFIU.
   val inputStage = io.command.m2sPipe()
 
@@ -420,14 +345,60 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     leaf.value := mac.product(lane)
     leaf
   }
-  private val tripReduction = reduceContiguous(tripLeaves)
+  // MFIU emits a valid prefix in pair-major order.  In reduction mode this
+  // lets the MRN use a segmented prefix tree directly: a segment is one A/B
+  // fiber pair, and only its final lane becomes an output.  No intermediate
+  // stream compaction or child-cluster merge is needed.
+  var tripSegmentedSums = tripLeaves.map(_.value)
+  var tripDistance = 1
+  while (tripDistance < cfg.macLanes) {
+    val nextLevel = Vec(SInt(cfg.accumulatorWidth bits), cfg.macLanes)
+    for (position <- 0 until cfg.macLanes) {
+      if (position < tripDistance) {
+        nextLevel(position) := tripSegmentedSums(position)
+      } else {
+        val sameSegment = tripLeaves(position).valid &&
+          tripLeaves(position - tripDistance).valid &&
+          tripLeaves(position).aFiber ===
+            tripLeaves(position - tripDistance).aFiber &&
+          tripLeaves(position).bFiber ===
+            tripLeaves(position - tripDistance).bFiber
+        nextLevel(position) := Mux(sameSegment,
+          (tripSegmentedSums(position) +
+            tripSegmentedSums(position - tripDistance))
+            .resize(cfg.accumulatorWidth),
+          tripSegmentedSums(position))
+      }
+    }
+    tripSegmentedSums = (0 until cfg.macLanes).map(nextLevel(_))
+    tripDistance *= 2
+  }
+
+  val tripSegmentEnd = Vec(Bool(), cfg.macLanes)
+  val tripSegmentPrefix = Vec(UInt(cfg.outputCountWidth bits), cfg.macLanes + 1)
+  tripSegmentPrefix(0) := 0
+  for (position <- 0 until cfg.macLanes) {
+    val nextDiffers = if (position == cfg.macLanes - 1) {
+      True
+    } else {
+      !tripLeaves(position + 1).valid ||
+        tripLeaves(position).aFiber =/= tripLeaves(position + 1).aFiber ||
+        tripLeaves(position).bFiber =/= tripLeaves(position + 1).bFiber
+    }
+    tripSegmentEnd(position) := tripLeaves(position).valid && nextDiffers
+    tripSegmentPrefix(position + 1) := tripSegmentPrefix(position) +
+      tripSegmentEnd(position).asUInt
+  }
   for (out <- 0 until cfg.outputLanes) {
     if (out < cfg.macLanes) {
-      when(tripMode && !mac.overflow && tripReduction.entries(out).valid) {
-        nextResponse.results(out).valid := True
-        nextResponse.results(out).row := tripReduction.entries(out).row
-        nextResponse.results(out).column := tripReduction.entries(out).column
-        nextResponse.results(out).value := tripReduction.entries(out).value
+      for (position <- 0 until cfg.macLanes) {
+        when(tripMode && !mac.overflow && tripSegmentEnd(position) &&
+            tripSegmentPrefix(position) === out) {
+          nextResponse.results(out).valid := True
+          nextResponse.results(out).row := tripLeaves(position).row
+          nextResponse.results(out).column := tripLeaves(position).column
+          nextResponse.results(out).value := tripSegmentedSums(position)
+        }
       }
     }
   }
@@ -436,7 +407,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     nextResponse.overflow := mac.overflow
     nextResponse.selectedColumns := mac.selectedColumns
     nextResponse.effectualMacs := mac.effectualMacs
-    nextResponse.count := Mux(mac.overflow, U(0), tripReduction.count).resized
+    nextResponse.count := Mux(mac.overflow, U(0),
+      tripSegmentPrefix.last).resized
   }
 
   // TrGT merges four coordinate-sorted subrow heads. TrGS receives one

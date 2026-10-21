@@ -28,6 +28,10 @@ class TrapezoidStructureSpec extends AnyFunSuite {
     elaborate(new DynamicColumnPacker(cfg))
   }
 
+  test("operand distribution tree elaborates") {
+    elaborate(new OperandDistributionNetwork(cfg))
+  }
+
   test("four-bank local buffer elaborates") {
     elaborate(new BankedLocalBuffer(cfg))
   }

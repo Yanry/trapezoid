@@ -330,6 +330,38 @@ class MultiFiberIntersection(cfg: TrapezoidConfig) extends Component {
   * compressed-value arrays at every MAC lane.
   */
 class OperandDistributionNetwork(cfg: TrapezoidConfig) extends Component {
+  private val distributionWidth = {
+    var width = 1
+    while (width < cfg.macLanes) width *= 2
+    width
+  }
+
+  private def selectValue(values: Seq[SInt], index: UInt): SInt = {
+    var level = values.toVector
+    var bit = 0
+    while (level.length > 1) {
+      val previous = level
+      level = Vector.tabulate(previous.length / 2) { pair =>
+        Mux(index(bit), previous(pair * 2 + 1), previous(pair * 2))
+      }
+      bit += 1
+    }
+    level.head
+  }
+
+  private def selectValid(values: Seq[Bool], index: UInt): Bool = {
+    var level = values.toVector
+    var bit = 0
+    while (level.length > 1) {
+      val previous = level
+      level = Vector.tabulate(previous.length / 2) { pair =>
+        Mux(index(bit), previous(pair * 2 + 1), previous(pair * 2))
+      }
+      bit += 1
+    }
+    level.head
+  }
+
   val io = new Bundle {
     val sources = in Vec(SInt(cfg.dataWidth bits), cfg.macLanes)
     val sourceValid = in Bits(cfg.macLanes bits)
@@ -339,12 +371,24 @@ class OperandDistributionNetwork(cfg: TrapezoidConfig) extends Component {
     val routeError = out Bool()
   }
 
+  // A power-of-two radix tree makes the fan-in and logic depth explicit. The
+  // input vector is padded with invalid sources when macLanes is not a power
+  // of two; an out-of-range route therefore becomes a route error.
+  private val paddedSources = Vector.tabulate(distributionWidth) { index =>
+    if (index < cfg.macLanes) io.sources(index)
+    else S(0, cfg.dataWidth bits)
+  }
+  private val paddedSourceValid = Vector.tabulate(distributionWidth) { index =>
+    if (index < cfg.macLanes) io.sourceValid(index) else False
+  }
+
   val laneErrors = Bits(cfg.macLanes bits)
   for (lane <- 0 until cfg.macLanes) {
-    val selectedValid = io.sourceValid(io.sourceIndex(lane))
+    val selectedValid = selectValid(paddedSourceValid, io.sourceIndex(lane))
+    val selectedValue = selectValue(paddedSources, io.sourceIndex(lane))
     laneErrors(lane) := io.laneValid(lane) && !selectedValid
     io.outputs(lane) := Mux(io.laneValid(lane) && selectedValid,
-      io.sources(io.sourceIndex(lane)), S(0, cfg.dataWidth bits))
+      selectedValue, S(0, cfg.dataWidth bits))
   }
   io.routeError := laneErrors.orR
 }

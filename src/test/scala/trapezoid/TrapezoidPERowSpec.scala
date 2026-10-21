@@ -104,6 +104,11 @@ class TrapezoidPERowSpec extends AnyFunSuite {
           dut.io.response.payload.results(index).value.toInt)
       }
       assert(results == Seq((2, 0, 22), (2, 1, 91), (3, 1, 133)))
+      val destinations = (0 until 3).map { index =>
+        (dut.io.response.payload.destinationBank(index).toInt,
+          dut.io.response.payload.destinationWordOffset(index).toInt)
+      }
+      assert(destinations == Seq((0, 0), (0, 1), (1, 1)))
     }
   }
 

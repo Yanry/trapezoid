@@ -69,6 +69,9 @@ case class PERowResponse(cfg: TrapezoidConfig) extends Bundle {
   val effectualMacs = UInt(cfg.matchCountWidth bits)
   val count = UInt(cfg.outputCountWidth bits)
   val results = Vec(MatrixResult(cfg), cfg.outputLanes)
+  val destinationBank = Vec(UInt(cfg.localBankIndexWidth bits), cfg.outputLanes)
+  val destinationWordOffset =
+    Vec(UInt(cfg.localWordIndexWidth bits), cfg.outputLanes)
 }
 
 case class IntersectionRoute(cfg: TrapezoidConfig) extends Bundle {

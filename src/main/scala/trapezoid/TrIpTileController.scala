@@ -124,7 +124,7 @@ class TrIpTileController(
   private val peIndexWidth = scala.math.max(1, log2Up(cfg.peRows))
   private val cellCount = tileCfg.maxRows * tileCfg.maxColumns
   private val cellIndexWidth = scala.math.max(1, log2Up(cellCount))
-  private val bankIndexWidth = log2Up(cfg.localBanks)
+  private val bankIndexWidth = cfg.localBankIndexWidth
   private val pendingLineCount = cfg.peRows * cfg.localBanks
   private val pendingWordCount = pendingLineCount * cfg.localWordsPerBank
 
@@ -371,8 +371,6 @@ class TrIpTileController(
     cfg.localWordsPerBank)
   val scatterColumnSelected = Vec(Bool(), cfg.localWordsPerBank)
   val scatterColumnAvailable = Vec(Bool(), cfg.localWordsPerBank)
-  val scatterColumnTag = Vec(UInt(cfg.coordinateWidth bits),
-    cfg.localWordsPerBank)
   for (word <- 0 until cfg.localWordsPerBank) {
     scatterColumnWide(word) := scatterLineBase + word
     scatterColumnIndex(word) := scatterColumnWide(word).resized
@@ -384,7 +382,6 @@ class TrIpTileController(
       scatterColumnWide(word) < columnCount.resize(tileCfg.columnCountWidth + 1) &&
         bLoaded(scatterColumnIndex(word)) &&
         bStorageValid(scatterColumnIndex(word))
-    scatterColumnTag(word) := bStorageTag(scatterColumnIndex(word))
   }
 
   for (pe <- 0 until cfg.peRows; fiber <- 0 until cfg.maxFibers;
@@ -402,10 +399,13 @@ class TrIpTileController(
     if (globalRow < tileCfg.maxRows) {
       for (lane <- 0 until cfg.outputLanes) {
         val result = responseRegs(pe).results(lane)
+        val destinationWord = UInt(cfg.localWordIndexWidth bits)
+        destinationWord := lineOffset +
+          responseRegs(pe).destinationWordOffset(lane)
         when(state === TrIpTileState.Scatter && scatterColumnSelected(word) &&
             rowAvailable && scatterColumnAvailable(word) && result.valid &&
-            result.row === aStorage(globalRow).tag &&
-            result.column === scatterColumnTag(word)) {
+            responseRegs(pe).destinationBank(lane) === fiber &&
+            destinationWord === word) {
           scatterWordValid(slot) := True
           scatterWordValue(slot) := result.value
         }

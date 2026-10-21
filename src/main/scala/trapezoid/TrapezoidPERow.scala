@@ -46,6 +46,8 @@ case class PERowReducedProduct(cfg: TrapezoidConfig) extends Bundle {
   val segmentStart = Bool()
   val row = UInt(cfg.coordinateWidth bits)
   val column = UInt(cfg.coordinateWidth bits)
+  val destinationBank = UInt(cfg.localBankIndexWidth bits)
+  val destinationWordOffset = UInt(cfg.localWordIndexWidth bits)
   val value = SInt(cfg.accumulatorWidth bits)
 }
 
@@ -356,6 +358,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     leaf.segmentStart := False
     leaf.row := mac.tripATags(mac.laneAFiber(lane))
     leaf.column := mac.tripBTags(mac.laneBFiber(lane))
+    leaf.destinationBank := mac.laneAFiber(lane).resized
+    leaf.destinationWordOffset := mac.laneBFiber(lane).resized
     leaf.value := mac.product(lane)
     leaf
   }
@@ -366,6 +370,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     leaf.segmentStart := False
     leaf.row := mac.gustRow(lane)
     leaf.column := mac.gustColumn(lane)
+    leaf.destinationBank := 0
+    leaf.destinationWordOffset := 0
     leaf.value := mac.product(lane)
     leaf
   }
@@ -430,6 +436,9 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     orderedProducts(position).valid := selected.valid
     orderedProducts(position).row := selected.row
     orderedProducts(position).column := selected.column
+    orderedProducts(position).destinationBank := selected.destinationBank
+    orderedProducts(position).destinationWordOffset :=
+      selected.destinationWordOffset
     orderedProducts(position).value := selected.value
     val startsNewSegment = if (position == 0) {
       True
@@ -472,6 +481,10 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       levelOutput.payload.lanes(position).valid := right.valid
       levelOutput.payload.lanes(position).row := right.row
       levelOutput.payload.lanes(position).column := right.column
+      levelOutput.payload.lanes(position).destinationBank :=
+        right.destinationBank
+      levelOutput.payload.lanes(position).destinationWordOffset :=
+        right.destinationWordOffset
       if (position >= reductionDistance) {
         val left = levelInput.payload.lanes(position - reductionDistance)
         val combine = right.valid && left.valid && !right.segmentStart
@@ -515,6 +528,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     nextResponse.results(out).column := 0
     nextResponse.results(out).value := 0
     nextResponse.results(out).endOfTile := reduced.endOfTile
+    nextResponse.destinationBank(out) := 0
+    nextResponse.destinationWordOffset(out) := 0
     for (position <- 0 until cfg.macLanes) {
       val outputIndex = segmentPrefix(position) - 1
       when(!reduced.overflow && segmentEnd(position) && outputIndex === out) {
@@ -522,6 +537,10 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
         nextResponse.results(out).row := reduced.lanes(position).row
         nextResponse.results(out).column := reduced.lanes(position).column
         nextResponse.results(out).value := reduced.lanes(position).value
+        nextResponse.destinationBank(out) :=
+          reduced.lanes(position).destinationBank
+        nextResponse.destinationWordOffset(out) :=
+          reduced.lanes(position).destinationWordOffset
       }
     }
   }

@@ -116,7 +116,7 @@ PE row 已拆分为以下弹性流水阶段：
 - 读响应有效信号；
 - 可配置的 bank 深度。
 
-`TrIpTileController` 为每个 PE row 例化独立的四 bank buffer，使用 `A fiber/subrow -> bank`、`B column / 4 -> address`、`B column % 4 -> word` 的映射。一个 `PERowResponse` 的最多 `4 x 4` 个 TrIP 结果会组合匹配到四个 bank 的四个 word，并在一个 scatter 阶段并行掩码写入；跨 K tile 时则并行读出相关 bank line、逐 word 累加后写回。结果最终仍按 row-major 顺序从对应 PE buffer 读回。
+`TrIpTileController` 为每个 PE row 例化独立的四 bank buffer，使用 `A fiber/subrow -> bank`、`B column / 4 -> address`、`B column % 4 -> word` 的映射。TrIP 乘积现在携带 `destinationBank` 和 `destinationWordOffset` 穿过各级 MRN，归约结果可直接按短目的索引落入四个 bank 的四个 word，不再让每个结果与全部 A/B 坐标做宽比较。一个 `PERowResponse` 的最多 `4 x 4` 个结果可在一个 scatter 阶段并行掩码写入；跨 K tile 时则并行读出相关 bank line、逐 word 累加后写回。结果最终仍按 row-major 顺序从对应 PE buffer 读回。
 
 Gustavson cache adapter 对两种 mode 使用不同分发方式。TrGT 在 cache line 内用游标跳过无效槽，并把每个有效 B 元素送到 `aIndex` 所属的 subrow lane；因此一条含 `E` 个有效元素的缓存行需要 `E` 次 PE 命令握手，末元素才结束该行或 tile。TrGS 则把一条有序缓存行中的全部有效元素在一次命令中空间展开，并统一引用广播的 A0。上述发射周期属于 cache-to-PE 分发阶段，后面还要叠加 PE 流水、tile accumulator 和结果写回周期。
 

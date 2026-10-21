@@ -77,6 +77,7 @@ case class TrapezoidConfig(
   val macLanesPerSubrow: Int = macLanes / localBanks
   val matchCountWidth: Int = log2Up(maxFibers * maxFibers * fiberWidth + 1)
   val outputCountWidth: Int = log2Up(outputLanes + 1)
+  val localBankIndexWidth: Int = log2Up(localBanks)
   val localWordIndexWidth: Int = log2Up(localWordsPerBank)
   val localLineWidth: Int = accumulatorWidth * localWordsPerBank
   val localLineBytes: Int = localLineWidth / 8

@@ -81,7 +81,7 @@ class TrapezoidStructureSpec extends AnyFunSuite {
       modeSharedLocalBuffers = true))
   }
 
-  test("multi-row TrIP and TrGT shared-buffer tile controller elaborates") {
+  test("multi-row TrIP, TrGT, and TrGS shared-PE tile controller elaborates") {
     val sharedCfg = cfg.copy(peRows = 2)
     elaborate(new ModeSharedTileController(
       TrIpTileConfig(sharedCfg, maxColumns = 4),

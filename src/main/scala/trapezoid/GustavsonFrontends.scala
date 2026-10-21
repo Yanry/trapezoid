@@ -357,7 +357,8 @@ class TrGsSpatialEngine(
     tileCfg: GustavsonTileConfig,
     peFactory: TrapezoidConfig => TrapezoidPERowComponent =
       cfg => new TrapezoidPERow(cfg),
-    wideOutput: Boolean = false
+    wideOutput: Boolean = false,
+    externalPe: Boolean = false
 ) extends Component {
   private val cfg = tileCfg.core
   private val slots = tileCfg.accumulatorEntries
@@ -386,6 +387,8 @@ class TrGsSpatialEngine(
     val accumulatorCycles = out UInt(32 bits)
     val accumulatorUpdates = out UInt(32 bits)
     val bankReplayCycles = out UInt(32 bits)
+    val peCommand = if (externalPe) master(Stream(PERowCommand(cfg))) else null
+    val peResponse = if (externalPe) slave(Stream(PERowResponse(cfg))) else null
   }
 
   val state = RegInit(TrGsSpatialState.Idle)
@@ -452,21 +455,39 @@ class TrGsSpatialEngine(
     adapted.gustavson.b(lane).value := io.command.payload.b(lane).value
   }
 
-  val pe = peFactory(cfg)
   val supportedMode = io.command.payload.mode === TrapezoidDataflow.TrGs
   val acceptsSupported = (state === TrGsSpatialState.Idle ||
     (state === TrGsSpatialState.Run && !inputClosed)) && supportedMode
-  pe.io.command.valid := !io.clear && io.command.valid && acceptsSupported
-  pe.io.command.payload := adapted
+  val peCommandReady = Bool()
+  val peResponseValid = Bool()
+  val peResponsePayload = PERowResponse(cfg)
+  val peResponseReady = Bool()
+  val peCommandValid = !io.clear && io.command.valid && acceptsSupported
+  if (externalPe) {
+    io.peCommand.valid := peCommandValid
+    io.peCommand.payload := adapted
+    peCommandReady := io.peCommand.ready
+    peResponseValid := io.peResponse.valid
+    peResponsePayload := io.peResponse.payload
+    io.peResponse.ready := peResponseReady
+  } else {
+    val pe = peFactory(cfg)
+    pe.io.command.valid := peCommandValid
+    pe.io.command.payload := adapted
+    peCommandReady := pe.io.command.ready
+    peResponseValid := pe.io.response.valid
+    peResponsePayload := pe.io.response.payload
+    pe.io.response.ready := peResponseReady
+  }
   io.command.ready := !io.clear && Mux(supportedMode,
-    acceptsSupported && pe.io.command.ready,
+    acceptsSupported && peCommandReady,
     state === TrGsSpatialState.Idle)
 
   val commandFire = io.command.fire && supportedMode
-  val responseFire = pe.io.response.fire
-  pe.io.response.ready := !io.clear &&
+  peResponseReady := !io.clear &&
     (state === TrGsSpatialState.AbortDrain ||
       (state === TrGsSpatialState.Run && !responseActive))
+  val responseFire = peResponseValid && peResponseReady
   val commandColumnChoices = Vec(Bool(), cfg.cacheLineWords)
   var earlierCommandColumn: Bool = False
   for (lane <- 0 until cfg.cacheLineWords) {
@@ -514,7 +535,7 @@ class TrGsSpatialEngine(
   val remainingResults = pendingResults & ~issuedResults
   val capturedResults = Bits(cfg.outputLanes bits)
   for (lane <- 0 until cfg.outputLanes) {
-    capturedResults(lane) := pe.io.response.payload.results(lane).valid
+    capturedResults(lane) := peResponsePayload.results(lane).valid
   }
   val responseDrained = responseActive &&
     (!pendingResults.orR || !remainingResults.orR)
@@ -666,7 +687,7 @@ class TrGsSpatialEngine(
       .otherwise { inFlight := inFlight - 1 }
   }
   when(responseFire && state === TrGsSpatialState.Run) {
-    responseReg := pe.io.response.payload
+    responseReg := peResponsePayload
     pendingResults := capturedResults
     responseActive := True
   } elsewhen (responseActive) {

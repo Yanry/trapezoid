@@ -26,7 +26,7 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
     .addSimulatorFlag("-CFLAGS -std=c++14")
     .addSimulatorFlag("-LDFLAGS -std=c++14")
 
-  test("TrIP and TrGT share one PE row and local SRAM across tile boundaries") {
+  test("TrIP, TrGT, and TrGS share one PE row across tile boundaries") {
     simConfig.compile(new ModeSharedTileController(
       tripCfg, gustavsonCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
@@ -39,6 +39,9 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
       dut.io.trgtStart(0).valid #= false
       dut.io.trgtFinish #= 0
       dut.io.trgtResult(0).ready #= false
+      dut.io.trgsCommand(0).valid #= false
+      dut.io.trgsResult(0).ready #= false
+      dut.io.trgsResultLine(0).ready #= false
       for (subrow <- 0 until cfg.localBanks) {
         dut.io.trgtBPush(0)(subrow).valid #= false
       }
@@ -163,6 +166,54 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
       assert(ownerPosition == LocalBufferOwner.TrIp.position)
       assert((dut.io.trgtOverflow.toBigInt & 1) == 0)
       assert((dut.io.trgtUnsupportedMode.toBigInt & 1) == 0)
+
+      val trgsCommand = dut.io.trgsCommand(0)
+      trgsCommand.payload.mode #= TrapezoidDataflow.TrGs
+      trgsCommand.payload.endOfTile #= true
+      trgsCommand.payload.a.valid #= true
+      trgsCommand.payload.a.row #= 8
+      trgsCommand.payload.a.k #= 1
+      trgsCommand.payload.a.value #= 5
+      for (lane <- 0 until cfg.cacheLineWords) {
+        val element = trgsCommand.payload.b(lane)
+        element.valid #= lane == 0
+        element.k #= 1
+        element.column #= (if (lane == 0) 3 else 0)
+        element.value #= (if (lane == 0) 6 else 0)
+      }
+      dut.io.trgsResult(0).ready #= true
+      trgsCommand.valid #= true
+      while (!trgsCommand.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      trgsCommand.valid #= false
+      sleep(1)
+      assert(ownerPosition == LocalBufferOwner.Gustavson.position)
+
+      dut.io.tripStart.valid #= true
+      sleep(1)
+      assert(!dut.io.tripStart.ready.toBoolean)
+      dut.io.tripStart.valid #= false
+
+      val trgsResults = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      timeout = 0
+      while ((dut.io.trgsDone.toBigInt & 1) == 0 && timeout < 300) {
+        sleep(1)
+        if (dut.io.trgsResult(0).valid.toBoolean &&
+            dut.io.trgsResult(0).ready.toBoolean) {
+          trgsResults += ((dut.io.trgsResult(0).payload.row.toInt,
+            dut.io.trgsResult(0).payload.column.toInt,
+            dut.io.trgsResult(0).payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert((dut.io.trgsDone.toBigInt & 1) != 0)
+      assert(trgsResults == Seq((8, 3, 30L)))
+      assert(dut.io.trgsAccumulatorUpdates(0).toLong == 1)
+      assert((dut.io.trgsOverflow.toBigInt & 1) == 0)
+      assert((dut.io.trgsUnsupportedMode.toBigInt & 1) == 0)
+      dut.clockDomain.waitSampling()
+      assert(ownerPosition == LocalBufferOwner.TrIp.position)
     }
   }
 }

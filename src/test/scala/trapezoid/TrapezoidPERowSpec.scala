@@ -396,4 +396,34 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       assert(dut.io.response.payload.results(0).value.toInt == 20)
     }
   }
+
+  test("configured pipeline depth matches accepted-command response latency") {
+    simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      clearInputs(dut)
+      dut.io.command.payload.mode #= TrapezoidDataflow.TrGs
+      dut.io.command.payload.gustavson.a(0).valid #= true
+      dut.io.command.payload.gustavson.a(0).row #= 1
+      dut.io.command.payload.gustavson.a(0).k #= 0
+      dut.io.command.payload.gustavson.a(0).value #= 2
+      dut.io.command.payload.gustavson.b(0).valid #= true
+      dut.io.command.payload.gustavson.b(0).aIndex #= 0
+      dut.io.command.payload.gustavson.b(0).k #= 0
+      dut.io.command.payload.gustavson.b(0).column #= 3
+      dut.io.command.payload.gustavson.b(0).value #= 4
+
+      dut.io.command.valid #= true
+      while (!dut.io.command.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      dut.io.command.valid #= false
+
+      var elapsedCycles = 0
+      while (!dut.io.response.valid.toBoolean) {
+        dut.clockDomain.waitSampling()
+        elapsedCycles += 1
+      }
+      assert(elapsedCycles == cfg.pePipelineStages)
+      assert(dut.io.response.payload.results(0).value.toInt == 8)
+    }
+  }
 }

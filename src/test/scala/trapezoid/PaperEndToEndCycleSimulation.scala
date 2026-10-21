@@ -31,7 +31,7 @@ object PaperEndToEndCycleSimulation extends App {
   private val fp32Bytes = 4L
   private val coordinateBytes = 4L
   private val pointerBytes = 4L
-  private val pePipelineStages = 5L
+  private val pePipelineStages = cfg.pePipelineStages.toLong
 
   require(cfg.peRows == 128)
   require(cfg.macLanes == 128)
@@ -254,7 +254,7 @@ object PaperEndToEndCycleSimulation extends App {
     val hbmWriteCycles = ceilDiv(cBytes, hbmBytesPerCycle)
     val cacheWriteCycles = ceilDiv(outputLines, cacheBanks)
     val outputCycles = math.max(hbmWriteCycles, cacheWriteCycles)
-    val pipelineCycles = pePipelineStages - 1
+    val pipelineCycles = pePipelineStages
     for (mode <- modes) {
       val compute = computeCycles(mode, product, a, b)
       val streamedCycles = math.max(inputCycles, compute) +

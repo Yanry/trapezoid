@@ -92,15 +92,16 @@ PE row 响应会返回：
 
 IP/TrIP 路径可以在一次命令中输出多个 `(row, column, value)`。Gustavson 路径可以在一个 cache-line 命令内合并相同坐标的部分积。
 
-PE row 已拆分为五个逻辑阶段：
+PE row 已拆分为以下弹性流水阶段：
 
 1. `Input`：锁存完整命令，隔离阵列调度器与 MFIU；
 2. `Route/Distribution`：执行 MFIU、动态列规划、A/B 值索引和 Gustavson `aIndex` 选择；
 3. `MAC`：固定 lane 有符号乘法，并把无效 lane 清零；
-4. `Reduce/Merge`：按输出坐标归约部分积；
-5. `Output`：将完整响应写入可配置深度的弹性寄存器 FIFO。
+4. `MRN leaf ordering`：TrIP 保持 MFIU 的 pair-major 顺序，TrGT 排序四个 subrow head，TrGS 压缩有序 cache line，并标记输出坐标 segment；
+5. `MRN levels`：radix-`macLanes` tree 的每个二叉层各占一个周期，逐层执行 segmented reduction；
+6. `Output`：将 segment tail 压缩成结果，并写入可配置深度的弹性寄存器 FIFO。
 
-前三个阶段之间使用支持同周期出入的弹性 `Stream` 流水寄存器。在无背压时，流水线填满后可以每周期接收一条命令；任一级停顿都会沿 `ready` 反压到命令入口。DenseIp 在恰好一个全有效 A fiber 和一个全有效 B fiber 时直接按固定 K lane 送入 MAC，并把 MFIU 和动态列规划器输入隔离为零；这保持论文 dense IP 的固定路由和低稀疏控制翻转。显式选择 DenseIp 但输入并非该形态时仍回退到通用路径，保持 mode 与 density 解耦的接口语义。四种 mode 在 route stage 结束前选择同一组 lane `valid/A operand/B operand`，后续 MAC stage 不再保存或选择一套独立的 Gustavson operand bus，因此物理上只描述 `macLanes` 个共享乘法器和一套 operand 流水寄存器。TrIP 坐标继续用最多 4 个 A/B tag 加每 lane fiber index 表示，Gustavson 坐标只为前 `cacheLineWords` 条 lane 保存，避免为了统一接口而把坐标复制到全部 128 条 MAC lane。按 paper 参数，这一改动相对双 operand/valid payload 每个 PE row 减少 1056 bit route/MAC 流水寄存器，完整 128-row 阵列约减少 16.5 KiB 等效寄存器位；非当前 mode 的 TrIP tag 或 Gustavson 坐标 sideband 会在写入流水寄存器前清零，Gustavson 未使用的 MAC lane 也由 operand isolation 保持为零，以降低无效翻转。TrIP 利用 MFIU 输出按 fiber pair 连续排列且 valid-prefix 的性质，直接进入 segmented prefix reduction tree：每个树节点只在同一 fiber-pair segment 内累加，segment 尾部产生一个输出，不再先构造完整的中间压缩流。这更接近论文 MRN 的 reduction mode，并保持 O(log2(`macLanes`)) 加法深度。Gustavson 路径不再对整个 16-word cache line 构造全互比较排序器：TrGT 只对四个 subrow head 进行坐标排序，且每个 head 只能访问所属的 A-register slice；TrGS 固定广播 A0，并对已经按坐标排列的 cache-line 输入进行分层稳定压缩。之后两者复用对数深度 segmented prefix tree 合并相同坐标。跨 subrow 的 TrGT 路由或乱序的 TrGS cache line 都会置 overflow 并丢弃该响应。默认响应 FIFO 深度为 2，并以 field-wise 弹性寄存器实现；下游停顿时会保持输出稳定，并允许前级继续运行到所有弹性存储占满。
+所有阶段使用支持同周期出入的弹性 `Stream` 流水寄存器。在无背压时，流水线填满后可以每周期接收一条命令；任一级停顿都会沿 `ready` 反压到命令入口。DenseIp 在恰好一个全有效 A fiber 和一个全有效 B fiber 时直接按固定 K lane 送入 MAC，并把 MFIU 和动态列规划器输入隔离为零；这保持论文 dense IP 的固定路由和低稀疏控制翻转。显式选择 DenseIp 但输入并非该形态时仍回退到通用路径，保持 mode 与 density 解耦的接口语义。四种 mode 在 route stage 结束前选择同一组 lane `valid/A operand/B operand`，后续 MAC stage 不再保存或选择一套独立的 Gustavson operand bus，因此物理上只描述 `macLanes` 个共享乘法器和一套 operand 流水寄存器。TrIP 坐标继续用最多 4 个 A/B tag 加每 lane fiber index 表示，Gustavson 坐标只为前 `cacheLineWords` 条 lane 保存，避免为了统一接口而把坐标复制到全部 128 条 MAC lane。按 paper 参数，这一改动相对双 operand/valid payload 每个 PE row 减少 1056 bit route/MAC 流水寄存器，完整 128-row 阵列约减少 16.5 KiB 等效寄存器位；非当前 mode 的 TrIP tag 或 Gustavson 坐标 sideband 会在写入流水寄存器前清零，Gustavson 未使用的 MAC lane 也由 operand isolation 保持为零，以降低无效翻转。TrIP 利用 MFIU 输出按 fiber pair 连续排列且 valid-prefix 的性质进入 segmented prefix MRN。现在每个二叉 reduction level 后都有独立寄存器，因此 paper 配置的 radix-128 MRN 为 7 个 reduction 周期，而不是把 7 级加法压入一个组合周期；每级只在同一坐标 segment 内累加，segment 尾部产生一个输出。Gustavson 路径不再对整个 16-word cache line 构造全互比较排序器：TrGT 只对四个 subrow head 进行坐标排序，且每个 head 只能访问所属的 A-register slice；TrGS 固定广播 A0，并对已经按坐标排列的 cache-line 输入进行分层稳定压缩。之后两者复用同一组流水 MRN levels 合并相同坐标。跨 subrow 的 TrGT 路由或乱序的 TrGS cache line 都会置 overflow 并丢弃该响应。默认响应 FIFO 深度为 2，并以 field-wise 弹性寄存器实现；下游停顿时会保持输出稳定，并允许前级继续运行到所有弹性存储占满。
 
 这次流水化没有改变 `PERowCommand`/`PERowResponse` 外部协议，也没有根据 density 改写 mode。代价是 PE row 不再是一拍命令/响应模块，上层必须只依赖 Stream 握手，不能假定固定的一拍响应延迟。
 
@@ -434,7 +435,7 @@ verilator --lint-only --Wall -Wno-fatal generated-cached-gustavson/*.v
 
 当前已生成的 RTL 目录都没有 lint error。剩余 warning 主要来自 SpinalHDL 生成的枚举调试字符串、未消费的调试/诊断信号和部分保留接口，不影响功能。
 
-已对 paper 参数的单个 Gustavson/PE row 做独立 elaboration。当前论文配置保持 128 个输入 MAC lane、128-wide fiber 和 `4 x 4` fiber intersection，但将响应修正为 16 个结果 lane：MRN 每条命令最多生成 16 个 TrIP 输出，TrGS 每条 cache line 也最多提供 16 个输出。最早的全比较 MFIU 约为 `304.7 MB / 6,391,733` 行；仅包含分层 route compactor 和 value-rank prefix tree 的版本约为 `17.7 MB / 205,127` 行。加入论文 Fig. 12 对应的 A/B participating-value shift、连续 source packing 和全局 source index 后，当前 `MultiFiberIntersection.v` 约为 `35.8 MB / 419,087` 行，`OperandDistributionNetwork.v` 约为 `1.0 MB / 18,323` 行，`TrapezoidPERow.v` 则因删除直接的 `4 x 128` operand 读取网络降至约 `19.4 MB / 345,979` 行，最终 paper 单行生成约 52 秒。上述数字是生成 RTL 文本规模而非综合面积；完整 128-row 阵列的生成、lint 和综合仍属于后续规模化工作。
+已对 paper 参数的单个 Gustavson/PE row 做独立 elaboration。当前论文配置保持 128 个输入 MAC lane、128-wide fiber 和 `4 x 4` fiber intersection，但将响应修正为 16 个结果 lane：MRN 每条命令最多生成 16 个 TrIP 输出，TrGS 每条 cache line 也最多提供 16 个输出。最早的全比较 MFIU 约为 `304.7 MB / 6,391,733` 行；仅包含分层 route compactor 和 value-rank prefix tree 的版本约为 `17.7 MB / 205,127` 行。加入论文 Fig. 12 对应的 A/B participating-value shift、连续 source packing 和全局 source index 后，当前 `MultiFiberIntersection.v` 约为 `35 MB / 419,087` 行，`OperandDistributionNetwork.v` 约为 `6.2 MB / 93,331` 行。将 TrIP 与 Gustavson reduction 合并为共享的 7-level 流水 MRN 后，`TrapezoidPERow.v` 约为 `5.9 MB / 101,849` 行，paper 单行生成约 50 秒。上述数字是生成 RTL 文本规模而非综合面积；完整 128-row 阵列的生成、lint 和综合仍属于后续规模化工作。
 
 ### 3.3 四种 mode 的论文规模周期模型
 
@@ -546,18 +547,18 @@ sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
 sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 ```
 
-默认矩阵为 `256 x 256`，`HS=0.5%`、`MS=20%`、`D=100%`，每类使用 3 个固定随机样本。HS 输入按 CSR/CSC 的 FP32 value、32-bit coordinate 和 pointer 计算流量，MS 输入按 bitmask fiber 和 FP32 nonzero value 计算流量，D 输入按未压缩 FP32 计算流量；输出根据实际非零密度选择相同的格式规则。计时从矩阵描述符接受且 A/B 位于 HBM 开始，到 C 写回 HBM 结束，包含输入格式流量、global cache/HBM 服务周期、所选数据流的 issue 周期、五级 PE pipeline fill/drain 和输出写回周期。
+默认矩阵为 `256 x 256`，`HS=0.5%`、`MS=20%`、`D=100%`，每类使用 3 个固定随机样本。HS 输入按 CSR/CSC 的 FP32 value、32-bit coordinate 和 pointer 计算流量，MS 输入按 bitmask fiber 和 FP32 nonzero value 计算流量，D 输入按未压缩 FP32 计算流量；输出根据实际非零密度选择相同的格式规则。计时从矩阵描述符接受且 A/B 位于 HBM 开始，到 C 写回 HBM 结束，包含输入格式流量、global cache/HBM 服务周期、所选数据流的 issue 周期、`TrapezoidConfig.pePipelineStages` 对应的 pipeline fill/drain 和输出写回周期。paper 配置当前为 13 个寄存阶段，其中包括 7 个 MRN reduction levels 和深度为 2 的响应 FIFO。
 
 固定种子的运行结果如下，均为每类 3 个样本的算术平均值；周期在 1 GHz 下也等于 ns。
 
 | 类别 | A 密度 | B 密度 | 论文 mode | `DenseIp` | `TrIp` | `TrGt` | `TrGs` |
 | :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: |
-| HS x HS | 0.50% | 0.50% | `TrGt` | 1031.0 | 135.0 | 17.7 | 11.0 |
-| HS x MS | 0.50% | 20.00% | `TrGs` | 1062.0 | 166.0 | 287.3 | 71.0 |
-| HS x D | 0.50% | 100.00% | `TrGs` | 1128.3 | 237.3 | 1469.7 | 264.3 |
-| MS x MS | 20.00% | 20.00% | `TrIp` | 1164.0 | 269.7 | 3715.3 | 576.7 |
-| MS x D | 20.00% | 100.00% | `TrIp` | 1160.0 | 705.3 | 17629.3 | 2280.0 |
-| D x D | 100.00% | 100.00% | `DenseIp` | 1160.0 | 2184.0 | 65672.0 | 8328.0 |
+| HS x HS | 0.50% | 0.50% | `TrGt` | 1040.0 | 144.0 | 26.7 | 20.0 |
+| HS x MS | 0.50% | 20.00% | `TrGs` | 1071.0 | 175.0 | 296.3 | 80.0 |
+| HS x D | 0.50% | 100.00% | `TrGs` | 1137.3 | 246.3 | 1478.7 | 273.3 |
+| MS x MS | 20.00% | 20.00% | `TrIp` | 1173.0 | 278.7 | 3724.3 | 585.7 |
+| MS x D | 20.00% | 100.00% | `TrIp` | 1169.0 | 714.3 | 17638.3 | 2289.0 |
+| D x D | 100.00% | 100.00% | `DenseIp` | 1169.0 | 2193.0 | 65681.0 | 8337.0 |
 
 主表为 `E2E streamed`：允许输入传输与执行重叠。程序还为全部 24 个 category/mode 组合输出详细表，其中 `E2E serialized` 将输入、计算和输出完全串行，是无重叠上界。论文没有公开固定 HBM command latency，因此模型使用论文给出的 2 TB/s 带宽，不额外虚构 first-line latency。当前实现是可重复的 paper-configuration cycle model，不是论文模拟器的逐地址复刻，也不是 full-chip Verilator：它尚未模拟 cache 地址级 bank conflict、NoC 仲裁、DMA command latency 和随机背压；full-chip Verilator 在当前机器上仍受 128-row RTL 翻译内存限制。
 

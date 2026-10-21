@@ -43,11 +43,20 @@ case class PERowMacPayload(cfg: TrapezoidConfig) extends Bundle {
 /** One packed TrIP product carried through the configurable reduction tree. */
 case class PERowReducedProduct(cfg: TrapezoidConfig) extends Bundle {
   val valid = Bool()
-  val aFiber = UInt(cfg.fiberIndexWidth bits)
-  val bFiber = UInt(cfg.fiberIndexWidth bits)
+  val segmentStart = Bool()
   val row = UInt(cfg.coordinateWidth bits)
   val column = UInt(cfg.coordinateWidth bits)
   val value = SInt(cfg.accumulatorWidth bits)
+}
+
+/** Coordinate-ordered products carried through one registered MRN level. */
+case class PERowReductionPayload(cfg: TrapezoidConfig) extends Bundle {
+  val mode = TrapezoidDataflow()
+  val endOfTile = Bool()
+  val overflow = Bool()
+  val selectedColumns = UInt(log2Up(cfg.maxFibers + 1) bits)
+  val effectualMacs = UInt(cfg.matchCountWidth bits)
+  val lanes = Vec(PERowReducedProduct(cfg), cfg.macLanes)
 }
 
 case class TrapezoidPERowIo(cfg: TrapezoidConfig) extends Bundle {
@@ -117,6 +126,26 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       count := (leftCount + rightCount).resize(countWidth)
       ReductionGroup(entries, count)
     }
+  }
+
+  /** Inclusive logarithmic-depth prefix count. */
+  private def prefixCount(values: Seq[Bool]): Seq[UInt] = {
+    require(values.nonEmpty)
+    var level = values.map(_.asUInt.resize(cfg.outputCountWidth))
+    var distance = 1
+    while (distance < values.length) {
+      val previous = level
+      level = previous.indices.map { index =>
+        if (index >= distance) {
+          (previous(index) + previous(index - distance))
+            .resize(cfg.outputCountWidth)
+        } else {
+          previous(index)
+        }
+      }
+      distance *= 2
+    }
+    level
   }
 
   // Stage 0: capture one complete command and decouple the scheduler from MFIU.
@@ -317,108 +346,24 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   routeStage.ready := macInput.ready
   val macStage = macInput.m2sPipe()
 
-  // Stage 3: merge products by output coordinate with logarithmic-depth trees.
+  // Stage 3: order products and mark segment boundaries at the MRN leaves.
   val mac = macStage.payload
-  val nextResponse = PERowResponse(cfg)
-  nextResponse.mode := mac.mode
-  nextResponse.overflow := False
-  nextResponse.selectedColumns := 0
-  nextResponse.effectualMacs := 0
-  nextResponse.count := 0
-  for (out <- 0 until cfg.outputLanes) {
-    nextResponse.results(out).valid := False
-    nextResponse.results(out).row := 0
-    nextResponse.results(out).column := 0
-    nextResponse.results(out).value := 0
-    nextResponse.results(out).endOfTile := mac.endOfTile
-  }
-
   val tripMode = mac.mode === TrapezoidDataflow.DenseIp ||
     mac.mode === TrapezoidDataflow.TrIp
   val tripLeaves = (0 until cfg.macLanes).map { lane =>
     val leaf = PERowReducedProduct(cfg)
     leaf.valid := mac.laneValid(lane)
-    leaf.aFiber := mac.laneAFiber(lane)
-    leaf.bFiber := mac.laneBFiber(lane)
+    leaf.segmentStart := False
     leaf.row := mac.tripATags(mac.laneAFiber(lane))
     leaf.column := mac.tripBTags(mac.laneBFiber(lane))
     leaf.value := mac.product(lane)
     leaf
   }
-  // MFIU emits a valid prefix in pair-major order.  In reduction mode this
-  // lets the MRN use a segmented prefix tree directly: a segment is one A/B
-  // fiber pair, and only its final lane becomes an output.  No intermediate
-  // stream compaction or child-cluster merge is needed.
-  var tripSegmentedSums = tripLeaves.map(_.value)
-  var tripDistance = 1
-  while (tripDistance < cfg.macLanes) {
-    val nextLevel = Vec(SInt(cfg.accumulatorWidth bits), cfg.macLanes)
-    for (position <- 0 until cfg.macLanes) {
-      if (position < tripDistance) {
-        nextLevel(position) := tripSegmentedSums(position)
-      } else {
-        val sameSegment = tripLeaves(position).valid &&
-          tripLeaves(position - tripDistance).valid &&
-          tripLeaves(position).aFiber ===
-            tripLeaves(position - tripDistance).aFiber &&
-          tripLeaves(position).bFiber ===
-            tripLeaves(position - tripDistance).bFiber
-        nextLevel(position) := Mux(sameSegment,
-          (tripSegmentedSums(position) +
-            tripSegmentedSums(position - tripDistance))
-            .resize(cfg.accumulatorWidth),
-          tripSegmentedSums(position))
-      }
-    }
-    tripSegmentedSums = (0 until cfg.macLanes).map(nextLevel(_))
-    tripDistance *= 2
-  }
 
-  val tripSegmentEnd = Vec(Bool(), cfg.macLanes)
-  val tripSegmentPrefix = Vec(UInt(cfg.outputCountWidth bits), cfg.macLanes + 1)
-  tripSegmentPrefix(0) := 0
-  for (position <- 0 until cfg.macLanes) {
-    val nextDiffers = if (position == cfg.macLanes - 1) {
-      True
-    } else {
-      !tripLeaves(position + 1).valid ||
-        tripLeaves(position).aFiber =/= tripLeaves(position + 1).aFiber ||
-        tripLeaves(position).bFiber =/= tripLeaves(position + 1).bFiber
-    }
-    tripSegmentEnd(position) := tripLeaves(position).valid && nextDiffers
-    tripSegmentPrefix(position + 1) := tripSegmentPrefix(position) +
-      tripSegmentEnd(position).asUInt
-  }
-  for (out <- 0 until cfg.outputLanes) {
-    if (out < cfg.macLanes) {
-      for (position <- 0 until cfg.macLanes) {
-        when(tripMode && !mac.overflow && tripSegmentEnd(position) &&
-            tripSegmentPrefix(position) === out) {
-          nextResponse.results(out).valid := True
-          nextResponse.results(out).row := tripLeaves(position).row
-          nextResponse.results(out).column := tripLeaves(position).column
-          nextResponse.results(out).value := tripSegmentedSums(position)
-        }
-      }
-    }
-  }
-
-  when(tripMode) {
-    nextResponse.overflow := mac.overflow
-    nextResponse.selectedColumns := mac.selectedColumns
-    nextResponse.effectualMacs := mac.effectualMacs
-    nextResponse.count := Mux(mac.overflow, U(0),
-      tripSegmentPrefix.last).resized
-  }
-
-  // TrGT merges four coordinate-sorted subrow heads. TrGS receives one
-  // coordinate-ordered cache line and only needs stable valid-lane compaction.
-  // Both consume the same physical lane records and segmented reduction tree.
   val gustLeaves = (0 until cfg.cacheLineWords).map { lane =>
     val leaf = PERowReducedProduct(cfg)
     leaf.valid := mac.laneValid(lane)
-    leaf.aFiber := 0
-    leaf.bFiber := 0
+    leaf.segmentStart := False
     leaf.row := mac.gustRow(lane)
     leaf.column := mac.gustColumn(lane)
     leaf.value := mac.product(lane)
@@ -472,75 +417,120 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     }
   }
 
-  val sortedValid = Vec(Bool(), cfg.cacheLineWords)
-  val sortedRow = Vec(UInt(cfg.coordinateWidth bits), cfg.cacheLineWords)
-  val sortedColumn = Vec(UInt(cfg.coordinateWidth bits), cfg.cacheLineWords)
-  val sortedValue = Vec(SInt(cfg.accumulatorWidth bits), cfg.cacheLineWords)
-  for (position <- 0 until cfg.cacheLineWords) {
-    val ordered = Mux(mac.mode === TrapezoidDataflow.TrGs,
-      trGsCompacted.entries(position), trGtSorted(position))
-    sortedValid(position) := ordered.valid
-    sortedRow(position) := ordered.row
-    sortedColumn(position) := ordered.column
-    sortedValue(position) := ordered.value
-  }
-
-  var segmentedSums = (0 until cfg.cacheLineWords).map(sortedValue(_))
-  var distance = 1
-  while (distance < cfg.cacheLineWords) {
-    val nextLevel = Vec(SInt(cfg.accumulatorWidth bits), cfg.cacheLineWords)
-    for (position <- 0 until cfg.cacheLineWords) {
-      if (position < distance) {
-        nextLevel(position) := segmentedSums(position)
-      } else {
-        val sameSegment = sortedValid(position) && sortedValid(position - distance) &&
-          sortedRow(position) === sortedRow(position - distance) &&
-          sortedColumn(position) === sortedColumn(position - distance)
-        nextLevel(position) := Mux(sameSegment,
-          (segmentedSums(position) + segmentedSums(position - distance))
-            .resize(cfg.accumulatorWidth),
-          segmentedSums(position))
-      }
+  val orderedProducts = Vec(PERowReducedProduct(cfg), cfg.macLanes)
+  for (position <- 0 until cfg.macLanes) {
+    val selected = if (position < cfg.cacheLineWords) {
+      Mux(tripMode, tripLeaves(position),
+        Mux(mac.mode === TrapezoidDataflow.TrGs,
+          trGsCompacted.entries(position), trGtSorted(position)))
+    } else {
+      Mux(tripMode, tripLeaves(position),
+        PERowReducedProduct(cfg).getZero)
     }
-    segmentedSums = (0 until cfg.cacheLineWords).map(nextLevel(_))
-    distance *= 2
-  }
-
-  val segmentEnd = Vec(Bool(), cfg.cacheLineWords)
-  val segmentPrefix = Vec(UInt(cfg.outputCountWidth bits), cfg.cacheLineWords + 1)
-  segmentPrefix(0) := 0
-  for (position <- 0 until cfg.cacheLineWords) {
-    val nextDiffers = if (position == cfg.cacheLineWords - 1) {
+    orderedProducts(position).valid := selected.valid
+    orderedProducts(position).row := selected.row
+    orderedProducts(position).column := selected.column
+    orderedProducts(position).value := selected.value
+    val startsNewSegment = if (position == 0) {
       True
     } else {
-      !sortedValid(position + 1) ||
-        sortedRow(position) =/= sortedRow(position + 1) ||
-        sortedColumn(position) =/= sortedColumn(position + 1)
+      !orderedProducts(position - 1).valid ||
+        selected.row =/= orderedProducts(position - 1).row ||
+        selected.column =/= orderedProducts(position - 1).column
     }
-    segmentEnd(position) := sortedValid(position) && nextDiffers
-    segmentPrefix(position + 1) := segmentPrefix(position) + segmentEnd(position).asUInt
-    for (out <- 0 until cfg.outputLanes) {
-      when(!tripMode && !gustOrderError && segmentEnd(position) &&
-          segmentPrefix(position) === out) {
+    orderedProducts(position).segmentStart := selected.valid && startsNewSegment
+  }
+
+  val reductionInput = Stream(PERowReductionPayload(cfg))
+  reductionInput.valid := macStage.valid
+  reductionInput.payload.mode := mac.mode
+  reductionInput.payload.endOfTile := mac.endOfTile
+  reductionInput.payload.overflow := Mux(tripMode, mac.overflow, gustOrderError)
+  reductionInput.payload.selectedColumns := Mux(tripMode,
+    mac.selectedColumns, U(0))
+  reductionInput.payload.effectualMacs := Mux(tripMode,
+    mac.effectualMacs, U(0))
+  reductionInput.payload.lanes := orderedProducts
+  macStage.ready := reductionInput.ready
+
+  // The paper/SIGMA timing model assigns one cycle to each MRN level. The
+  // segmented prefix operator carries a head flag so additions never cross
+  // an output-coordinate boundary.
+  var reductionStage = reductionInput.m2sPipe()
+  for (level <- 0 until cfg.mrnReductionLevels) {
+    val reductionDistance = 1 << level
+    val levelInput = reductionStage
+    val levelOutput = Stream(PERowReductionPayload(cfg))
+    levelOutput.valid := levelInput.valid
+    levelOutput.payload.mode := levelInput.payload.mode
+    levelOutput.payload.endOfTile := levelInput.payload.endOfTile
+    levelOutput.payload.overflow := levelInput.payload.overflow
+    levelOutput.payload.selectedColumns := levelInput.payload.selectedColumns
+    levelOutput.payload.effectualMacs := levelInput.payload.effectualMacs
+    for (position <- 0 until cfg.macLanes) {
+      val right = levelInput.payload.lanes(position)
+      levelOutput.payload.lanes(position).valid := right.valid
+      levelOutput.payload.lanes(position).row := right.row
+      levelOutput.payload.lanes(position).column := right.column
+      if (position >= reductionDistance) {
+        val left = levelInput.payload.lanes(position - reductionDistance)
+        val combine = right.valid && left.valid && !right.segmentStart
+        levelOutput.payload.lanes(position).value := Mux(combine,
+          (left.value + right.value).resize(cfg.accumulatorWidth), right.value)
+        levelOutput.payload.lanes(position).segmentStart := right.valid &&
+          (right.segmentStart || left.segmentStart)
+      } else {
+        levelOutput.payload.lanes(position).value := right.value
+        levelOutput.payload.lanes(position).segmentStart := right.segmentStart
+      }
+    }
+    levelInput.ready := levelOutput.ready
+    reductionStage = levelOutput.m2sPipe()
+  }
+
+  // Final MRN stage: emit only segment tails and compact them to output lanes.
+  val reduced = reductionStage.payload
+  val segmentEnd = Vec(Bool(), cfg.macLanes)
+  for (position <- 0 until cfg.macLanes) {
+    val current = reduced.lanes(position)
+    val nextDiffers = if (position == cfg.macLanes - 1) {
+      True
+    } else {
+      val next = reduced.lanes(position + 1)
+      !next.valid || current.row =/= next.row || current.column =/= next.column
+    }
+    segmentEnd(position) := current.valid && nextDiffers
+  }
+  val segmentPrefix = prefixCount((0 until cfg.macLanes).map(segmentEnd(_)))
+
+  val nextResponse = PERowResponse(cfg)
+  nextResponse.mode := reduced.mode
+  nextResponse.overflow := reduced.overflow
+  nextResponse.selectedColumns := reduced.selectedColumns
+  nextResponse.effectualMacs := reduced.effectualMacs
+  nextResponse.count := Mux(reduced.overflow, U(0), segmentPrefix.last).resized
+  for (out <- 0 until cfg.outputLanes) {
+    nextResponse.results(out).valid := False
+    nextResponse.results(out).row := 0
+    nextResponse.results(out).column := 0
+    nextResponse.results(out).value := 0
+    nextResponse.results(out).endOfTile := reduced.endOfTile
+    for (position <- 0 until cfg.macLanes) {
+      val outputIndex = segmentPrefix(position) - 1
+      when(!reduced.overflow && segmentEnd(position) && outputIndex === out) {
         nextResponse.results(out).valid := True
-        nextResponse.results(out).row := sortedRow(position)
-        nextResponse.results(out).column := sortedColumn(position)
-        nextResponse.results(out).value := segmentedSums(position)
+        nextResponse.results(out).row := reduced.lanes(position).row
+        nextResponse.results(out).column := reduced.lanes(position).column
+        nextResponse.results(out).value := reduced.lanes(position).value
       }
     }
   }
 
-  when(!tripMode) {
-    nextResponse.overflow := gustOrderError
-    nextResponse.count := Mux(gustOrderError, U(0), segmentPrefix.last).resized
-  }
-
-  // Stage 4: field-wise elastic registers preserve response ordering and make
-  // backpressure independent of whether a target can infer a very-wide FIFO.
+  // Final elastic response FIFO preserves order under downstream backpressure.
   val responseInput = Stream(PERowResponse(cfg))
-  responseInput.valid := macStage.valid
+  responseInput.valid := reductionStage.valid
   responseInput.payload := nextResponse
-  macStage.ready := responseInput.ready
+  reductionStage.ready := responseInput.ready
   val outputStage = (0 until cfg.responseFifoDepth).foldLeft(responseInput) {
     (stage, _) => stage.m2sPipe()
   }

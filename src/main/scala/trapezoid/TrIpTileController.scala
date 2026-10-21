@@ -112,12 +112,14 @@ class TrIpPERowArray(
   * load order. Every PE row matches all response lanes to the four banks at
   * one line address and scatters all four-word lines in one controller stage.
   * DenseIp and TrIp are both accepted at any input density; mode selection is
-  * always controlled by the caller.
+  * always controlled by the caller. When mode-shared local buffers are
+  * enabled, ownership must only change while this controller is idle.
   */
 class TrIpTileController(
     tileCfg: TrIpTileConfig,
     peFactory: TrapezoidConfig => TrapezoidPERowComponent =
-      cfg => new TrapezoidPERow(cfg)
+      cfg => new TrapezoidPERow(cfg),
+    modeSharedLocalBuffers: Boolean = false
 ) extends Component {
   private val cfg = tileCfg.core
   private val fiberCounterWidth = log2Up(cfg.maxFibers + 1)
@@ -145,6 +147,10 @@ class TrIpTileController(
     val candidateColumnCount = out UInt(fiberCounterWidth bits)
     val activeRows = out Bits(cfg.peRows bits)
     val denseBypassActive = out Bool()
+    val localBufferOwners = if (modeSharedLocalBuffers)
+      in Vec(LocalBufferOwner(), cfg.peRows) else null
+    val gustavsonLocalBuffers = if (modeSharedLocalBuffers)
+      Vec(slave(LocalBufferBus(cfg)), cfg.peRows) else null
   }
 
   val aStorage = Vec((0 until tileCfg.maxRows).map(_ => Reg(CompressedFiber(cfg))))
@@ -351,7 +357,38 @@ class TrIpTileController(
       state === TrIpTileState.AbortDrain
   peArray.io.responseReady := peResponseReady
 
-  val localBuffers = Array.fill(cfg.peRows)(new BankedLocalBuffer(cfg))
+  val privateLocalBuffers = if (modeSharedLocalBuffers) {
+    Array.empty[BankedLocalBuffer]
+  } else {
+    Array.fill(cfg.peRows)(new BankedLocalBuffer(cfg))
+  }
+  val sharedLocalBuffers = if (modeSharedLocalBuffers) {
+    Array.fill(cfg.peRows)(new ModeSharedLocalBuffer(cfg))
+  } else {
+    Array.empty[ModeSharedLocalBuffer]
+  }
+  val localBufferBuses: IndexedSeq[LocalBufferBus] =
+    if (modeSharedLocalBuffers) {
+      for (pe <- 0 until cfg.peRows) yield {
+        val shared = sharedLocalBuffers(pe)
+        shared.io.owner := io.localBufferOwners(pe)
+        for (bank <- 0 until cfg.localBanks) {
+          shared.io.gustavson.writes(bank).valid :=
+            io.gustavsonLocalBuffers(pe).writes(bank).valid
+          shared.io.gustavson.writes(bank).payload :=
+            io.gustavsonLocalBuffers(pe).writes(bank).payload
+          shared.io.gustavson.readCommands(bank).valid :=
+            io.gustavsonLocalBuffers(pe).readCommands(bank).valid
+          shared.io.gustavson.readCommands(bank).payload :=
+            io.gustavsonLocalBuffers(pe).readCommands(bank).payload
+          io.gustavsonLocalBuffers(pe).readResponses(bank) :=
+            shared.io.gustavson.readResponses(bank)
+        }
+        shared.io.trip
+      }
+    } else {
+      privateLocalBuffers.map(_.io.bus).toIndexedSeq
+    }
   val scatterWordValid = Vec(Bool(), pendingWordCount)
   val scatterWordExisting = Vec(Bool(), pendingWordCount)
   val scatterWordValue = Vec(SInt(cfg.accumulatorWidth bits), pendingWordCount)
@@ -469,7 +506,7 @@ class TrIpTileController(
   val outputCellValid = outputRowValid(outputColumnSlot)
 
   for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
-    val buffer = localBuffers(pe)
+    val buffer = localBufferBuses(pe)
     val line = pe * cfg.localBanks + bank
     val directData = Bits(cfg.localLineWidth bits)
     val directMask = Bits(cfg.localLineBytes bits)
@@ -490,7 +527,8 @@ class TrIpTileController(
         B((BigInt(1) << (cfg.accumulatorWidth / 8)) - 1,
           (cfg.accumulatorWidth / 8) bits), B(0, (cfg.accumulatorWidth / 8) bits))
 
-      val oldWord = buffer.io.bus.readResponses(bank).payload(dataHigh downto dataLow).asSInt
+      val oldWord = buffer.readResponses(bank).payload(
+        dataHigh downto dataLow).asSInt
       val mergedWord = Mux(pendingWordExisting(slot),
         (oldWord + pendingWordValue(slot)).resized, pendingWordValue(slot))
       accumulatedData(dataHigh downto dataLow) := mergedWord.asBits
@@ -499,38 +537,38 @@ class TrIpTileController(
           (cfg.accumulatorWidth / 8) bits), B(0, (cfg.accumulatorWidth / 8) bits))
     }
 
-    buffer.io.bus.writes(bank).valid := False
-    buffer.io.bus.writes(bank).payload.address := 0
-    buffer.io.bus.writes(bank).payload.data := 0
-    buffer.io.bus.writes(bank).payload.mask := 0
-    buffer.io.bus.readCommands(bank).valid := False
-    buffer.io.bus.readCommands(bank).payload := 0
+    buffer.writes(bank).valid := False
+    buffer.writes(bank).payload.address := 0
+    buffer.writes(bank).payload.data := 0
+    buffer.writes(bank).payload.mask := 0
+    buffer.readCommands(bank).valid := False
+    buffer.readCommands(bank).payload := 0
 
     when(state === TrIpTileState.Scatter && scatterLineValid(line) &&
         !scatterLineExisting(line)) {
-      buffer.io.bus.writes(bank).valid := True
-      buffer.io.bus.writes(bank).payload.address := scatterLineAddress
-      buffer.io.bus.writes(bank).payload.data := directData
-      buffer.io.bus.writes(bank).payload.mask := directMask
+      buffer.writes(bank).valid := True
+      buffer.writes(bank).payload.address := scatterLineAddress
+      buffer.writes(bank).payload.data := directData
+      buffer.writes(bank).payload.mask := directMask
     }
 
     when(state === TrIpTileState.Scatter && scatterLineExisting(line)) {
-      buffer.io.bus.readCommands(bank).valid := True
-      buffer.io.bus.readCommands(bank).payload := scatterLineAddress
+      buffer.readCommands(bank).valid := True
+      buffer.readCommands(bank).payload := scatterLineAddress
     }
 
     when(state === TrIpTileState.ScatterAccumWait && pendingValid(line) &&
-        buffer.io.bus.readResponses(bank).valid) {
-      buffer.io.bus.writes(bank).valid := True
-      buffer.io.bus.writes(bank).payload.address := pendingAddress(line)
-      buffer.io.bus.writes(bank).payload.data := accumulatedData
-      buffer.io.bus.writes(bank).payload.mask := accumulatedMask
+        buffer.readResponses(bank).valid) {
+      buffer.writes(bank).valid := True
+      buffer.writes(bank).payload.address := pendingAddress(line)
+      buffer.writes(bank).payload.data := accumulatedData
+      buffer.writes(bank).payload.mask := accumulatedMask
     }
 
     when(state === TrIpTileState.ReadPlan && outputCellValid &&
         outputPe === pe && outputBank === bank) {
-      buffer.io.bus.readCommands(bank).valid := True
-      buffer.io.bus.readCommands(bank).payload := outputAddress
+      buffer.readCommands(bank).valid := True
+      buffer.readCommands(bank).payload := outputAddress
     }
   }
 
@@ -540,7 +578,7 @@ class TrIpTileController(
   for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
     val line = pe * cfg.localBanks + bank
     when(pendingValid(line) &&
-        !localBuffers(pe).io.bus.readResponses(bank).valid) {
+        !localBufferBuses(pe).readResponses(bank).valid) {
       accumulationReady := False
     }
   }
@@ -551,12 +589,12 @@ class TrIpTileController(
   selectedReadData := 0
   for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
     when(outputPe === pe && outputBank === bank) {
-      selectedReadValid := localBuffers(pe).io.bus.readResponses(bank).valid
+      selectedReadValid := localBufferBuses(pe).readResponses(bank).valid
       for (word <- 0 until cfg.localWordsPerBank) {
         val high = (word + 1) * cfg.accumulatorWidth - 1
         val low = word * cfg.accumulatorWidth
         when(outputWord === word) {
-          selectedReadData := localBuffers(pe).io.bus.readResponses(bank)
+          selectedReadData := localBufferBuses(pe).readResponses(bank)
             .payload(high downto low)
         }
       }
@@ -842,4 +880,14 @@ object GenerateTrIpTileController extends App {
     targetDirectory = "generated-tile",
     oneFilePerComponent = true
   ).generate(new TrIpTileController(TrIpTileConfig(TrapezoidConfig.small)))
+}
+
+object GenerateSharedTrIpTileController extends App {
+  SpinalConfig(
+    mode = Verilog,
+    targetDirectory = "generated-shared-tile",
+    oneFilePerComponent = true
+  ).generate(new TrIpTileController(
+    TrIpTileConfig(TrapezoidConfig.small),
+    modeSharedLocalBuffers = true))
 }

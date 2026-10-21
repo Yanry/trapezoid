@@ -75,6 +75,12 @@ class TrapezoidStructureSpec extends AnyFunSuite {
       tileCfg, maxMatrixRows = 8, maxMatrixColumns = 8, maxKTiles = 1)))
   }
 
+  test("TrIP tile controller elaborates with mode-shared local buffers") {
+    elaborate(new TrIpTileController(
+      TrIpTileConfig(cfg, maxColumns = 4),
+      modeSharedLocalBuffers = true))
+  }
+
   test("banked read cache elaborates") {
     elaborate(new BankedReadCache(CacheConfig(
       wordWidth = 8, wordsPerLine = 4, addressWidth = 6,

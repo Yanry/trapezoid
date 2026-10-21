@@ -36,6 +36,17 @@ class TrIpTileControllerSpec extends AnyFunSuite {
     dut.io.result.ready #= false
   }
 
+  private def initializeSharedBuffers(dut: TrIpTileController): Unit = {
+    initialize(dut)
+    for (pe <- 0 until cfg.peRows) {
+      dut.io.localBufferOwners(pe) #= LocalBufferOwner.TrIp
+      for (bank <- 0 until cfg.localBanks) {
+        dut.io.gustavsonLocalBuffers(pe).writes(bank).valid #= false
+        dut.io.gustavsonLocalBuffers(pe).readCommands(bank).valid #= false
+      }
+    }
+  }
+
   private def driveFiber(target: IndexedFiber, index: Int, fiber: BitmaskFiber): Unit = {
     target.index #= index
     target.fiber.valid #= true
@@ -269,6 +280,32 @@ class TrIpTileControllerSpec extends AnyFunSuite {
       } yield (row, column) -> (MatrixReference.multiply(aTiles(0), bTiles(0))(row, column) +
         MatrixReference.multiply(aTiles(1), bTiles(1))(row, column))
       assert(observed.toMap == expected.toMap)
+    }
+  }
+
+  test("TrIP results remain accessible through the shared Gustavson SRAM port") {
+    simConfig.compile(new TrIpTileController(
+      tileCfg, modeSharedLocalBuffers = true)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      initializeSharedBuffers(dut)
+
+      val a = DenseMatrix(Vector(Vector(2L, 0L, 0L, 0L)))
+      val b = DenseMatrix(Vector(Vector(3L), Vector(0L),
+        Vector(0L), Vector(0L)))
+      assert(execute(dut, TrapezoidDataflow.TrIp, a, b,
+        new Random(0x51a2)) == DenseMatrix(Vector(Vector(6L))))
+
+      dut.io.localBufferOwners(0) #= LocalBufferOwner.Gustavson
+      dut.io.gustavsonLocalBuffers(0).readCommands(0).payload #= 0
+      dut.io.gustavsonLocalBuffers(0).readCommands(0).valid #= true
+      dut.clockDomain.waitSampling()
+      dut.io.gustavsonLocalBuffers(0).readCommands(0).valid #= false
+      sleep(1)
+
+      val wordMask = (BigInt(1) << cfg.accumulatorWidth) - 1
+      assert(dut.io.gustavsonLocalBuffers(0).readResponses(0).valid.toBoolean)
+      assert((dut.io.gustavsonLocalBuffers(0).readResponses(0).payload.toBigInt &
+        wordMask) == 6)
     }
   }
 }

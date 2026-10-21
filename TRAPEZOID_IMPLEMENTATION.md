@@ -118,7 +118,9 @@ PE row 已拆分为以下弹性流水阶段：
 
 `TrIpTileController` 为每个 PE row 例化独立的四 bank buffer，使用 `A fiber/subrow -> bank`、`B column / 4 -> address`、`B column % 4 -> word` 的映射。TrIP 乘积现在携带 `destinationBank` 和 `destinationWordOffset` 穿过各级 MRN，归约结果可直接按短目的索引落入四个 bank 的四个 word，不再让每个结果与全部 A/B 坐标做宽比较。一个 `PERowResponse` 的最多 `4 x 4` 个结果可在一个 scatter 阶段并行掩码写入；跨 K tile 时则并行读出相关 bank line、逐 word 累加后写回。结果最终仍按 row-major 顺序从对应 PE buffer 读回。
 
-`ModeSharedLocalBuffer` 在一个物理 `BankedLocalBuffer` 前增加 TrIP/Gustavson mode ownership。新请求只进入当前 owner；每个 bank 独立保存同步读请求的 owner，因此即使下一拍切换 mode，返回数据仍送回原客户端。`BankedGustavsonBFifo` 已使用该共享实例：Gustavson owner 下四个 bank 作为四条 TrGT subrow FIFO，TrIP owner 下 FIFO 状态冻结，四 bank SRAM 可由 TrIP 端口直接访问；owner 改变时队列指针、occupancy 和预取 valid 自动失效，但 SRAM 本体不做高功耗清零。当前 TrIP tile controller 尚未接到这个端口，完成统一执行顶层后即可删除两套物理 buffer 的重复实例。
+`ModeSharedLocalBuffer` 在一个物理 `BankedLocalBuffer` 前增加 TrIP/Gustavson mode ownership。新请求只进入当前 owner；每个 bank 独立保存同步读请求的 owner，因此即使下一拍切换 mode，返回数据仍送回原客户端。`BankedGustavsonBFifo` 已使用该共享实例：Gustavson owner 下四个 bank 作为四条 TrGT subrow FIFO，TrIP owner 下 FIFO 状态冻结，四 bank SRAM 可由 TrIP 端口直接访问；owner 改变时队列指针、occupancy 和预取 valid 自动失效，但 SRAM 本体不做高功耗清零。
+
+`TrIpTileController` 的 `modeSharedLocalBuffers` 配置现在会把每个 PE row 的 scatter、跨 K 读改写和结果读回直接连接到 `ModeSharedLocalBuffer.trip`，同时向统一顶层暴露 owner 和 Gustavson 客户端端口。RTL 测试已验证 TrIP 写入的结果在切换 owner 后可由 Gustavson 端口从同一 bank/address 读出。owner 必须在 TrIP controller 空闲时切换。默认配置仍保留私有 buffer，以维持已有生成入口的接口兼容；下一步需要让统一四 mode 顶层启用共享配置，并把实际 TrGT/TrGS 存储客户端连接到暴露端口。
 
 Gustavson cache adapter 对两种 mode 使用不同分发方式。TrGT 在 cache line 内用游标跳过无效槽，并把每个有效 B 元素送到 `aIndex` 所属的 subrow lane；因此一条含 `E` 个有效元素的缓存行需要 `E` 次 PE 命令握手，末元素才结束该行或 tile。TrGS 则把一条有序缓存行中的全部有效元素在一次命令中空间展开，并统一引用广播的 A0。上述发射周期属于 cache-to-PE 分发阶段，后面还要叠加 PE 流水、tile accumulator 和结果写回周期。
 

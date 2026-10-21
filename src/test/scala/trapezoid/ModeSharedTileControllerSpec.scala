@@ -169,7 +169,7 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
 
       val trgsCommand = dut.io.trgsCommand(0)
       trgsCommand.payload.mode #= TrapezoidDataflow.TrGs
-      trgsCommand.payload.endOfTile #= true
+      trgsCommand.payload.endOfTile #= false
       trgsCommand.payload.a.valid #= true
       trgsCommand.payload.a.row #= 8
       trgsCommand.payload.a.k #= 1
@@ -194,6 +194,19 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
       assert(!dut.io.tripStart.ready.toBoolean)
       dut.io.tripStart.valid #= false
 
+      trgsCommand.payload.endOfTile #= true
+      trgsCommand.payload.a.k #= 2
+      trgsCommand.payload.a.value #= 2
+      for (lane <- 0 until cfg.cacheLineWords) {
+        val element = trgsCommand.payload.b(lane)
+        element.k #= 2
+        element.value #= (if (lane == 0) 4 else 0)
+      }
+      trgsCommand.valid #= true
+      while (!trgsCommand.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      trgsCommand.valid #= false
+
       val trgsResults = mutable.ArrayBuffer.empty[(Int, Int, Long)]
       timeout = 0
       while ((dut.io.trgsDone.toBigInt & 1) == 0 && timeout < 300) {
@@ -208,8 +221,8 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
         timeout += 1
       }
       assert((dut.io.trgsDone.toBigInt & 1) != 0)
-      assert(trgsResults == Seq((8, 3, 30L)))
-      assert(dut.io.trgsAccumulatorUpdates(0).toLong == 1)
+      assert(trgsResults == Seq((8, 3, 38L)))
+      assert(dut.io.trgsAccumulatorUpdates(0).toLong == 2)
       assert((dut.io.trgsOverflow.toBigInt & 1) == 0)
       assert((dut.io.trgsUnsupportedMode.toBigInt & 1) == 0)
       dut.clockDomain.waitSampling()

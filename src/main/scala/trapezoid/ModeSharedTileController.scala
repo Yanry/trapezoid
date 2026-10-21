@@ -16,7 +16,8 @@ object ModeSharedPeClient extends SpinalEnum {
   */
 class ModeSharedTileController(
     tripCfg: TrIpTileConfig,
-    gustavsonCfg: GustavsonTileConfig
+    gustavsonCfg: GustavsonTileConfig,
+    wideTrGsOutput: Boolean = false
 ) extends Component {
   private val cfg = tripCfg.core
   private val peInFlightWidth = log2Up(cfg.pePipelineStages + 2)
@@ -66,7 +67,9 @@ class ModeSharedTileController(
     new TrGtSubrowScheduler(gustavsonCfg,
       externalFifoStorage = true, externalPe = true))
   val trgs = Array.fill(cfg.peRows)(
-    new TrGsSpatialEngine(gustavsonCfg, externalPe = true))
+    new TrGsSpatialEngine(gustavsonCfg, wideOutput = wideTrGsOutput,
+      externalPe = true,
+      externalAccumulatorStorage = true))
   val peRows = Array.fill(cfg.peRows)(new TrapezoidPERow(cfg))
   val trgtOwned = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
   val trgsOwned = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
@@ -196,12 +199,33 @@ class ModeSharedTileController(
     io.localBufferOwners(row) := owner
     trip.io.localBufferOwners(row) := owner
     for (bank <- 0 until cfg.localBanks) {
-      trip.io.gustavsonLocalBuffers(row).writes(bank) :=
-        scheduler.io.fifoStorage.writes(bank)
-      trip.io.gustavsonLocalBuffers(row).readCommands(bank) :=
-        scheduler.io.fifoStorage.readCommands(bank)
-      scheduler.io.fifoStorage.readResponses(bank) :=
-        trip.io.gustavsonLocalBuffers(row).readResponses(bank)
+      val buffer = trip.io.gustavsonLocalBuffers(row)
+      val trgsUsesBuffer = trgsOwned(row)
+      buffer.writes(bank).valid := Mux(trgsUsesBuffer,
+        spatial.io.accumulatorStorage.writes(bank).valid,
+        scheduler.io.fifoStorage.writes(bank).valid)
+      buffer.writes(bank).payload := Mux(trgsUsesBuffer,
+        spatial.io.accumulatorStorage.writes(bank).payload,
+        scheduler.io.fifoStorage.writes(bank).payload)
+      buffer.readCommands(bank).valid := Mux(trgsUsesBuffer,
+        spatial.io.accumulatorStorage.readCommands(bank).valid,
+        scheduler.io.fifoStorage.readCommands(bank).valid)
+      buffer.readCommands(bank).payload := Mux(trgsUsesBuffer,
+        spatial.io.accumulatorStorage.readCommands(bank).payload,
+        scheduler.io.fifoStorage.readCommands(bank).payload)
+
+      val readForTrgs = RegInit(False)
+      when(buffer.readCommands(bank).valid) {
+        readForTrgs := trgsUsesBuffer
+      }
+      scheduler.io.fifoStorage.readResponses(bank).valid :=
+        buffer.readResponses(bank).valid && !readForTrgs
+      scheduler.io.fifoStorage.readResponses(bank).payload :=
+        buffer.readResponses(bank).payload
+      spatial.io.accumulatorStorage.readResponses(bank).valid :=
+        buffer.readResponses(bank).valid && readForTrgs
+      spatial.io.accumulatorStorage.readResponses(bank).payload :=
+        buffer.readResponses(bank).payload
     }
 
     when(scheduler.io.start.fire) {

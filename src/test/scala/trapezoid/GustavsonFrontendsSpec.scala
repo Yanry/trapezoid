@@ -59,6 +59,41 @@ class ExternalBufferedTrGtHarness(tileCfg: GustavsonTileConfig)
   io.issuedBElements := scheduler.io.issuedBElements
 }
 
+class ExternalBufferedTrGsHarness(tileCfg: GustavsonTileConfig,
+                                  wideOutput: Boolean) extends Component {
+  private val cfg = tileCfg.core
+
+  val io = new Bundle {
+    val clear = in Bool()
+    val command = slave(Stream(TrGsCommand(cfg)))
+    val result = master(Stream(MatrixResult(cfg)))
+    val resultLine = master(Stream(MatrixResultLine(cfg)))
+    val done = out Bool()
+    val overflow = out Bool()
+    val accumulatorUpdates = out UInt(32 bits)
+    val bankReplayCycles = out UInt(32 bits)
+  }
+
+  val engine = new TrGsSpatialEngine(tileCfg, wideOutput = wideOutput,
+    externalAccumulatorStorage = true)
+  val storage = new BankedLocalBuffer(cfg)
+  engine.io.clear := io.clear
+  engine.io.command <> io.command
+  io.result <> engine.io.result
+  io.resultLine <> engine.io.resultLine
+  io.done := engine.io.done
+  io.overflow := engine.io.overflow
+  io.accumulatorUpdates := engine.io.accumulatorUpdates
+  io.bankReplayCycles := engine.io.bankReplayCycles
+  for (bank <- 0 until cfg.localBanks) {
+    storage.io.bus.writes(bank) := engine.io.accumulatorStorage.writes(bank)
+    storage.io.bus.readCommands(bank) :=
+      engine.io.accumulatorStorage.readCommands(bank)
+    engine.io.accumulatorStorage.readResponses(bank) :=
+      storage.io.bus.readResponses(bank)
+  }
+}
+
 class GustavsonFrontendsSpec extends AnyFunSuite {
   private val cfg = TrapezoidConfig(
     dataWidth = 8,
@@ -586,6 +621,73 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
         Seq(false, false, false, false, false, true))
       assert(!dut.io.result.valid.toBoolean)
       assert(!dut.io.overflow.toBoolean)
+    }
+  }
+
+  test("TrGS accumulates and prefetches wide output through external SRAM") {
+    simConfig.compile(new ExternalBufferedTrGsHarness(
+      tileCfg, wideOutput = true)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.command.valid #= false
+      dut.io.result.ready #= false
+      dut.io.resultLine.ready #= true
+
+      def issue(k: Int, aValue: Int, leftValue: Int, rightValue: Int,
+                endOfTile: Boolean): Unit = {
+        dut.io.command.payload.mode #= TrapezoidDataflow.TrGs
+        dut.io.command.payload.endOfTile #= endOfTile
+        dut.io.command.payload.a.valid #= true
+        dut.io.command.payload.a.row #= 9
+        dut.io.command.payload.a.k #= k
+        dut.io.command.payload.a.value #= aValue
+        for (lane <- 0 until cfg.cacheLineWords) {
+          val element = dut.io.command.payload.b(lane)
+          element.valid #= lane < 2
+          element.k #= k
+          element.column #= (if (lane == 0) 0 else if (lane == 1) 4 else 0)
+          element.value #= (if (lane == 0) leftValue
+            else if (lane == 1) rightValue else 0)
+        }
+        dut.io.command.valid #= true
+        sleep(1)
+        while (!dut.io.command.ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        sleep(1)
+        dut.io.command.valid #= false
+      }
+
+      issue(k = 0, aValue = 2, leftValue = 3, rightValue = 5,
+        endOfTile = false)
+      issue(k = 1, aValue = 3, leftValue = 7, rightValue = 11,
+        endOfTile = true)
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      var lineCount = 0
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 300) {
+        sleep(1)
+        if (dut.io.resultLine.valid.toBoolean &&
+            dut.io.resultLine.ready.toBoolean) {
+          lineCount += 1
+          for (lane <- 0 until cfg.cacheLineWords) {
+            val result = dut.io.resultLine.payload.results(lane)
+            if (result.valid.toBoolean) {
+              observed += ((result.row.toInt, result.column.toInt,
+                result.value.toLong))
+            }
+          }
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+
+      assert(dut.io.done.toBoolean)
+      assert(!dut.io.overflow.toBoolean)
+      assert(lineCount == 2)
+      assert(observed == Seq((9, 0, 27L), (9, 4, 43L)))
+      assert(dut.io.accumulatorUpdates.toLong == 4)
+      assert(dut.io.bankReplayCycles.toLong > 0)
     }
   }
 

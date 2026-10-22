@@ -592,12 +592,51 @@ class TrGsSpatialEngine(
           updateMask(maskHigh downto maskLow).setAll()
         }
       }
+      val forwardedDelta = SInt(cfg.accumulatorWidth bits)
+      forwardedDelta := 0
+      var earlierForward: Bool = False
+      for (lane <- 0 until cfg.outputLanes) {
+        val result = responseReg.results(lane)
+        val resultSlot = result.column(tileCfg.entryIndexWidth - 1 downto 0)
+        val resultWordInBank = (resultSlot >> bankIndexWidth)
+          .resize(tileCfg.entryIndexWidth)
+        val resultLineAddress = (resultWordInBank >> cfg.localWordIndexWidth)
+          .resize(cfg.localAddressWidth)
+        val resultWordOffset = resultWordInBank
+          .resize(cfg.localWordIndexWidth)
+        when(pendingResults(lane) && result.valid &&
+            storageBankBusy(bank) &&
+            result.column(bankIndexWidth - 1 downto 0) === bank &&
+            resultLineAddress === storageUpdateAddress(bank) &&
+            resultWordOffset === storageUpdateWord(bank) &&
+            !earlierForward) {
+          forwardedDelta := result.value
+        }
+        earlierForward = earlierForward ||
+          (pendingResults(lane) && result.valid &&
+            storageBankBusy(bank) &&
+            result.column(bankIndexWidth - 1 downto 0) === bank &&
+            resultLineAddress === storageUpdateAddress(bank) &&
+            resultWordOffset === storageUpdateWord(bank))
+      }
+      val updatedValueWithForward =
+        (oldValue + storageUpdateValue(bank) + forwardedDelta).resized
       when(storageBankBusy(bank) &&
           io.accumulatorStorage.readResponses(bank).valid) {
         io.accumulatorStorage.writes(bank).valid := True
         io.accumulatorStorage.writes(bank).payload.address :=
           storageUpdateAddress(bank)
-        io.accumulatorStorage.writes(bank).payload.data := updateData
+        val writeData = Bits(cfg.localLineWidth bits)
+        writeData := updateData
+        for (word <- 0 until cfg.localWordsPerBank) {
+          when(storageUpdateWord(bank) === word) {
+            val dataHigh = (word + 1) * cfg.accumulatorWidth - 1
+            val dataLow = word * cfg.accumulatorWidth
+            writeData(dataHigh downto dataLow) :=
+              updatedValueWithForward.asBits
+          }
+        }
+        io.accumulatorStorage.writes(bank).payload.data := writeData
         io.accumulatorStorage.writes(bank).payload.mask := updateMask
         storageBankBusy(bank) := False
         completedRmw(bank) := True
@@ -610,9 +649,21 @@ class TrGsSpatialEngine(
     var earlierMatch: Bool = False
     for (lane <- 0 until cfg.outputLanes) {
       val result = responseReg.results(lane)
+      val resultSlot = result.column(tileCfg.entryIndexWidth - 1 downto 0)
+      val resultWordInBank = (resultSlot >> bankIndexWidth)
+        .resize(tileCfg.entryIndexWidth)
+      val resultLineAddress = (resultWordInBank >> cfg.localWordIndexWidth)
+        .resize(cfg.localAddressWidth)
+      val resultWordOffset = resultWordInBank.resize(cfg.localWordIndexWidth)
+      val samePendingSlot = if (externalAccumulatorStorage) {
+        storageBankBusy(bank) &&
+          resultLineAddress === storageUpdateAddress(bank) &&
+          resultWordOffset === storageUpdateWord(bank)
+      } else False
       val bankMatches = pendingResults(lane) && result.valid &&
         result.column(bankIndexWidth - 1 downto 0) === bank &&
-        (if (externalAccumulatorStorage) !storageBankBusy(bank) else True)
+        (if (externalAccumulatorStorage)
+          !storageBankBusy(bank) || samePendingSlot else True)
       bankGrants(bank)(lane) := bankMatches && !earlierMatch
       earlierMatch = earlierMatch || bankMatches
     }
@@ -648,6 +699,11 @@ class TrGsSpatialEngine(
     val grantFound = bankGrants(bank).orR
     val result = responseReg.results(grantLane)
     val slot = result.column(tileCfg.entryIndexWidth - 1 downto 0)
+    val wordInBank = (slot >> bankIndexWidth)
+      .resize(tileCfg.entryIndexWidth)
+    val lineAddress = (wordInBank >> cfg.localWordIndexWidth)
+      .resize(cfg.localAddressWidth)
+    val wordOffset = wordInBank.resize(cfg.localWordIndexWidth)
     val expectedColumn = UInt(cfg.coordinateWidth bits)
     expectedColumn := tileColumnBase | slot.resize(cfg.coordinateWidth)
     val coordinateCollision = tileRow =/= result.row ||
@@ -661,26 +717,33 @@ class TrGsSpatialEngine(
       !coordinateCollision && !selectedSlotValid
     grantedUpdates(bank) := responseActive && grantFound &&
       !coordinateCollision && !responseReg.overflow &&
-      (if (externalAccumulatorStorage) !selectedSlotValid else True)
+      (if (externalAccumulatorStorage) {
+        !selectedSlotValid || storageBankBusy(bank) &&
+          lineAddress === storageUpdateAddress(bank) &&
+          wordOffset === storageUpdateWord(bank)
+      } else True)
 
     when(responseActive && grantFound && !responseReg.overflow) {
       when(coordinateCollision) {
         overflowReg := True
       } otherwise {
         if (externalAccumulatorStorage) {
-          val wordInBank = (slot >> bankIndexWidth)
-            .resize(tileCfg.entryIndexWidth)
-          val lineAddress = (wordInBank >> cfg.localWordIndexWidth)
-            .resize(cfg.localAddressWidth)
-          val wordOffset = wordInBank.resize(cfg.localWordIndexWidth)
           when(selectedSlotValid) {
-            io.accumulatorStorage.readCommands(bank).valid := True
-            io.accumulatorStorage.readCommands(bank).payload := lineAddress
-            storageUpdateAddress(bank) := lineAddress
-            storageUpdateWord(bank) := wordOffset
-            storageUpdateValue(bank) := result.value
-            storageBankBusy(bank) := True
-            updateReadsIssued(bank) := True
+            val samePendingSlot = storageBankBusy(bank) &&
+              lineAddress === storageUpdateAddress(bank) &&
+              wordOffset === storageUpdateWord(bank)
+            when(samePendingSlot) {
+              storageUpdateValue(bank) :=
+                (storageUpdateValue(bank) + result.value).resized
+            } otherwise {
+              io.accumulatorStorage.readCommands(bank).valid := True
+              io.accumulatorStorage.readCommands(bank).payload := lineAddress
+              storageUpdateAddress(bank) := lineAddress
+              storageUpdateWord(bank) := wordOffset
+              storageUpdateValue(bank) := result.value
+              storageBankBusy(bank) := True
+              updateReadsIssued(bank) := True
+            }
           } otherwise {
             val directData = Bits(cfg.localLineWidth bits)
             val directMask = Bits(cfg.localLineBytes bits)

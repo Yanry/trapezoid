@@ -592,7 +592,7 @@ sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 
 当前 TrGT/TrGS 已能在任意 lane density 下完成命令内归约、跨命令累加、有序 flush、SRAM subrow FIFO 调度、多 PE row 分配和共享结果仲裁，但尚未完成：
 
-- 将当前每 bank 单 outstanding 的 TrGS SRAM 读改写扩展为带 forwarding 的流水，减少同 bank 更新气泡；
+- 将当前每 bank 单 outstanding 的 TrGS SRAM 读改写扩展为支持多个 pending delta 的 forwarding 流水，进一步减少同 bank 更新气泡；
 - 将通用 Gustavson 有序寄存器 accumulator 替换为可扩展的本地 buffer/双流 merge tree；
 - 在 first-free 分配之上增加 row 成本估计、公平仲裁和描述符驱动的负载均衡；
 - 从 CSR row pointer 自动生成 B-row cache 区间，以及 DMA/HBM refill 流程。
@@ -697,7 +697,7 @@ sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 
 ## 6. 建议的近期任务
 
-PE row 方向下一轮应为 TrGS 的四 bank SRAM read-modify-write 增加同地址 forwarding，使每 bank 从当前单 outstanding 更新提升到每周期可接收一次无依赖更新。随后将通用 Gustavson 的寄存器逐项插入替换为流水化 SRAM 双流 merge，并用 16/32/64/128 lane 配置综合，根据报告确定 MFIU、Benes 路由和 reduction tree 的附加寄存器位置。
+PE row 方向已为 TrGS 的四 bank SRAM read-modify-write 增加同地址 forwarding：等待 SRAM 返回时，命中同一 bank/line/word 的新 delta 会直接并入当前写回值。下一轮应把该单条 forwarding 槽扩展为多个 pending delta，并将通用 Gustavson 的寄存器逐项插入替换为流水化 SRAM 双流 merge；同时用 16/32/64/128 lane 配置综合，根据报告确定 MFIU、Benes 路由和 reduction tree 的附加寄存器位置。
 
 系统方向仍需实现简单 DMA/AXI refill 和 CSR/CSC row/column pointer walker，使软件不再直接提供固定宽度 fiber/B-row 地址。cache/Gustavson 仲裁器也仍需增加 round-robin 公平策略。
 

@@ -38,7 +38,7 @@ object EndToEndCycleSimulation extends App {
     addressWidth = 12,
     bankCount = 8,
     setsPerBank = 64,
-    clientCount = 5,
+    clientCount = cfg.peRows + 4,
     requestIdWidth = 8
   )
   private val gustCfg = GustavsonCacheConfig(
@@ -95,6 +95,13 @@ object EndToEndCycleSimulation extends App {
     Category("D x D", denseBasisPoints, denseBasisPoints, "DenseIp")
   )
   private val modeOrder = Vector("DenseIp", "TrIp", "TrGt", "TrGs")
+  private val categoryFilter = sys.props.get("trapezoid.bench.category")
+  private val modeFilter = sys.props.get("trapezoid.bench.mode")
+  private val selectedCategories = categories.filter(category =>
+    categoryFilter.forall(_ == category.name))
+  private val selectedModes = modeOrder.filter(mode => modeFilter.forall(_ == mode))
+  require(selectedCategories.nonEmpty, s"unknown benchmark category $categoryFilter")
+  require(selectedModes.nonEmpty, s"unknown benchmark mode $modeFilter")
 
   private def nonZerosFor(basisPoints: Int): Int =
     ((dimension.toLong * dimension * basisPoints + 5000) / 10000).toInt
@@ -133,6 +140,11 @@ object EndToEndCycleSimulation extends App {
     record
   }
 
+  private def encodeDenseFiber(tag: Int, dense: Vector[Long]): BigInt = {
+    val allValid = (BigInt(1) << cfg.fiberWidth) - 1
+    encodeFiber(BitmaskFiber(tag, cfg.fiberWidth, allValid, dense))
+  }
+
   private def recordLines(record: BigInt): Vector[BigInt] = {
     val lineMask = (BigInt(1) << cacheCfg.lineWidth) - 1
     Vector.tabulate(fiberCacheCfg.linesPerFiber) { line =>
@@ -140,15 +152,17 @@ object EndToEndCycleSimulation extends App {
     }
   }
 
-  private def ipMemory(workload: Workload): Map[Int, BigInt] = {
+  private def ipMemory(workload: Workload, modeName: String): Map[Int, BigInt] = {
+    val denseInput = modeName == "DenseIp"
     val kTiles = dimension / cfg.fiberWidth
     val aLines = for {
       row <- 0 until dimension
       tile <- 0 until kTiles
-      fiber = MatrixReference.encodeFiber(row,
-        workload.a.values(row).slice(tile * cfg.fiberWidth,
-          (tile + 1) * cfg.fiberWidth))
-      (data, line) <- recordLines(encodeFiber(fiber)).zipWithIndex
+      dense = workload.a.values(row).slice(tile * cfg.fiberWidth,
+        (tile + 1) * cfg.fiberWidth)
+      fiber = if (denseInput) encodeDenseFiber(row, dense)
+        else encodeFiber(MatrixReference.encodeFiber(row, dense))
+      (data, line) <- recordLines(fiber).zipWithIndex
       ordinal = row * matrixCfg.maxKTiles + tile
     } yield ipABase + ordinal * fiberCacheCfg.linesPerFiber + line -> data
     val bLines = for {
@@ -157,8 +171,9 @@ object EndToEndCycleSimulation extends App {
       dense = Vector.tabulate(cfg.fiberWidth) { offset =>
         workload.b(tile * cfg.fiberWidth + offset, column)
       }
-      fiber = MatrixReference.encodeFiber(column, dense)
-      (data, line) <- recordLines(encodeFiber(fiber)).zipWithIndex
+      fiber = if (denseInput) encodeDenseFiber(column, dense)
+        else encodeFiber(MatrixReference.encodeFiber(column, dense))
+      (data, line) <- recordLines(fiber).zipWithIndex
       ordinal = tile * matrixCfg.maxMatrixColumns + column
     } yield ipBBase + ordinal * fiberCacheCfg.linesPerFiber + line -> data
     (aLines ++ bLines).toMap
@@ -285,7 +300,7 @@ object EndToEndCycleSimulation extends App {
         case "TrGt" => TrapezoidDataflow.TrGt
         case "TrGs" => TrapezoidDataflow.TrGs
       }
-      val memory = ipMemory(workload) ++ csrMemory(workload)
+      val memory = ipMemory(workload, modeName) ++ csrMemory(workload)
       val expected = expectedEntries(workload)
       val observed = mutable.Map.empty[(Int, Int), Long]
       val pendingReads = mutable.Queue.empty[PendingRead]
@@ -390,7 +405,10 @@ object EndToEndCycleSimulation extends App {
 
       require(startEdge >= 0, s"$modeName descriptor was not accepted")
       require(finalEdge >= 0,
-        s"$modeName ${workload.category.name} timed out")
+        s"$modeName ${workload.category.name} timed out: " +
+          s"trgtPhase=${dut.io.trgtPhase.toInt}, " +
+          s"schedulerBusy=${dut.io.trgtSchedulerBusy.toBoolean}, " +
+          s"fifo=${dut.io.trgtFifoOccupancy.toInt}")
       require(!dut.io.error.toBoolean,
         s"$modeName ${workload.category.name} reported an RTL error")
       require(observed.toMap == expected,
@@ -405,16 +423,17 @@ object EndToEndCycleSimulation extends App {
         usefulMacs(workload), checksum(observed))
     }
 
-    for (workload <- workloads; mode <- modeOrder) {
+    for (workload <- workloads if selectedCategories.contains(workload.category);
+         mode <- selectedModes) {
       measurements += run(workload, mode)
     }
   }
 
-  for (workload <- workloads) {
+  for (workload <- workloads if selectedCategories.contains(workload.category)) {
     val selected = measurements.filter(measurement =>
       measurement.category == workload.category &&
         measurement.sample == workload.sample)
-    require(selected.size == modeOrder.size)
+    require(selected.size == selectedModes.size)
     require(selected.map(_.checksum).distinct.size == 1,
       s"all modes must agree for ${workload.category.name} sample ${workload.sample}")
   }
@@ -437,10 +456,12 @@ object EndToEndCycleSimulation extends App {
   println(s"Cold cache; read DMA latency: $readLatencyCycles cycles; " +
     s"write response latency: $writeLatencyCycles cycles")
   println("Boundary: unified descriptor acceptance through the final C DMA write response.")
-  println("| Category | A density | B density | Paper mode | DenseIp | TrIp | TrGt | TrGs |")
-  println("| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: |")
-  categories.foreach { category =>
-    val cycles = modeOrder.map(mode =>
+  println(s"| Category | A density | B density | Paper mode | " +
+    s"${selectedModes.mkString(" | ")} |")
+  println(s"| :--- | ---: | ---: | :--- | " +
+    s"${selectedModes.map(_ => "---:").mkString(" | ")} |")
+  selectedCategories.foreach { category =>
+    val cycles = selectedModes.map(mode =>
       f"${average(category, mode)(_.totalCycles)}%.1f")
     println(s"| ${category.name} | ${densityText(category.aBasisPoints)} | " +
       s"${densityText(category.bBasisPoints)} | ${category.paperMode} | " +
@@ -451,7 +472,7 @@ object EndToEndCycleSimulation extends App {
   println("| Category | Mode | Total | First C write | Read DMA active | " +
     "Write DMA active | Reads | Writes | Hits | Misses | Useful MACs |")
   println("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
-  for (category <- categories; mode <- modeOrder) {
+  for (category <- selectedCategories; mode <- selectedModes) {
     println(f"| ${category.name}%s | $mode%s | " +
       f"${average(category, mode)(_.totalCycles)}%.1f | " +
       f"${average(category, mode)(_.firstWriteCycles)}%.1f | " +

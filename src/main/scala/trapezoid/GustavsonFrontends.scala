@@ -214,10 +214,12 @@ class TrGtSubrowScheduler(
         localStorage.io.bus.readResponses(bank)
     }
   }
+  val preloadActive = !aLoadRequiresReset && !finishSeen
+  val acceptingPushes = running || preloadActive
   for (subrow <- 0 until subrows) {
-    fifos.io.pushes(subrow).valid := io.bPush(subrow).valid && running && !finishSeen
+    fifos.io.pushes(subrow).valid := io.bPush(subrow).valid && acceptingPushes
     fifos.io.pushes(subrow).payload := io.bPush(subrow).payload
-    io.bPush(subrow).ready := fifos.io.pushes(subrow).ready && running && !finishSeen
+    io.bPush(subrow).ready := fifos.io.pushes(subrow).ready && acceptingPushes
     io.fifoOccupancy(subrow) := fifos.io.occupancy(subrow)
   }
 
@@ -240,6 +242,8 @@ class TrGtSubrowScheduler(
   io.aLoad.ready := !io.clear && !running && !engine.io.busy && !io.start.valid
   when(io.aLoad.fire) {
     when(aLoadRequiresReset) {
+      acceptedBElements := 0
+      issuedBElements := 0
       for (subrow <- 0 until subrows;
            offset <- 0 until cfg.macLanesPerSubrow) {
         aLoaded(subrow)(offset) := False
@@ -259,8 +263,10 @@ class TrGtSubrowScheduler(
   io.start.ready := !io.clear && !running && !engine.io.busy && !io.aLoad.valid
   when(io.start.fire) {
     controlDone := False
-    acceptedBElements := 0
-    issuedBElements := 0
+    when(aLoadRequiresReset) {
+      acceptedBElements := 0
+      issuedBElements := 0
+    }
     modeError := io.start.payload.mode =/= TrapezoidDataflow.TrGt
     when(io.start.payload.mode === TrapezoidDataflow.TrGt) {
       running := True

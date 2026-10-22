@@ -522,7 +522,7 @@ paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用�
 
 `EndToEndCycleSimulation` 使用真实 Verilator RTL 对六类稀疏度组合和四种 mode 做完整交叉测试，共运行 `6 categories x 4 modes x 3 samples = 72` 次。统一的 `UnifiedMatrixDescriptor` 同时携带 IP fiber、CSR A、B-row descriptor 和 C 写回区域地址。计时从该 descriptor 握手开始，直到最后一次 C DMA write response 握手结束。
 
-缩比配置为 `4 PE rows x 16 MACs`，global cache 由 `4 clusters x 2 banks` 组成。五个 cache client 分别服务 IP-A、IP-B、CSR walker、TrGT B-row 和 TrGS B-row；cluster 根据 cache-line 地址选择，cluster 内继续执行真实 tag lookup、bank 仲裁、miss/refill 和客户端背压。读 DMA 使用固定 12-cycle refill latency，C 写 DMA 使用固定 6-cycle response latency：
+缩比配置为 `4 PE rows x 16 MACs`，global cache 由 `4 clusters x 2 banks` 组成。8 个 cache client 分别服务 IP-A、IP-B、CSR walker、4 个独立 TrGT PE-row B 流和 TrGS B 流；cluster 根据 cache-line 地址选择，cluster 内继续执行真实 tag lookup、bank 仲裁、miss/refill 和客户端背压。读 DMA 使用固定 12-cycle refill latency，C 写 DMA 使用固定 6-cycle response latency：
 
 ```bash
 sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
@@ -532,20 +532,24 @@ sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
 
 DenseIp/TrIP 由 descriptor 自动启动固定宽度 fiber loader。TrGT/TrGS 由 `CsrGustavsonDescriptorFrontend` 从 cache/DMA 读取 A row pointer、A `(k,value)` entry 和 B-row `(base,lineCount)` descriptor，再自动产生所有 B-row command。结果通过 `ResultWritebackDma` 写入 C 区域；当前格式为每个非零 `(row,column,value)` 使用一个 cache line，并且写端一次只允许一个 outstanding transaction，因此写响应背压会真实传播到 PE 结果端口。
 
+DenseIp 的测试输入使用全有效 mask 和包含零值的固定宽度 value slots，TrIP 使用压缩 bitmask fiber，因此两者的 RTL 数据移动语义不再相同。TrGT 将每个 CSR A 行的非零项按行内序号交错分配到四个 temporal subrow，允许在 `start` 前预填四路 SRAM FIFO；完整 A 行再由 `CachedTrGtRowScheduler` 分配到四个独立 PE row，使 CSR 解析、B-row miss/refill、计算和结果排空可以跨行重叠。
+
 输出表包含总周期、首次 C write 周期、读/写 DMA active 周期、DMA 请求数、cache hit/miss 和有效 MAC 数。所有周期都来自 Verilator 时钟边沿，没有解析 compute-cycle 公式。旧的 cache-to-result 边界保留为 `CacheToResultCycleSimulation`，仅用于与之前结果对照。
 
 当前固定种子的顶层 `Total cycles` 平均值如下。每个数字都来自 Verilator 时钟边沿计数，不使用解析 compute-cycle 公式：
 
 | 类别 | A密度 | B密度 | 论文mode | `DenseIp` | `TrIp` | `TrGt` | `TrGs` |
 | :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: |
-| HS x HS | 0.39% | 0.39% | `TrGt` | 1524.0 | 1524.0 | 356.0 | 356.0 |
-| HS x MS | 0.39% | 19.92% | `TrGs` | 1559.0 | 1559.0 | 356.0 | 356.0 |
-| HS x D | 0.39% | 100.00% | `TrGs` | 1644.0 | 1644.0 | 406.0 | 356.0 |
-| MS x MS | 19.92% | 19.92% | `TrIp` | 2359.0 | 2359.0 | 2686.0 | 2065.0 |
-| MS x D | 19.92% | 100.00% | `TrIp` | 3409.3 | 3409.3 | 10214.0 | 2785.7 |
-| D x D | 100.00% | 100.00% | `DenseIp` | 3820.0 | 3884.0 | 50941.0 | 13867.0 |
+| HS x HS | 0.39% | 0.39% | `TrGt` | 1876.0 | 1524.0 | 357.0 | 356.0 |
+| HS x MS | 0.39% | 19.92% | `TrGs` | 1911.0 | 1559.0 | 357.7 | 356.0 |
+| HS x D | 0.39% | 100.00% | `TrGs` | 1996.0 | 1644.0 | 450.0 | 356.0 |
+| MS x MS | 19.92% | 19.92% | `TrIp` | 2713.7 | 2359.0 | 2113.0 | 2065.0 |
+| MS x D | 19.92% | 100.00% | `TrIp` | 3777.3 | 3409.3 | 3596.7 | 2785.7 |
+| D x D | 100.00% | 100.00% | `DenseIp` | 3820.0 | 3884.0 | 15467.0 | 13867.0 |
 
-表中小数来自三个整数周期样本的平均值。IP 路径使用固定宽度 bitmask fiber，因此冷 cache 下不同稀疏度仍请求相同的输入 fiber；Gustavson 路径的 CSR metadata 和压缩 B-row 都进入 cache/DMA 周期。TrGT 逐个发送 B 元素，TrGS 按 cache line 空间发送，因此 B 较密时 TrGS 明显更快。所有 mode 都需要等待 C write response，所以输出非零数较大时写回延迟会成为可见瓶颈。
+表中小数来自三个整数周期样本的平均值。DenseIp 始终搬运全有效固定宽度 fiber，TrIP 才利用 bitmask 跳过无效 MAC，因此 `D x D` 中 DenseIp 最快、稀疏输入中 TrIP 更快。Gustavson 路径的 CSR metadata 和压缩 B-row 都进入 cache/DMA 周期；TrGT 逐元素送入四路 temporal FIFO，TrGS 按 cache line 空间发送，因此 B 较密时 TrGS 明显更快。TrGT 从单 PE-row 串行执行改成四行并行后，`MS x MS` 从 4047.3 降至 2113.0 周期，证明跨行重叠已进入实际 RTL 计时。
+
+当前缩比表仍未完全恢复论文的 mode 交叉点。`16 x 16` 的 HS 密度只有一个全局非零，`HS x HS` 总周期由共同的 CSR 空行扫描决定，四路 TrGT 无法形成并行度；因此 TrGT 与 TrGS 只差 1 周期。`MS x MS` 和 `MS x D` 中 TrGS 仍快于论文推荐的 TrIP，详细表显示 TrIP 要完成所有 K tile 和整个 output tile 后才开始 C 写，且不同 output tile 串行执行；TrGS 则能在四个 PE row 上边取数、边计算、边写回。下一步应为 TrIP 增加双缓冲 fiber storage、K tile 预取和 output-tile overlap，而不是在测试中增加人工 mode 延迟。
 
 这些数字是当前缩比 RTL 的 descriptor-to-write-response 周期，而不是论文 `128 x 128` full-array 周期。CSR walker、四 cluster cache、读 DMA refill 和最终 C 写响应已经进入边界，但当前 CSR metadata 为每个 pointer/entry/descriptor 占一条 cache line，C 也为每个非零结果占一条 line；尚未实现论文存储格式的紧凑 burst packing、写 cache、多个 write outstanding、真实 HBM channel/queue 和 AXI transaction。论文配置 full-array Verilator 在当前机器上仍会因生成规模和内存占用失败。
 

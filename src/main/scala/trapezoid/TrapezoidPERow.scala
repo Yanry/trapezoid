@@ -514,7 +514,12 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     }
     segmentEnd(position) := current.valid && nextDiffers
   }
-  val segmentPrefix = prefixCount((0 until cfg.macLanes).map(segmentEnd(_)))
+  // DenseIp deliberately carries zero-valued lanes.  Keep those lanes in the
+  // reduction, but do not turn a zero sum into a sparse C entry.
+  val nonZeroSegmentEnd = (0 until cfg.macLanes).map { position =>
+    segmentEnd(position) && reduced.lanes(position).value =/= 0
+  }
+  val segmentPrefix = prefixCount(nonZeroSegmentEnd)
 
   val nextResponse = PERowResponse(cfg)
   nextResponse.mode := reduced.mode
@@ -532,7 +537,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     nextResponse.destinationWordOffset(out) := 0
     for (position <- 0 until cfg.macLanes) {
       val outputIndex = segmentPrefix(position) - 1
-      when(!reduced.overflow && segmentEnd(position) && outputIndex === out) {
+      when(!reduced.overflow && nonZeroSegmentEnd(position) &&
+          outputIndex === out) {
         nextResponse.results(out).valid := True
         nextResponse.results(out).row := reduced.lanes(position).row
         nextResponse.results(out).column := reduced.lanes(position).column

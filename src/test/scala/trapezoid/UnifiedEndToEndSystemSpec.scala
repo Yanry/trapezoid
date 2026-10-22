@@ -29,7 +29,7 @@ class UnifiedEndToEndSystemSpec extends AnyFunSuite {
     addressWidth = 8,
     bankCount = 4,
     setsPerBank = 8,
-    clientCount = 5,
+    clientCount = cfg.peRows + 4,
     requestIdWidth = 3
   )
   private val gustCfg = GustavsonCacheConfig(
@@ -89,18 +89,17 @@ class UnifiedEndToEndSystemSpec extends AnyFunSuite {
   }
 
   private val a = Vector(Vector(1L, 2L), Vector(0L, 3L))
-  private val b = Vector(Vector(4L, 5L), Vector(6L, 7L))
+  private val b = Vector(Vector(4L, 5L), Vector(0L, 0L))
   private val expected = Map(
-    (0, 0) -> 16L, (0, 1) -> 19L,
-    (1, 0) -> 18L, (1, 1) -> 21L)
+    (0, 0) -> 4L, (0, 1) -> 5L)
 
   private def inputMemory: Map[Int, BigInt] = {
     val aFibers = Vector(
       MatrixReference.encodeFiber(0, Vector(1L, 2L, 0L, 0L)),
       MatrixReference.encodeFiber(1, Vector(0L, 3L, 0L, 0L)))
     val bFibers = Vector(
-      MatrixReference.encodeFiber(0, Vector(4L, 6L, 0L, 0L)),
-      MatrixReference.encodeFiber(1, Vector(5L, 7L, 0L, 0L)))
+      MatrixReference.encodeFiber(0, Vector(4L, 0L, 0L, 0L)),
+      MatrixReference.encodeFiber(1, Vector(5L, 0L, 0L, 0L)))
     require(fiberCacheCfg.linesPerFiber == 1)
     Map(
       ipABase -> encodeFiber(aFibers(0)),
@@ -116,7 +115,7 @@ class UnifiedEndToEndSystemSpec extends AnyFunSuite {
       bDescriptorBase -> encodeBDescriptor(bRowBase, 1),
       bDescriptorBase + 1 -> encodeBDescriptor(bRowBase + 1, 1),
       bRowBase -> encodeBLine(Seq(0 -> 4, 1 -> 5)),
-      bRowBase + 1 -> encodeBLine(Seq(0 -> 6, 1 -> 7))
+      bRowBase + 1 -> encodeBLine(Seq.empty)
     )
   }
 

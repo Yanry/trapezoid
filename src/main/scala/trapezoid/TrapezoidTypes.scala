@@ -237,3 +237,41 @@ case class CachedGustavsonBRowCommand(gustCfg: GustavsonCacheConfig) extends Bun
   val bBaseAddress = UInt(gustCfg.cache.addressWidth bits)
   val lineCount = UInt(gustCfg.lineCountWidth bits)
 }
+
+/** One software-visible descriptor for all four Trapezoid dataflows.
+  *
+  * DenseIp/TrIp use the fixed-width fiber regions. TrGT/TrGS use CSR A rows;
+  * every A entry selects a B-row descriptor containing its packed cache-line
+  * region. C is written as one coordinate/value record per DMA line.
+  */
+case class UnifiedMatrixDescriptor(systemCfg: EndToEndSystemConfig) extends Bundle {
+  private val matrixCfg = systemCfg.matrix
+  private val cacheCfg = systemCfg.cache
+
+  val mode = TrapezoidDataflow()
+  val rowCount = UInt(matrixCfg.rowCountWidth bits)
+  val columnCount = UInt(matrixCfg.columnCountWidth bits)
+  val kTileCount = UInt(matrixCfg.kTileCountWidth bits)
+
+  val ipABaseAddress = UInt(cacheCfg.addressWidth bits)
+  val ipBBaseAddress = UInt(cacheCfg.addressWidth bits)
+
+  val csrRowPointerBase = UInt(cacheCfg.addressWidth bits)
+  val csrAEntryBase = UInt(cacheCfg.addressWidth bits)
+  val csrBRowDescriptorBase = UInt(cacheCfg.addressWidth bits)
+
+  val cBaseAddress = UInt(cacheCfg.addressWidth bits)
+}
+
+/** One cache-line write issued by the result DMA. */
+case class DmaWriteRequest(cacheCfg: CacheConfig) extends Bundle {
+  val address = UInt(cacheCfg.addressWidth bits)
+  val data = Bits(cacheCfg.lineWidth bits)
+  val mask = Bits((cacheCfg.lineWidth / 8) bits)
+}
+
+/** Completion for one result DMA write. */
+case class DmaWriteResponse(cacheCfg: CacheConfig) extends Bundle {
+  val address = UInt(cacheCfg.addressWidth bits)
+  val error = Bool()
+}

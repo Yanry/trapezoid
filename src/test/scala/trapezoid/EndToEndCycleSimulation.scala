@@ -16,7 +16,7 @@ import scala.util.Random
   * lookup, deterministic HBM refill latency, RTL execution, accumulation, and
   * result drain. Final C memory writes remain outside the current RTL boundary.
   */
-object EndToEndCycleSimulation extends App {
+object CacheToResultCycleSimulation extends App {
   private val dimension = 16
   private val samplesPerCategory = 3
   private val hbmLatencyCycles = 12

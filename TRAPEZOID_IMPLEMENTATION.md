@@ -369,7 +369,7 @@ sbt -batch 'runMain trapezoid.GeneratePaperTrGsSpatialRowScheduler'
 
 ### 3.1 功能验证
 
-当前共有 49 项自动测试，执行方式为：
+当前共有 64 项自动测试，执行方式为：
 
 ```bash
 sbt -batch test
@@ -518,9 +518,11 @@ paper RTL 基准中 `DenseIp`/`TrIp` 周期相同，是因为当前两者共用�
 - 研究 MFIU、动态列打包和 merge/reduction 行为；
 - 作为后续调度器、cache 层次和 FPGA/ASIC 综合工作的基础。
 
-### 3.5 Cache-to-result 端到端 RTL 周期仿真
+### 3.5 Descriptor-to-C-write-response 端到端 RTL 周期仿真
 
-`EndToEndCycleSimulation` 使用真实 Verilator RTL 对六类稀疏度组合和四种 mode 做完整交叉测试，共运行 `6 categories x 4 modes x 3 samples = 72` 次。每次运行都逐元素检查 RTL 输出，并从任务边界持续计数到最后结果或无结果 tile 的 `done`。该入口使用可在当前机器稳定运行的 `4 PE rows x 16 MACs` 缩比配置，同时包含冷 cache lookup、bank 仲裁、固定 12-cycle HBM refill、PE 流水、跨命令或跨 K tile 累加以及结果排空：
+`EndToEndCycleSimulation` 使用真实 Verilator RTL 对六类稀疏度组合和四种 mode 做完整交叉测试，共运行 `6 categories x 4 modes x 3 samples = 72` 次。统一的 `UnifiedMatrixDescriptor` 同时携带 IP fiber、CSR A、B-row descriptor 和 C 写回区域地址。计时从该 descriptor 握手开始，直到最后一次 C DMA write response 握手结束。
+
+缩比配置为 `4 PE rows x 16 MACs`，global cache 由 `4 clusters x 2 banks` 组成。五个 cache client 分别服务 IP-A、IP-B、CSR walker、TrGT B-row 和 TrGS B-row；cluster 根据 cache-line 地址选择，cluster 内继续执行真实 tag lookup、bank 仲裁、miss/refill 和客户端背压。读 DMA 使用固定 12-cycle refill latency，C 写 DMA 使用固定 6-cycle response latency：
 
 ```bash
 sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
@@ -528,22 +530,24 @@ sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
 
 六类为 `HS x HS`、`HS x MS`、`HS x D`、`MS x MS`、`MS x D` 和 `D x D`。目标密度是 `HS=0.5%`、`MS=20%`、`D=100%`；受 `16 x 16` 离散粒度限制，实际精确非零率为 `0.39%`、`19.92%` 和 `100%`，且每个样本强制保留一个共同 K 坐标以避免 HS workload 全部退化为空乘法。四种 mode 都运行所有六类，不按 density 限制接口。
 
-输出表包含总周期、首结果周期、输入接收完成周期、HBM active 周期、refill/hit/miss 数量、有效 MAC、结果数量和 checksum。DenseIp/TrIP 的起点是 cached matrix descriptor 握手；TrGT/TrGS 当前缺少矩阵描述符前端，因此起点是第一条 cached B-row command 握手。终点是最后一个结果完成握手且所有 output tile 完成。测试使用始终 ready 的结果接收端，因此没有人为加入输出背压。
+DenseIp/TrIP 由 descriptor 自动启动固定宽度 fiber loader。TrGT/TrGS 由 `CsrGustavsonDescriptorFrontend` 从 cache/DMA 读取 A row pointer、A `(k,value)` entry 和 B-row `(base,lineCount)` descriptor，再自动产生所有 B-row command。结果通过 `ResultWritebackDma` 写入 C 区域；当前格式为每个非零 `(row,column,value)` 使用一个 cache line，并且写端一次只允许一个 outstanding transaction，因此写响应背压会真实传播到 PE 结果端口。
+
+输出表包含总周期、首次 C write 周期、读/写 DMA active 周期、DMA 请求数、cache hit/miss 和有效 MAC 数。所有周期都来自 Verilator 时钟边沿，没有解析 compute-cycle 公式。旧的 cache-to-result 边界保留为 `CacheToResultCycleSimulation`，仅用于与之前结果对照。
 
 当前固定种子的顶层 `Total cycles` 平均值如下。每个数字都来自 Verilator 时钟边沿计数，不使用解析 compute-cycle 公式：
 
 | 类别 | A密度 | B密度 | 论文mode | `DenseIp` | `TrIp` | `TrGt` | `TrGs` |
 | :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: |
-| HS x HS | 0.39% | 0.39% | `TrGt` | 1360.0 | 1360.0 | 100.0 | 100.0 |
-| HS x MS | 0.39% | 19.92% | `TrGs` | 1381.0 | 1381.0 | 488.0 | 140.7 |
-| HS x D | 0.39% | 100.00% | `TrGs` | 1405.0 | 1405.0 | 1555.0 | 283.0 |
-| MS x MS | 19.92% | 19.92% | `TrIp` | 1724.0 | 1724.0 | 1237.0 | 550.7 |
-| MS x D | 19.92% | 100.00% | `TrIp` | 1995.0 | 1995.0 | 5910.0 | 1534.3 |
-| D x D | 100.00% | 100.00% | `DenseIp` | 2219.0 | 2283.0 | 28842.0 | 4439.0 |
+| HS x HS | 0.39% | 0.39% | `TrGt` | 1524.0 | 1524.0 | 356.0 | 356.0 |
+| HS x MS | 0.39% | 19.92% | `TrGs` | 1559.0 | 1559.0 | 356.0 | 356.0 |
+| HS x D | 0.39% | 100.00% | `TrGs` | 1644.0 | 1644.0 | 406.0 | 356.0 |
+| MS x MS | 19.92% | 19.92% | `TrIp` | 2359.0 | 2359.0 | 2686.0 | 2065.0 |
+| MS x D | 19.92% | 100.00% | `TrIp` | 3409.3 | 3409.3 | 10214.0 | 2785.7 |
+| D x D | 100.00% | 100.00% | `DenseIp` | 3820.0 | 3884.0 | 50941.0 | 13867.0 |
 
-表中小数来自三个整数周期样本的平均值。IP路径使用固定宽度 bitmask fiber，因此冷 cache 下不同稀疏度仍请求相同的64条输入cache line，低密度结果主要体现计算和输出排空差异；Gustavson路径使用压缩B row cache区域，refill数量会随B密度变化。TrGT逐个发送B元素，TrGS按cache line空间发送，因此B较密时TrGS明显更快。
+表中小数来自三个整数周期样本的平均值。IP 路径使用固定宽度 bitmask fiber，因此冷 cache 下不同稀疏度仍请求相同的输入 fiber；Gustavson 路径的 CSR metadata 和压缩 B-row 都进入 cache/DMA 周期。TrGT 逐个发送 B 元素，TrGS 按 cache line 空间发送，因此 B 较密时 TrGS 明显更快。所有 mode 都需要等待 C write response，所以输出非零数较大时写回延迟会成为可见瓶颈。
 
-这些数字是当前缩比 RTL 的 cache-to-result 顶层周期，而不是论文 `128 x 128` full-array 周期。Gustavson A/CSR pointer 读取、四 cluster cache、真实 HBM channel/queue、DMA 和最终 C 写回仍在边界之外；这些模块完成后，应保持同一个计时接口，将起点前移到统一矩阵描述符，将终点后移到最后一次 C 写响应。论文配置 full-array Verilator 在当前机器上仍会因生成规模和内存占用失败。
+这些数字是当前缩比 RTL 的 descriptor-to-write-response 周期，而不是论文 `128 x 128` full-array 周期。CSR walker、四 cluster cache、读 DMA refill 和最终 C 写响应已经进入边界，但当前 CSR metadata 为每个 pointer/entry/descriptor 占一条 cache line，C 也为每个非零结果占一条 line；尚未实现论文存储格式的紧凑 burst packing、写 cache、多个 write outstanding、真实 HBM channel/queue 和 AXI transaction。论文配置 full-array Verilator 在当前机器上仍会因生成规模和内存占用失败。
 
 ### 3.6 论文配置的稀疏度端到端周期仿真
 
@@ -570,23 +574,24 @@ sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 
 论文使用 128 个真实 workload，而不是统一的 `256 x 256` 随机矩阵；因此这里遵循的是论文硬件配置、稀疏度分类、存储格式和 mode 映射，不能把表中绝对周期与论文图中的 workload 周期直接逐项比较。要复现论文最终图表，还需要导入论文 Table III/IV 对应矩阵、执行 coordinate/occupancy tiling，并补齐上述逐地址争用模型。
 
-它目前还不是可以直接连接 HBM 并独立执行完整矩阵乘法的加速器系统。
+它目前具有抽象的 DMA read/write Stream 边界，但还不是可以直接连接标准 AXI/HBM 控制器并独立执行论文格式矩阵乘法的完整芯片系统。
 
 ## 4. 当前限制
 
 ### 4.1 调度器覆盖范围
 
-`TrIpTileController` 已完成 bitmask/IP tile 和跨 K 累加，`TrIpMatrixController` 已完成描述符驱动的 M/N/K 外层循环，cached wrapper 也能从固定跨度的 bitmask fiber 区自动取数，但尚未实现：
+`TrIpTileController` 已完成 bitmask/IP tile 和跨 K 累加，`TrIpMatrixController` 已完成描述符驱动的 M/N/K 外层循环，cached wrapper 也能从固定跨度的 bitmask fiber 区自动取数。统一顶层已能从 CSR A row pointer、A entry 和 B-row descriptor 自动生成 Gustavson command，但尚未实现：
 
-- 从内存中的可变长 CSR/CSC 指针和 index 数组自动生成 fiber；
-- 从矩阵描述符生成 Gustavson tile，并进行代价感知的多 PE row 负载均衡；
+- 将紧凑可变长 CSR/CSC pointer/index/value burst 自动转换为 TrIP bitmask fiber；
+- 将当前每个 CSR metadata 占一条 cache line 的验证格式替换为论文式紧凑打包；
+- 对 descriptor 生成的 Gustavson tile 进行代价感知的多 PE row/cluster 负载均衡；
 - 面向软件的寄存器组、描述符队列或指令译码器。
 
 当前设计刻意不实现根据 density 自动选择 mode。未来即使增加启发式推荐器，也必须保留软件显式覆盖 mode 的能力。
 
 ### 4.2 缺少全局 cache 和 DMA
 
-当前已实现一个参数化 multi-client、multi-bank direct-mapped 读 cache，以及每 bank 一个独立 miss 的共享 refill 协议。TrIP 矩阵前端和 Gustavson B-row 前端都已经与实际 cache、外部 refill 端口封装成完整读系统，但仍未实现论文中的 4 个 cache cluster、完整 32 x 32 cluster 互连、写 cache/dirty eviction、HBM 请求和 DMA。TrIP/TrGT/TrGS 的每行 PE owner 仲裁、mode-shared buffer 和 tile 生命周期控制已经集成到 `ModeSharedTileController`；后续需要把 cached matrix/B-row 前端接入该顶层，并加入描述符级 mode 调度。
+当前已实现参数化 multi-client、multi-bank direct-mapped 读 cache，以及 `ClusteredReadCache` 的多 cluster 组织。统一端到端缩比顶层配置为 4 个 cluster，每个 cluster 独立包含 bank/tag/data/miss 状态，cluster refill 经过共享 DMA 端口仲裁。TrIP fiber、CSR metadata 和 Gustavson B-row 已由同一 descriptor 驱动并共享该层次；结果也经过带 response 的写 DMA。不过仍未实现论文的每 cluster 32 banks/32 clients 规模、完整 cluster NoC、写 cache/dirty eviction、多个 outstanding write、HBM channel/queue 和标准 AXI/HBM 协议。`ModeSharedTileController` 中的共享 PE/SRAM 也还没有替换统一测试顶层中分别实例化的 IP、TrGT 和 TrGS scheduler，下一步需要合并两者以避免测试系统复制计算阵列。
 
 ### 4.3 Gustavson 存储和并行调度仍待完成
 

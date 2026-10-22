@@ -250,3 +250,41 @@ case class GustavsonCacheConfig(
 
   val lineCountWidth: Int = log2Up(maxLinesPerRow + 1)
 }
+
+/** Physical organization of the shared global read cache. */
+case class CacheClusterConfig(cache: CacheConfig, clusterCount: Int) {
+  require(clusterCount >= 1 && (clusterCount & (clusterCount - 1)) == 0,
+    "cache clusterCount must be a power of two")
+  require(cache.bankCount % clusterCount == 0,
+    "global cache banks must divide evenly across clusters")
+
+  val banksPerCluster: Int = cache.bankCount / clusterCount
+  require(banksPerCluster >= 2 &&
+    (banksPerCluster & (banksPerCluster - 1)) == 0,
+    "each cache cluster needs at least two power-of-two banks")
+
+  val clusterIndexWidth: Int = math.max(1, log2Up(clusterCount))
+  val localCache: CacheConfig = cache.copy(bankCount = banksPerCluster)
+}
+
+/** Bounds for the descriptor-to-C-write-response RTL system. */
+case class EndToEndSystemConfig(
+    matrix: TrIpMatrixConfig,
+    gustavson: GustavsonCacheConfig,
+    clusters: CacheClusterConfig,
+    maxCResults: Int
+) {
+  require(matrix.tile.core == gustavson.tile.core,
+    "all dataflows must share one core configuration")
+  require(gustavson.cache == clusters.cache,
+    "all descriptor frontends must share the clustered cache")
+  require(clusters.cache.clientCount >= 5,
+    "unified system needs IP-A, IP-B, CSR, TrGT-B, and TrGS-B clients")
+  require(maxCResults >= matrix.maxMatrixRows * matrix.maxMatrixColumns,
+    "C DMA capacity must cover the largest configured output matrix")
+  require(BigInt(maxCResults) <= (BigInt(1) << clusters.cache.addressWidth),
+    "the C result region must fit the DMA line address space")
+
+  val core: TrapezoidConfig = matrix.tile.core
+  val cache: CacheConfig = clusters.cache
+}

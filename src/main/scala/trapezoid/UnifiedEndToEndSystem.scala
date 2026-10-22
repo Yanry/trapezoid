@@ -525,16 +525,10 @@ class CachedTrGtSubrowAdapter(systemCfg: EndToEndSystemConfig) extends Component
     }
   }
 
-  val selectedSubrowReady = Bool()
-  selectedSubrowReady := False
-  for (subrow <- 0 until cfg.localBanks) {
-    when(currentSubrow === subrow) {
-      selectedSubrowReady := scheduler.io.bPush(subrow).ready
-    }
-  }
-  val startForFullFifo = state === CachedTrGtState.EmitLine &&
-    selectedElementValid && !schedulerStarted && !selectedSubrowReady
-  scheduler.io.start.valid := state === CachedTrGtState.Start || startForFullFifo
+  val startWithFirstElement = state === CachedTrGtState.EmitLine &&
+    selectedElementValid && !schedulerStarted
+  scheduler.io.start.valid := state === CachedTrGtState.Start ||
+    startWithFirstElement
   when(state === CachedTrGtState.Finish) {
     scheduler.io.finish := True
   }
@@ -590,7 +584,7 @@ class CachedTrGtSubrowAdapter(systemCfg: EndToEndSystemConfig) extends Component
     schedulerStarted := True
     state := CachedTrGtState.Finish
   }
-  when(startForFullFifo && scheduler.io.start.fire) {
+  when(startWithFirstElement && scheduler.io.start.fire) {
     schedulerStarted := True
   }
   when(state === CachedTrGtState.FindA) {
@@ -974,7 +968,8 @@ class UnifiedEndToEndSystem(systemCfg: EndToEndSystemConfig) extends Component {
   val doneReg = RegInit(False)
   val errorReg = RegInit(False)
 
-  val ip = new TrIpCachedMatrixController(matrixCfg, cacheCfg)
+  private val ipReaderLanes = cfg.localBanks
+  val ip = new TrIpCachedMatrixController(matrixCfg, cacheCfg, ipReaderLanes)
   val csr = new CsrGustavsonDescriptorFrontend(systemCfg)
   val trgtScheduler = new CachedTrGtRowScheduler(systemCfg)
   val trgsAdapter = new GustavsonBRowCacheAdapter(gustCfg,
@@ -1106,17 +1101,22 @@ class UnifiedEndToEndSystem(systemCfg: EndToEndSystemConfig) extends Component {
     state := UnifiedEndToEndState.Idle
   }
 
-  cache.io.requests(0) <> ip.io.aCacheRequest
-  ip.io.aCacheResponse <> cache.io.responses(0)
-  cache.io.requests(1) <> ip.io.bCacheRequest
-  ip.io.bCacheResponse <> cache.io.responses(1)
-  cache.io.requests(2) <> csr.io.cacheRequest
-  csr.io.cacheResponse <> cache.io.responses(2)
-  for (row <- 0 until cfg.peRows) {
-    cache.io.requests(3 + row) <> trgtScheduler.io.cacheRequests(row)
-    trgtScheduler.io.cacheResponses(row) <> cache.io.responses(3 + row)
+  for (lane <- 0 until ipReaderLanes) {
+    cache.io.requests(lane) <> ip.io.aCacheRequests(lane)
+    ip.io.aCacheResponses(lane) <> cache.io.responses(lane)
+    val bClient = ipReaderLanes + lane
+    cache.io.requests(bClient) <> ip.io.bCacheRequests(lane)
+    ip.io.bCacheResponses(lane) <> cache.io.responses(bClient)
   }
-  val trgsClient = 3 + cfg.peRows
+  val csrClient = 2 * ipReaderLanes
+  cache.io.requests(csrClient) <> csr.io.cacheRequest
+  csr.io.cacheResponse <> cache.io.responses(csrClient)
+  for (row <- 0 until cfg.peRows) {
+    val trgtClient = csrClient + 1 + row
+    cache.io.requests(trgtClient) <> trgtScheduler.io.cacheRequests(row)
+    trgtScheduler.io.cacheResponses(row) <> cache.io.responses(trgtClient)
+  }
+  val trgsClient = csrClient + 1 + cfg.peRows
   cache.io.requests(trgsClient) <> trgsAdapter.io.cacheRequest
   trgsAdapter.io.cacheResponse <> cache.io.responses(trgsClient)
   for (client <- trgsClient + 1 until cacheCfg.clientCount) {

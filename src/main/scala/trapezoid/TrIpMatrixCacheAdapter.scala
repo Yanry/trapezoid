@@ -108,6 +108,62 @@ class FiberCacheReader(fiberCacheCfg: FiberCacheConfig, indexWidth: Int)
   }
 }
 
+/** Small parallel reader pool used by the matrix loader.
+  *
+  * Each lane keeps one cache request in flight.  The result carries the
+  * original fiber index, so completion order does not affect tile storage.
+  */
+class FiberCacheReaderPool(
+    fiberCacheCfg: FiberCacheConfig,
+    indexWidth: Int,
+    laneCount: Int
+) extends Component {
+  private val cacheCfg = fiberCacheCfg.cache
+  require(laneCount >= 1)
+
+  val io = new Bundle {
+    val clear = in Bool()
+    val command = slave(Stream(FiberCacheReadCommand(fiberCacheCfg, indexWidth)))
+    val cacheRequests = Vec(master(Stream(CacheReadRequest(cacheCfg))), laneCount)
+    val cacheResponses = Vec(slave(Stream(CacheReadResponse(cacheCfg))), laneCount)
+    val result = master(Stream(FiberCacheReadResult(fiberCacheCfg, indexWidth)))
+    val busy = out Bool()
+  }
+
+  val readers = Array.fill(laneCount)(
+    new FiberCacheReader(fiberCacheCfg, indexWidth))
+  val commandChoices = Bits(laneCount bits)
+  var earlierCommand: Bool = False
+  for (lane <- 0 until laneCount) {
+    commandChoices(lane) := readers(lane).io.command.ready &&
+      !earlierCommand
+    earlierCommand = earlierCommand || readers(lane).io.command.ready
+    readers(lane).io.clear := io.clear
+    readers(lane).io.command.valid := io.command.valid && commandChoices(lane)
+    readers(lane).io.command.payload := io.command.payload
+    io.cacheRequests(lane) <> readers(lane).io.cacheRequest
+    readers(lane).io.cacheResponse <> io.cacheResponses(lane)
+  }
+  io.command.ready := commandChoices.orR
+
+  val resultChoices = Bits(laneCount bits)
+  var earlierResult: Bool = False
+  for (lane <- 0 until laneCount) {
+    resultChoices(lane) := readers(lane).io.result.valid &&
+      !earlierResult
+    earlierResult = earlierResult || readers(lane).io.result.valid
+  }
+  io.result.valid := resultChoices.orR
+  io.result.payload := FiberCacheReadResult(fiberCacheCfg, indexWidth).getZero
+  for (lane <- 0 until laneCount) {
+    readers(lane).io.result.ready := io.result.ready && resultChoices(lane)
+    when(resultChoices(lane)) {
+      io.result.payload := readers(lane).io.result.payload
+    }
+  }
+  io.busy := readers.map(_.io.busy).reduce(_ || _)
+}
+
 /** Converts one matrix controller load phase into two cache request streams.
   *
   * A uses row-major `(globalRow, kTile)` records.  B uses transposed
@@ -115,11 +171,13 @@ class FiberCacheReader(fiberCacheCfg: FiberCacheConfig, indexWidth: Int)
   * maximum dimension, so addresses do not depend on runtime matrix sizes.
   */
 class TrIpMatrixFiberLoader(matrixCfg: TrIpMatrixConfig, cacheCfg: CacheConfig)
+    (parallelReaders: Int = 1)
     extends Component {
   private val tileCfg = matrixCfg.tile
   private val cfg = tileCfg.core
   private val fiberCacheCfg = FiberCacheConfig(cfg, cacheCfg)
   private val addressSpace = BigInt(1) << cacheCfg.addressWidth
+  require(parallelReaders >= 1)
 
   require(BigInt(matrixCfg.maxMatrixRows) * matrixCfg.maxKTiles *
     fiberCacheCfg.linesPerFiber <= addressSpace,
@@ -131,10 +189,22 @@ class TrIpMatrixFiberLoader(matrixCfg: TrIpMatrixConfig, cacheCfg: CacheConfig)
   val io = new Bundle {
     val clear = in Bool()
     val start = slave(Stream(TrIpMatrixFiberLoad(matrixCfg, cacheCfg)))
-    val aCacheRequest = master(Stream(CacheReadRequest(cacheCfg)))
-    val aCacheResponse = slave(Stream(CacheReadResponse(cacheCfg)))
-    val bCacheRequest = master(Stream(CacheReadRequest(cacheCfg)))
-    val bCacheResponse = slave(Stream(CacheReadResponse(cacheCfg)))
+    val aCacheRequest = if (parallelReaders == 1)
+      master(Stream(CacheReadRequest(cacheCfg))) else null
+    val aCacheResponse = if (parallelReaders == 1)
+      slave(Stream(CacheReadResponse(cacheCfg))) else null
+    val aCacheRequests = if (parallelReaders > 1)
+      Vec(master(Stream(CacheReadRequest(cacheCfg))), parallelReaders) else null
+    val aCacheResponses = if (parallelReaders > 1)
+      Vec(slave(Stream(CacheReadResponse(cacheCfg))), parallelReaders) else null
+    val bCacheRequest = if (parallelReaders == 1)
+      master(Stream(CacheReadRequest(cacheCfg))) else null
+    val bCacheResponse = if (parallelReaders == 1)
+      slave(Stream(CacheReadResponse(cacheCfg))) else null
+    val bCacheRequests = if (parallelReaders > 1)
+      Vec(master(Stream(CacheReadRequest(cacheCfg))), parallelReaders) else null
+    val bCacheResponses = if (parallelReaders > 1)
+      Vec(slave(Stream(CacheReadResponse(cacheCfg))), parallelReaders) else null
     val aLoad = master(Stream(IndexedFiber(cfg, tileCfg.rowIndexWidth)))
     val bLoad = master(Stream(IndexedFiber(cfg, tileCfg.columnIndexWidth)))
     val busy = out Bool()
@@ -142,8 +212,10 @@ class TrIpMatrixFiberLoader(matrixCfg: TrIpMatrixConfig, cacheCfg: CacheConfig)
     val error = out Bool()
   }
 
-  val aReader = new FiberCacheReader(fiberCacheCfg, tileCfg.rowIndexWidth)
-  val bReader = new FiberCacheReader(fiberCacheCfg, tileCfg.columnIndexWidth)
+  val aReader = new FiberCacheReaderPool(fiberCacheCfg, tileCfg.rowIndexWidth,
+    parallelReaders)
+  val bReader = new FiberCacheReaderPool(fiberCacheCfg, tileCfg.columnIndexWidth,
+    parallelReaders)
   aReader.io.clear := io.clear
   bReader.io.clear := io.clear
 
@@ -242,19 +314,19 @@ class TrIpMatrixFiberLoader(matrixCfg: TrIpMatrixConfig, cacheCfg: CacheConfig)
     doneReg := True
   }
 
-  io.aCacheRequest.valid := aReader.io.cacheRequest.valid
-  io.aCacheRequest.payload := aReader.io.cacheRequest.payload
-  aReader.io.cacheRequest.ready := io.aCacheRequest.ready
-  aReader.io.cacheResponse.valid := io.aCacheResponse.valid
-  aReader.io.cacheResponse.payload := io.aCacheResponse.payload
-  io.aCacheResponse.ready := aReader.io.cacheResponse.ready
-
-  io.bCacheRequest.valid := bReader.io.cacheRequest.valid
-  io.bCacheRequest.payload := bReader.io.cacheRequest.payload
-  bReader.io.cacheRequest.ready := io.bCacheRequest.ready
-  bReader.io.cacheResponse.valid := io.bCacheResponse.valid
-  bReader.io.cacheResponse.payload := io.bCacheResponse.payload
-  io.bCacheResponse.ready := bReader.io.cacheResponse.ready
+  if (parallelReaders == 1) {
+    io.aCacheRequest <> aReader.io.cacheRequests(0)
+    aReader.io.cacheResponses(0) <> io.aCacheResponse
+    io.bCacheRequest <> bReader.io.cacheRequests(0)
+    bReader.io.cacheResponses(0) <> io.bCacheResponse
+  } else {
+    for (lane <- 0 until parallelReaders) {
+      io.aCacheRequests(lane) <> aReader.io.cacheRequests(lane)
+      aReader.io.cacheResponses(lane) <> io.aCacheResponses(lane)
+      io.bCacheRequests(lane) <> bReader.io.cacheRequests(lane)
+      bReader.io.cacheResponses(lane) <> io.bCacheResponses(lane)
+    }
+  }
 
   when(io.clear) {
     active := False
@@ -270,7 +342,8 @@ class TrIpMatrixFiberLoader(matrixCfg: TrIpMatrixConfig, cacheCfg: CacheConfig)
 /** Matrix-level TrIP controller with automatic cache-backed fiber loading. */
 class TrIpCachedMatrixController(
     matrixCfg: TrIpMatrixConfig,
-    cacheCfg: CacheConfig
+    cacheCfg: CacheConfig,
+    parallelReaders: Int = 1
 ) extends Component {
   private val tileCfg = matrixCfg.tile
   private val cfg = tileCfg.core
@@ -285,10 +358,22 @@ class TrIpCachedMatrixController(
   val io = new Bundle {
     val clear = in Bool()
     val descriptor = slave(Stream(CachedTrIpMatrixDescriptor(matrixCfg, cacheCfg)))
-    val aCacheRequest = master(Stream(CacheReadRequest(cacheCfg)))
-    val aCacheResponse = slave(Stream(CacheReadResponse(cacheCfg)))
-    val bCacheRequest = master(Stream(CacheReadRequest(cacheCfg)))
-    val bCacheResponse = slave(Stream(CacheReadResponse(cacheCfg)))
+    val aCacheRequest = if (parallelReaders == 1)
+      master(Stream(CacheReadRequest(cacheCfg))) else null
+    val aCacheResponse = if (parallelReaders == 1)
+      slave(Stream(CacheReadResponse(cacheCfg))) else null
+    val aCacheRequests = if (parallelReaders > 1)
+      Vec(master(Stream(CacheReadRequest(cacheCfg))), parallelReaders) else null
+    val aCacheResponses = if (parallelReaders > 1)
+      Vec(slave(Stream(CacheReadResponse(cacheCfg))), parallelReaders) else null
+    val bCacheRequest = if (parallelReaders == 1)
+      master(Stream(CacheReadRequest(cacheCfg))) else null
+    val bCacheResponse = if (parallelReaders == 1)
+      slave(Stream(CacheReadResponse(cacheCfg))) else null
+    val bCacheRequests = if (parallelReaders > 1)
+      Vec(master(Stream(CacheReadRequest(cacheCfg))), parallelReaders) else null
+    val bCacheResponses = if (parallelReaders > 1)
+      Vec(slave(Stream(CacheReadResponse(cacheCfg))), parallelReaders) else null
     val result = master(Stream(MatrixDescriptorResult(cfg)))
     val busy = out Bool()
     val done = out Bool()
@@ -304,7 +389,7 @@ class TrIpCachedMatrixController(
   }
 
   val controller = new TrIpMatrixController(matrixCfg)
-  val loader = new TrIpMatrixFiberLoader(matrixCfg, cacheCfg)
+  val loader = new TrIpMatrixFiberLoader(matrixCfg, cacheCfg)(parallelReaders)
   controller.io.clear := io.clear
   loader.io.clear := io.clear
 
@@ -378,19 +463,19 @@ class TrIpCachedMatrixController(
   io.result.payload := controller.io.result.payload
   controller.io.result.ready := io.result.ready
 
-  io.aCacheRequest.valid := loader.io.aCacheRequest.valid
-  io.aCacheRequest.payload := loader.io.aCacheRequest.payload
-  loader.io.aCacheRequest.ready := io.aCacheRequest.ready
-  loader.io.aCacheResponse.valid := io.aCacheResponse.valid
-  loader.io.aCacheResponse.payload := io.aCacheResponse.payload
-  io.aCacheResponse.ready := loader.io.aCacheResponse.ready
-
-  io.bCacheRequest.valid := loader.io.bCacheRequest.valid
-  io.bCacheRequest.payload := loader.io.bCacheRequest.payload
-  loader.io.bCacheRequest.ready := io.bCacheRequest.ready
-  loader.io.bCacheResponse.valid := io.bCacheResponse.valid
-  loader.io.bCacheResponse.payload := io.bCacheResponse.payload
-  io.bCacheResponse.ready := loader.io.bCacheResponse.ready
+  if (parallelReaders == 1) {
+    io.aCacheRequest <> loader.io.aCacheRequest
+    loader.io.aCacheResponse <> io.aCacheResponse
+    io.bCacheRequest <> loader.io.bCacheRequest
+    loader.io.bCacheResponse <> io.bCacheResponse
+  } else {
+    for (lane <- 0 until parallelReaders) {
+      io.aCacheRequests(lane) <> loader.io.aCacheRequests(lane)
+      loader.io.aCacheResponses(lane) <> io.aCacheResponses(lane)
+      io.bCacheRequests(lane) <> loader.io.bCacheRequests(lane)
+      loader.io.bCacheResponses(lane) <> io.bCacheResponses(lane)
+    }
+  }
 
   io.busy := controller.io.busy
   io.done := controller.io.done || addressDone

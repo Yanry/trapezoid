@@ -29,7 +29,7 @@ class UnifiedEndToEndSystemSpec extends AnyFunSuite {
     addressWidth = 8,
     bankCount = 4,
     setsPerBank = 8,
-    clientCount = cfg.peRows + 4,
+    clientCount = 2 * cfg.localBanks + cfg.peRows + 2,
     requestIdWidth = 3
   )
   private val gustCfg = GustavsonCacheConfig(

@@ -556,6 +556,23 @@ class TrIpTileController(
   val outputRowValid = resultValid(outputRowSlot)
   val outputCellValid = outputRowValid(outputColumnSlot)
 
+  // Compact the sparse C bitmap before issuing local-buffer reads.  The
+  // previous counter walked every M x N slot, including guaranteed zero
+  // entries, which made sparse TrIP output latency depend on tile area.
+  val nextValidCell = UInt(cellIndexWidth bits)
+  val nextValidChoices = Bits(cellCount bits)
+  nextValidCell := 0
+  for (cell <- 0 until cellCount) {
+    val row = cell / tileCfg.maxColumns
+    val column = cell % tileCfg.maxColumns
+    nextValidChoices(cell) :=
+      U(cell, cellIndexWidth bits) >= outputCell && resultValid(row)(column)
+  }
+  for (cell <- (0 until cellCount).reverse) {
+    when(nextValidChoices(cell)) { nextValidCell := cell }
+  }
+  val nextValidFound = nextValidChoices.orR
+
   for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
     val buffer = localBufferBuses(pe)
     val line = pe * cfg.localBanks + bank
@@ -864,13 +881,15 @@ class TrIpTileController(
     }
 
     is(TrIpTileState.ReadPlan) {
-      when(outputCellValid) {
-        state := TrIpTileState.ReadWait
-      } elsewhen(outputCell === cellCount - 1) {
+      when(nextValidFound) {
+        when(outputCell === nextValidCell) {
+          state := TrIpTileState.ReadWait
+        } otherwise {
+          outputCell := nextValidCell
+        }
+      } otherwise {
         state := TrIpTileState.Idle
         doneReg := True
-      } otherwise {
-        outputCell := outputCell + 1
       }
     }
 

@@ -278,9 +278,10 @@ case class EndToEndSystemConfig(
     "all dataflows must share one core configuration")
   require(gustavson.cache == clusters.cache,
     "all descriptor frontends must share the clustered cache")
-  require(clusters.cache.clientCount >= matrix.tile.core.peRows + 4,
-    "unified system needs IP-A, IP-B, CSR, one TrGT-B client per PE row, " +
-      "and one TrGS-B client")
+  require(clusters.cache.clientCount >=
+      2 * matrix.tile.core.localBanks + matrix.tile.core.peRows + 2,
+    "unified system needs parallel IP A/B readers, CSR, one TrGT-B client " +
+      "per PE row, and one TrGS-B client")
   require(maxCResults >= matrix.maxMatrixRows * matrix.maxMatrixColumns,
     "C DMA capacity must cover the largest configured output matrix")
   require(BigInt(maxCResults) <= (BigInt(1) << clusters.cache.addressWidth),

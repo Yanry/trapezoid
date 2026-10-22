@@ -38,7 +38,7 @@ object EndToEndCycleSimulation extends App {
     addressWidth = 12,
     bankCount = 8,
     setsPerBank = 64,
-    clientCount = cfg.peRows + 4,
+    clientCount = 2 * cfg.localBanks + cfg.peRows + 2,
     requestIdWidth = 8
   )
   private val gustCfg = GustavsonCacheConfig(

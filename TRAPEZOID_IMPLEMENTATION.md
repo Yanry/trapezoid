@@ -611,7 +611,7 @@ paper PE-row 作为生成 RTL blackbox 在 128 个位置复用，并标记为 Ve
 sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
 ```
 
-论文级单 PE row 测试由 `PaperSinglePERowCycleSimulation` 提供。它只实例化一个真实 `TrapezoidPERow`，但保持论文 datapath 配置：`fiberWidth=128`、`macLanes=128`、`outputLanes=16`、72-bit 累加器。它直接驱动 PE-row command Stream，不包含 descriptor、cache 或 DMA；每个 command 接受后等待对应 response，并对软件参考结果逐坐标累加校验。默认同样运行四种 mode 和六类 `HS x HS`、`HS x MS`、`HS x D`、`MS x MS`、`MS x D`、`D x D` 组合：
+论文级单 PE row 测试由 `PaperSinglePERowCycleSimulation` 提供。它只实例化一个真实 `TrapezoidPERow`，但保持论文 datapath 配置：`fiberWidth=128`、`macLanes=128`、`outputLanes=16`、72-bit 累加器。四种 mode 使用同一份 `128 x 128` tile 的一个 active output row：`DenseIp` 固定发送完整 dense column 流，`TrIp` 根据有效乘法数进行 fiber packing，`TrGs` 按 16 个 B columns 分组，`TrGt` 按四个 temporal subrows 分组。command 在 response 消费的同时连续发射，不包含 descriptor、cache 或 DMA；每个输出坐标还会与软件参考值校验。默认同样运行四种 mode 和六类 `HS x HS`、`HS x MS`、`HS x D`、`MS x MS`、`MS x D`、`D x D` 组合：
 
 ```bash
 sbt -batch 'Test/runMain trapezoid.PaperSinglePERowCycleSimulation'
@@ -623,7 +623,7 @@ sbt -batch 'Test/runMain trapezoid.PaperSinglePERowCycleSimulation'
 sbt -batch 'Test/runMain trapezoid.PaperSinglePERowCycleSimulation --mode=TrIp "--category=MS x D" --samples=1'
 ```
 
-单 PE row 的周期边界是 command acceptance 到 response consumption，反映 PE row 内部的 MFIU/分发、MAC、MRN reduction、输出 FIFO 和 backpressure；它不能代表 128-row 阵列的吞吐，也不能替代统一顶层的端到端周期。
+单 PE row 的周期边界是第一个 command acceptance 到最后一个 response consumption，反映 PE row 内部的 MFIU/分发、MAC、MRN reduction、command pipeline、输出 FIFO 和 backpressure。表格同时给出 command 数、有效 MAC 数、lane slots 和利用率。它能用于比较四种数据流在相同单 row workload 下的吞吐趋势，但不能代表 128-row 阵列的吞吐，也不能替代统一顶层的端到端周期。
 
 ## 4. 当前限制
 

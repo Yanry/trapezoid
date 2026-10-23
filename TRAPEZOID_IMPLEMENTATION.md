@@ -603,6 +603,28 @@ paper PE-row 作为生成 RTL blackbox 在 128 个位置复用，并标记为 Ve
 
 该入口是 RTL 时钟边沿仿真，不使用 `PaperEndToEndCycleSimulation` 的解析计算公式。不过数据仍是 72-bit 整数累加而非 IEEE-754 FP32，DMA 仍使用固定响应延迟模型，CSR/C 记录仍为验证用的一记录一 cache line 格式，因此不能直接把绝对周期当作论文最终图表数据。
 
+### 3.8 小规模统一 RTL 与论文单 PE row RTL 测试
+
+小规模完整端到端测试已经由 `EndToEndCycleSimulation` 提供。它使用 `16 x 16` 矩阵、`4 PE rows x 16 MACs`、真实 `UnifiedEndToEndSystem` 和 Verilator；默认运行四种 mode、六类密度组合、每类三个样本。计时从 descriptor 握手开始，到最终 C DMA write response，包含 CSR/DMA、clustered cache、计算、结果回压和写响应：
+
+```bash
+sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
+```
+
+论文级单 PE row 测试由 `PaperSinglePERowCycleSimulation` 提供。它只实例化一个真实 `TrapezoidPERow`，但保持论文 datapath 配置：`fiberWidth=128`、`macLanes=128`、`outputLanes=16`、72-bit 累加器。它直接驱动 PE-row command Stream，不包含 descriptor、cache 或 DMA；每个 command 接受后等待对应 response，并对软件参考结果逐坐标累加校验。默认同样运行四种 mode 和六类 `HS x HS`、`HS x MS`、`HS x D`、`MS x MS`、`MS x D`、`D x D` 组合：
+
+```bash
+sbt -batch 'Test/runMain trapezoid.PaperSinglePERowCycleSimulation'
+```
+
+可按 mode、类别和样本数缩小运行范围：
+
+```bash
+sbt -batch 'Test/runMain trapezoid.PaperSinglePERowCycleSimulation --mode=TrIp "--category=MS x D" --samples=1'
+```
+
+单 PE row 的周期边界是 command acceptance 到 response consumption，反映 PE row 内部的 MFIU/分发、MAC、MRN reduction、输出 FIFO 和 backpressure；它不能代表 128-row 阵列的吞吐，也不能替代统一顶层的端到端周期。
+
 ## 4. 当前限制
 
 ### 4.1 调度器覆盖范围

@@ -50,7 +50,7 @@ object EndToEndCycleSimulation extends App {
     responseFifoDepth = 2
   )
   private val tileCfg = TrIpTileConfig(cfg, maxColumns = dimension,
-    maxRowsOverride = dimension)
+    maxRowsOverride = if (paperScale) dimension else cfg.peRows * cfg.maxFibers)
   private val matrixCfg = TrIpMatrixConfig(tileCfg,
     maxMatrixRows = dimension, maxMatrixColumns = dimension,
     maxKTiles = dimension / cfg.fiberWidth)

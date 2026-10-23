@@ -45,8 +45,8 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
   }
 
   val states = Vec((0 until cacheCfg.bankCount).map(_ => RegInit(CacheBankState.Idle)))
-  val validBits = Array.fill(cacheCfg.bankCount)(
-    Vec((0 until cacheCfg.setsPerBank).map(_ => RegInit(False))))
+  val validBits = Vec((0 until cacheCfg.bankCount).map(_ =>
+    Reg(Bits(cacheCfg.setsPerBank bits)) init 0))
   val dataMemories = Array.fill(cacheCfg.bankCount)(
     Mem(Bits(cacheCfg.lineWidth bits), cacheCfg.setsPerBank))
   val tagMemories = Array.fill(cacheCfg.bankCount)(
@@ -218,7 +218,7 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
   when(io.clear) {
     for (bank <- 0 until cacheCfg.bankCount) {
       states(bank) := CacheBankState.Idle
-      for (set <- 0 until cacheCfg.setsPerBank) validBits(bank)(set) := False
+      validBits(bank) := 0
     }
     for (client <- 0 until cacheCfg.clientCount) clientOutstanding(client) := False
     hitCount := 0

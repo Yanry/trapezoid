@@ -14,7 +14,11 @@ object TrIpMatrixState extends SpinalEnum {
   * stream the corresponding bitmask fibers.  Each K tile keeps an explicit
   * DenseIp/TrIp mode; density is never inspected to select a mode.
   */
-class TrIpMatrixController(matrixCfg: TrIpMatrixConfig) extends Component {
+class TrIpMatrixController(
+    matrixCfg: TrIpMatrixConfig,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent =
+      cfg => new TrapezoidPERow(cfg)
+) extends Component {
   private val tileCfg = matrixCfg.tile
   private val cfg = tileCfg.core
 
@@ -37,7 +41,7 @@ class TrIpMatrixController(matrixCfg: TrIpMatrixConfig) extends Component {
     val completedOutputTiles = out UInt(32 bits)
   }
 
-  val inner = new TrIpTileController(tileCfg)
+  val inner = new TrIpTileController(tileCfg, peFactory)
   inner.io.clear := io.clear
 
   val state = RegInit(TrIpMatrixState.Idle)

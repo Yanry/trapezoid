@@ -278,10 +278,8 @@ case class EndToEndSystemConfig(
     "all dataflows must share one core configuration")
   require(gustavson.cache == clusters.cache,
     "all descriptor frontends must share the clustered cache")
-  require(clusters.cache.clientCount >=
-      2 * matrix.tile.core.localBanks + matrix.tile.core.peRows + 2,
-    "unified system needs parallel IP A/B readers, CSR, one TrGT-B client " +
-      "per PE row, and one TrGS-B client")
+  require(clusters.cache.clientCount >= 2,
+    "an end-to-end system needs at least two cache clients")
   require(maxCResults >= matrix.maxMatrixRows * matrix.maxMatrixColumns,
     "C DMA capacity must cover the largest configured output matrix")
   require(BigInt(maxCResults) <= (BigInt(1) << clusters.cache.addressWidth),
@@ -289,4 +287,33 @@ case class EndToEndSystemConfig(
 
   val core: TrapezoidConfig = matrix.tile.core
   val cache: CacheConfig = clusters.cache
+}
+
+sealed trait EndToEndHardwareProfile {
+  def includeIp: Boolean
+  def includeTrGt: Boolean
+  def includeTrGs: Boolean
+}
+
+object EndToEndHardwareProfile {
+  case object Unified extends EndToEndHardwareProfile {
+    val includeIp = true
+    val includeTrGt = true
+    val includeTrGs = true
+  }
+  case object IpOnly extends EndToEndHardwareProfile {
+    val includeIp = true
+    val includeTrGt = false
+    val includeTrGs = false
+  }
+  case object TrGtOnly extends EndToEndHardwareProfile {
+    val includeIp = false
+    val includeTrGt = true
+    val includeTrGs = false
+  }
+  case object TrGsOnly extends EndToEndHardwareProfile {
+    val includeIp = false
+    val includeTrGt = false
+    val includeTrGs = true
+  }
 }

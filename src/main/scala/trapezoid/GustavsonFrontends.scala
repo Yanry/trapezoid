@@ -150,7 +150,9 @@ class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
 class TrGtSubrowScheduler(
     tileCfg: GustavsonTileConfig,
     externalFifoStorage: Boolean = false,
-    externalPe: Boolean = false
+    externalPe: Boolean = false,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent =
+      cfg => new TrapezoidPERow(cfg)
 ) extends Component {
   private val cfg = tileCfg.core
   private val subrows = cfg.localBanks
@@ -223,7 +225,8 @@ class TrGtSubrowScheduler(
     io.fifoOccupancy(subrow) := fifos.io.occupancy(subrow)
   }
 
-  val engine = new GustavsonTileEngine(tileCfg, externalPe = externalPe)
+  val engine = new GustavsonTileEngine(tileCfg, peFactory,
+    externalPe = externalPe)
   engine.io.clear := io.clear
   if (externalPe) {
     io.peCommand.valid := engine.io.peCommand.valid

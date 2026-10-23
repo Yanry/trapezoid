@@ -559,19 +559,32 @@ class TrIpTileController(
   // Compact the sparse C bitmap before issuing local-buffer reads.  The
   // previous counter walked every M x N slot, including guaranteed zero
   // entries, which made sparse TrIP output latency depend on tile area.
+  val nextValidRows = Bits(tileCfg.maxRows bits)
+  val nextValidColumns = Vec(UInt(tileCfg.columnIndexWidth bits),
+    tileCfg.maxRows)
+  for (row <- 0 until tileCfg.maxRows) {
+    val columnChoices = Bits(tileCfg.maxColumns bits)
+    for (column <- 0 until tileCfg.maxColumns) {
+      columnChoices(column) := resultValid(row)(column) &&
+        (U(row, tileCfg.rowIndexWidth bits) > outputRowSlot ||
+          (U(row, tileCfg.rowIndexWidth bits) === outputRowSlot &&
+            U(column, tileCfg.columnIndexWidth bits) >= outputColumnSlot))
+    }
+    nextValidRows(row) := columnChoices.orR
+    nextValidColumns(row) := 0
+    for (column <- (0 until tileCfg.maxColumns).reverse) {
+      when(columnChoices(column)) { nextValidColumns(row) := column }
+    }
+  }
+  val nextValidRow = UInt(tileCfg.rowIndexWidth bits)
+  nextValidRow := 0
+  for (row <- (0 until tileCfg.maxRows).reverse) {
+    when(nextValidRows(row)) { nextValidRow := row }
+  }
   val nextValidCell = UInt(cellIndexWidth bits)
-  val nextValidChoices = Bits(cellCount bits)
-  nextValidCell := 0
-  for (cell <- 0 until cellCount) {
-    val row = cell / tileCfg.maxColumns
-    val column = cell % tileCfg.maxColumns
-    nextValidChoices(cell) :=
-      U(cell, cellIndexWidth bits) >= outputCell && resultValid(row)(column)
-  }
-  for (cell <- (0 until cellCount).reverse) {
-    when(nextValidChoices(cell)) { nextValidCell := cell }
-  }
-  val nextValidFound = nextValidChoices.orR
+  nextValidCell := (nextValidRow.asBits ##
+    nextValidColumns(nextValidRow).asBits).asUInt.resized
+  val nextValidFound = nextValidRows.orR
 
   for (pe <- 0 until cfg.peRows; bank <- 0 until cfg.localBanks) {
     val buffer = localBufferBuses(pe)

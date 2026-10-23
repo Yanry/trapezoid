@@ -36,8 +36,19 @@ class FiberCacheReader(fiberCacheCfg: FiberCacheConfig, indexWidth: Int)
   val state = RegInit(FiberCacheReaderState.Idle)
   val commandReg = Reg(FiberCacheReadCommand(fiberCacheCfg, indexWidth))
   val lineIndex = Reg(UInt(fiberCacheCfg.lineIndexWidth bits)) init 0
-  val record = Reg(Bits(fiberCacheCfg.recordWidth bits)) init 0
+  val recordLines = Vec((0 until fiberCacheCfg.linesPerFiber).map(_ =>
+    Reg(Bits(cacheCfg.lineWidth bits)) init 0))
   val errorReg = RegInit(False)
+
+  private def recordBits(low: Int, width: Int): Bits = {
+    val decoded = Bits(width bits)
+    for (bit <- 0 until width) {
+      val recordBit = low + bit
+      decoded(bit) := recordLines(recordBit / cacheCfg.lineWidth)(
+        recordBit % cacheCfg.lineWidth)
+    }
+    decoded
+  }
 
   io.busy := state =/= FiberCacheReaderState.Idle
   io.command.ready := !io.clear && state === FiberCacheReaderState.Idle
@@ -54,21 +65,20 @@ class FiberCacheReader(fiberCacheCfg: FiberCacheConfig, indexWidth: Int)
   io.result.valid := !io.clear && state === FiberCacheReaderState.Emit
   io.result.payload.index := commandReg.index
   io.result.payload.error := errorReg
-  io.result.payload.fiber.valid := record(0) && !errorReg
-  io.result.payload.fiber.mask :=
-    record(maskOffset + cfg.fiberWidth - 1 downto maskOffset)
+  io.result.payload.fiber.valid := recordLines(0)(0) && !errorReg
+  io.result.payload.fiber.mask := recordBits(maskOffset, cfg.fiberWidth)
   for (entry <- 0 until cfg.fiberWidth) {
     val low = valuesOffset + entry * cfg.dataWidth
     io.result.payload.fiber.values(entry) :=
-      record(low + cfg.dataWidth - 1 downto low).asSInt
+      recordBits(low, cfg.dataWidth).asSInt
   }
-  io.result.payload.fiber.tag :=
-    record(tagOffset + cfg.coordinateWidth - 1 downto tagOffset).asUInt
+  io.result.payload.fiber.tag := recordBits(tagOffset,
+    cfg.coordinateWidth).asUInt
 
   when(io.command.fire) {
     commandReg := io.command.payload
     lineIndex := 0
-    record := 0
+    for (line <- 0 until fiberCacheCfg.linesPerFiber) recordLines(line) := 0
     errorReg := False
     state := FiberCacheReaderState.Request
   }
@@ -78,11 +88,8 @@ class FiberCacheReader(fiberCacheCfg: FiberCacheConfig, indexWidth: Int)
   }
 
   for (line <- 0 until fiberCacheCfg.linesPerFiber) {
-    val low = line * cacheCfg.lineWidth
-    val width = scala.math.min(cacheCfg.lineWidth, fiberCacheCfg.recordWidth - low)
     when(io.cacheResponse.fire && lineIndex === line) {
-      record(low + width - 1 downto low) :=
-        io.cacheResponse.payload.data(width - 1 downto 0)
+      recordLines(line) := io.cacheResponse.payload.data
     }
   }
 
@@ -103,7 +110,7 @@ class FiberCacheReader(fiberCacheCfg: FiberCacheConfig, indexWidth: Int)
   when(io.clear) {
     state := FiberCacheReaderState.Idle
     lineIndex := 0
-    record := 0
+    for (line <- 0 until fiberCacheCfg.linesPerFiber) recordLines(line) := 0
     errorReg := False
   }
 }
@@ -343,7 +350,9 @@ class TrIpMatrixFiberLoader(matrixCfg: TrIpMatrixConfig, cacheCfg: CacheConfig)
 class TrIpCachedMatrixController(
     matrixCfg: TrIpMatrixConfig,
     cacheCfg: CacheConfig,
-    parallelReaders: Int = 1
+    parallelReaders: Int = 1,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent =
+      cfg => new TrapezoidPERow(cfg)
 ) extends Component {
   private val tileCfg = matrixCfg.tile
   private val cfg = tileCfg.core
@@ -388,7 +397,7 @@ class TrIpCachedMatrixController(
     val completedOutputTiles = out UInt(32 bits)
   }
 
-  val controller = new TrIpMatrixController(matrixCfg)
+  val controller = new TrIpMatrixController(matrixCfg, peFactory)
   val loader = new TrIpMatrixFiberLoader(matrixCfg, cacheCfg)(parallelReaders)
   controller.io.clear := io.clear
   loader.io.clear := io.clear

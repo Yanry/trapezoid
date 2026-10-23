@@ -552,7 +552,7 @@ DenseIp 的测试输入使用全有效 mask 和包含零值的固定宽度 value
 
 当前缩比表已恢复论文的主要 mode 趋势：`MS x MS` 和 `MS x D` 中 TrIP 快于 Gustavson，`D x D` 中 DenseIp 最快。TrIP 四路 reader 使 `MS x MS` 从 `2342.7` 降至 `1724.7` 周期，`MS x D` 从 `3409.3` 降至 `2791.3` 周期。`16 x 16` 的 HS 密度只有一个全局非零，`HS x HS` 总周期由共同的 CSR 空行扫描决定，四路 TrGT 无法形成并行度；因此 TrGT 与 TrGS 仍只差 1 周期。TrGT/TrGS 的绝对排序在 HS 极小 workload 上不应过度解读，论文结论主要来自完整存储流量和更大 workload 分布。
 
-这些数字是当前缩比 RTL 的 descriptor-to-write-response 周期，而不是论文 `128 x 128` full-array 周期。CSR walker、四 cluster cache、读 DMA refill 和最终 C 写响应已经进入边界，但当前 CSR metadata 为每个 pointer/entry/descriptor 占一条 cache line，C 也为每个非零结果占一条 line；尚未实现论文存储格式的紧凑 burst packing、写 cache、多个 write outstanding、真实 HBM channel/queue 和 AXI transaction。论文配置 full-array Verilator 在当前机器上仍会因生成规模和内存占用失败。
+这些数字是当前缩比 RTL 的 descriptor-to-write-response 周期，而不是论文 `128 x 128` full-array 周期。CSR walker、四 cluster cache、读 DMA refill 和最终 C 写响应已经进入边界，但当前 CSR metadata 为每个 pointer/entry/descriptor 占一条 cache line，C 也为每个非零结果占一条 line；尚未实现论文存储格式的紧凑 burst packing、写 cache、多个 write outstanding、真实 HBM channel/queue 和 AXI transaction。
 
 ### 3.6 论文配置的稀疏度端到端周期仿真
 
@@ -581,6 +581,28 @@ sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 
 它目前具有抽象的 DMA read/write Stream 边界，但还不是可以直接连接标准 AXI/HBM 控制器并独立执行论文格式矩阵乘法的完整芯片系统。
 
+### 3.7 论文规模真实 RTL 端到端仿真
+
+`PaperUnifiedEndToEndCycleSimulation` 将真实 `UnifiedEndToEndSystem` 配置为论文阵列和存储规模：`128 PE rows x 128 MACs`、128-wide fiber、4 个 cache cluster、每 cluster 32 banks、总计 16 MB cache。矩阵采用一个 `128 x 128` paper tile；计时仍从统一 descriptor 握手开始，经过 CSR/fiber DMA、cache miss/refill、所选计算路径和结果背压，直到最后一个 C DMA write response。
+
+完整运行六类稀疏度和四种 mode：
+
+```bash
+sbt -batch 'Test/runMain trapezoid.PaperUnifiedEndToEndCycleSimulation'
+```
+
+资源受限机器可以按 mode、类别和样本数分批运行：
+
+```bash
+sbt -batch 'Test/runMain trapezoid.PaperUnifiedEndToEndCycleSimulation --mode=TrIp "--category=MS x MS" --samples=1'
+```
+
+未指定 `--mode` 或使用 `--mode=all` 时，入口依次运行 `DenseIp`、`TrIp`、`TrGt` 和 `TrGs`。每个 worker 使用 mode 专用 elaboration profile，只实例化该次仿真使用的计算路径；descriptor、cache、DMA 和 C 写回边界保持完整。这样避免在一次 Verilator 编译中同时复制三套未使用阵列，不改变被测 mode 的 RTL 周期。
+
+paper PE-row 作为生成 RTL blackbox 在 128 个位置复用，并标记为 Verilator hierarchical block。cache valid metadata 以每 bank 位图实现，避免把 16 MB cache 的 262144 个 valid bit 展开成独立 reset 寄存器。当前 TrIP paper 顶层可以完成 SpinalHDL elaboration 和 Verilog 生成，约为 42 MB/73 万行；首次层次化 C++ 构建会产生大量分片，可能需要几十分钟，后续相同配置可复用 Verilator 缓存。
+
+该入口是 RTL 时钟边沿仿真，不使用 `PaperEndToEndCycleSimulation` 的解析计算公式。不过数据仍是 72-bit 整数累加而非 IEEE-754 FP32，DMA 仍使用固定响应延迟模型，CSR/C 记录仍为验证用的一记录一 cache line 格式，因此不能直接把绝对周期当作论文最终图表数据。
+
 ## 4. 当前限制
 
 ### 4.1 调度器覆盖范围
@@ -596,7 +618,7 @@ sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 
 ### 4.2 缺少全局 cache 和 DMA
 
-当前已实现参数化 multi-client、multi-bank direct-mapped 读 cache，以及 `ClusteredReadCache` 的多 cluster 组织。统一端到端缩比顶层配置为 4 个 cluster，每个 cluster 独立包含 bank/tag/data/miss 状态，cluster refill 经过共享 DMA 端口仲裁。TrIP fiber、CSR metadata 和 Gustavson B-row 已由同一 descriptor 驱动并共享该层次；结果也经过带 response 的写 DMA。不过仍未实现论文的每 cluster 32 banks/32 clients 规模、完整 cluster NoC、写 cache/dirty eviction、多个 outstanding write、HBM channel/queue 和标准 AXI/HBM 协议。`ModeSharedTileController` 中的共享 PE/SRAM 也还没有替换统一测试顶层中分别实例化的 IP、TrGT 和 TrGS scheduler，下一步需要合并两者以避免测试系统复制计算阵列。
+当前已实现参数化 multi-client、multi-bank direct-mapped 读 cache，以及 `ClusteredReadCache` 的多 cluster 组织。统一端到端缩比顶层配置为 4 个 cluster，每个 cluster 独立包含 bank/tag/data/miss 状态，cluster refill 经过共享 DMA 端口仲裁。paper RTL profile 已实例化每 cluster 32 banks 和总计 16 MB cache；TrIP fiber、CSR metadata 和 Gustavson B-row 均由同一 descriptor 驱动，结果也经过带 response 的写 DMA。不过仍未实现完整 cluster NoC、写 cache/dirty eviction、多个 outstanding write、HBM channel/queue 和标准 AXI/HBM 协议。通用全 mode 顶层仍分别实例化 IP、TrGT 和 TrGS scheduler；paper benchmark 通过每次只 elaboration 一个 mode 避免无效复制，最终芯片顶层仍应接入 `ModeSharedTileController` 以物理共享 PE/SRAM。
 
 ### 4.3 Gustavson 存储和并行调度仍待完成
 
@@ -617,13 +639,13 @@ sbt -batch 'Test/runMain trapezoid.PaperEndToEndCycleSimulation'
 
 ### 4.5 尚未获得实现后性能和面积结论
 
-目前已经有 small 配置的逐周期 RTL 基准，以及 `256 x 256`、`128 x 128 MAC` 的 compute issue 周期模型，但尚未执行：
+目前已经有 small 配置的逐周期 RTL 基准、`256 x 256` 的 paper cycle model，以及能够生成 `128 x 128` paper descriptor-to-write-response RTL 的真实仿真入口，但尚未完成：
 
-- paper 配置的完整 RTL 生成；
+- 当前主机上全部 24 个论文规模 RTL category/mode 组合的首次 Verilator C++ 构建和周期采集；
 - FPGA place-and-route；
 - ASIC synthesis；
 - 时序、面积和功耗分析；
-- 包含逐地址 cache/HBM/NoC/写回争用的论文规模端到端 RTL 或完整系统级周期模拟；
+- 真实 HBM channel/NoC/多 outstanding 写回争用模型；
 - 与论文 TPU、SIGMA、Flexagon 基线的完整周期级性能比较。
 
 因此当前表格中的 1 GHz 只是论文时钟假设下的时间换算，不能声称本 RTL 已达到论文报告的 1 GHz、32 TFLOP/s 或性能/面积结果。

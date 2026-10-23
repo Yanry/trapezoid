@@ -1,6 +1,7 @@
 package trapezoid
 
 import org.scalatest.funsuite.AnyFunSuite
+import spinal.core.{SpinalConfig, Verilog}
 import spinal.core.sim._
 import trapezoid.model.{BitmaskFiber, MatrixReference}
 
@@ -54,6 +55,21 @@ class UnifiedEndToEndSystemSpec extends AnyFunSuite {
   private def simConfig = SimConfig.withVerilator
     .addSimulatorFlag("-CFLAGS -std=c++14")
     .addSimulatorFlag("-LDFLAGS -std=c++14")
+
+  test("mode-specialized end-to-end profiles elaborate independently") {
+    val profiles = Seq(
+      EndToEndHardwareProfile.IpOnly,
+      EndToEndHardwareProfile.TrGtOnly,
+      EndToEndHardwareProfile.TrGsOnly)
+    profiles.zipWithIndex.foreach { case (profile, index) =>
+      SpinalConfig(
+        mode = Verilog,
+        targetDirectory = s"simWorkspace/unified-profile-$index",
+        oneFilePerComponent = true
+      ).generate(new UnifiedEndToEndSystem(systemCfg,
+        hardwareProfile = profile))
+    }
+  }
 
   private def encodeFiber(fiber: BitmaskFiber): BigInt = {
     val valueMask = (BigInt(1) << cfg.dataWidth) - 1

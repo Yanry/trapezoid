@@ -375,7 +375,11 @@ object CachedTrGtState extends SpinalEnum {
   * buffers the row descriptors, loads the stationary A registers, and then
   * streams each packed B line into the FIFO selected by the A index.
   */
-class CachedTrGtSubrowAdapter(systemCfg: EndToEndSystemConfig) extends Component {
+class CachedTrGtSubrowAdapter(
+    systemCfg: EndToEndSystemConfig,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent =
+      cfg => new TrapezoidPERow(cfg)
+) extends Component {
   private val cfg = systemCfg.core
   private val gustCfg = systemCfg.gustavson
   private val cacheCfg = systemCfg.cache
@@ -401,7 +405,8 @@ class CachedTrGtSubrowAdapter(systemCfg: EndToEndSystemConfig) extends Component
     val fifoOccupancy = out UInt(16 bits)
   }
 
-  val scheduler = new TrGtSubrowScheduler(gustCfg.tile)
+  val scheduler = new TrGtSubrowScheduler(gustCfg.tile,
+    peFactory = peFactory)
   scheduler.io.clear := io.clear
   io.result <> scheduler.io.result
 
@@ -689,7 +694,11 @@ class CachedTrGtSubrowAdapter(systemCfg: EndToEndSystemConfig) extends Component
 }
 
 /** Allocates complete CSR rows across independent temporal TrGT PE rows. */
-class CachedTrGtRowScheduler(systemCfg: EndToEndSystemConfig) extends Component {
+class CachedTrGtRowScheduler(
+    systemCfg: EndToEndSystemConfig,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent =
+      cfg => new TrapezoidPERow(cfg)
+) extends Component {
   private val cfg = systemCfg.core
   private val gustCfg = systemCfg.gustavson
   private val cacheCfg = systemCfg.cache
@@ -712,7 +721,8 @@ class CachedTrGtRowScheduler(systemCfg: EndToEndSystemConfig) extends Component 
     val fifoOccupancy = out UInt(16 bits)
   }
 
-  val adapters = Array.fill(cfg.peRows)(new CachedTrGtSubrowAdapter(systemCfg))
+  val adapters = Array.fill(cfg.peRows)(
+    new CachedTrGtSubrowAdapter(systemCfg, peFactory))
   val allocated = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
   val inputActive = RegInit(False)
   val inputRow = Reg(UInt(rowIndexWidth bits)) init 0
@@ -938,7 +948,13 @@ object UnifiedEndToEndState extends SpinalEnum {
 }
 
 /** Descriptor-to-final-C-write-response scaled RTL system. */
-class UnifiedEndToEndSystem(systemCfg: EndToEndSystemConfig) extends Component {
+class UnifiedEndToEndSystem(
+    systemCfg: EndToEndSystemConfig,
+    peFactory: TrapezoidConfig => TrapezoidPERowComponent =
+      cfg => new TrapezoidPERow(cfg),
+    hardwareProfile: EndToEndHardwareProfile =
+      EndToEndHardwareProfile.Unified
+) extends Component {
   private val cfg = systemCfg.core
   private val matrixCfg = systemCfg.matrix
   private val gustCfg = systemCfg.gustavson
@@ -969,20 +985,38 @@ class UnifiedEndToEndSystem(systemCfg: EndToEndSystemConfig) extends Component {
   val errorReg = RegInit(False)
 
   private val ipReaderLanes = cfg.localBanks
-  val ip = new TrIpCachedMatrixController(matrixCfg, cacheCfg, ipReaderLanes)
-  val csr = new CsrGustavsonDescriptorFrontend(systemCfg)
-  val trgtScheduler = new CachedTrGtRowScheduler(systemCfg)
-  val trgsAdapter = new GustavsonBRowCacheAdapter(gustCfg,
-    allowTrGt = false, allowTrGs = true, emitSpatialCommand = true)
-  val trgsScheduler = new TrGsSpatialRowScheduler(gustCfg.tile, wideOutput = false)
+  private val includeIp = hardwareProfile.includeIp
+  private val includeTrGt = hardwareProfile.includeTrGt
+  private val includeTrGs = hardwareProfile.includeTrGs
+  private val includeGustavson = includeTrGt || includeTrGs
+  private val requiredCacheClients =
+    (if (includeIp) 2 * ipReaderLanes else 0) +
+      (if (includeGustavson) 1 else 0) +
+      (if (includeTrGt) cfg.peRows else 0) +
+      (if (includeTrGs) 1 else 0)
+  require(cacheCfg.clientCount >= requiredCacheClients,
+    s"$hardwareProfile needs at least $requiredCacheClients cache clients")
+
+  val ip = if (includeIp) new TrIpCachedMatrixController(
+    matrixCfg, cacheCfg, ipReaderLanes, peFactory) else null
+  val csr = if (includeGustavson)
+    new CsrGustavsonDescriptorFrontend(systemCfg) else null
+  val trgtScheduler = if (includeTrGt)
+    new CachedTrGtRowScheduler(systemCfg, peFactory) else null
+  val trgsAdapter = if (includeTrGs) new GustavsonBRowCacheAdapter(gustCfg,
+    allowTrGt = false, allowTrGs = true, emitSpatialCommand = true) else null
+  val trgsScheduler = if (includeTrGs) new TrGsSpatialRowScheduler(
+    gustCfg.tile, peFactory, wideOutput = false) else null
   val cache = new ClusteredReadCache(systemCfg.clusters)
   val writeback = new ResultWritebackDma(systemCfg)
 
-  ip.io.clear := io.clear
-  csr.io.clear := io.clear
-  trgtScheduler.io.clear := io.clear
-  trgsAdapter.io.clear := io.clear
-  trgsScheduler.io.clear := io.clear
+  if (includeIp) ip.io.clear := io.clear
+  if (includeGustavson) csr.io.clear := io.clear
+  if (includeTrGt) trgtScheduler.io.clear := io.clear
+  if (includeTrGs) {
+    trgsAdapter.io.clear := io.clear
+    trgsScheduler.io.clear := io.clear
+  }
   cache.io.clear := io.clear
   writeback.io.clear := io.clear
 
@@ -993,13 +1027,34 @@ class UnifiedEndToEndSystem(systemCfg: EndToEndSystemConfig) extends Component {
   io.cacheHitCount := cache.io.hitCount
   io.cacheMissCount := cache.io.missCount
   io.cacheRefillCount := cache.io.refillCount
-  io.trgtPhase := trgtScheduler.io.phase
-  io.trgtSchedulerBusy := trgtScheduler.io.schedulerBusy
-  io.trgtFifoOccupancy := trgtScheduler.io.fifoOccupancy
+  if (includeTrGt) {
+    io.trgtPhase := trgtScheduler.io.phase
+    io.trgtSchedulerBusy := trgtScheduler.io.schedulerBusy
+    io.trgtFifoOccupancy := trgtScheduler.io.fifoOccupancy
+  } else {
+    io.trgtPhase := 0
+    io.trgtSchedulerBusy := False
+    io.trgtFifoOccupancy := 0
+  }
   doneReg := False
 
   val descriptorModeIsIp = io.descriptor.payload.mode === TrapezoidDataflow.DenseIp ||
     io.descriptor.payload.mode === TrapezoidDataflow.TrIp
+  val descriptorModeAllowed = Bool()
+  descriptorModeAllowed := False
+  if (includeIp) {
+    when(descriptorModeIsIp) { descriptorModeAllowed := True }
+  }
+  if (includeTrGt) {
+    when(io.descriptor.payload.mode === TrapezoidDataflow.TrGt) {
+      descriptorModeAllowed := True
+    }
+  }
+  if (includeTrGs) {
+    when(io.descriptor.payload.mode === TrapezoidDataflow.TrGs) {
+      descriptorModeAllowed := True
+    }
+  }
   val cAddressWidth = cacheCfg.addressWidth + 1
   val cRegionEnd = io.descriptor.payload.cBaseAddress.resize(cAddressWidth) +
     U(systemCfg.maxCResults, cAddressWidth bits)
@@ -1012,8 +1067,8 @@ class UnifiedEndToEndSystem(systemCfg: EndToEndSystemConfig) extends Component {
     writeback.io.start.ready
   when(io.descriptor.fire) {
     descriptorReg := io.descriptor.payload
-    errorReg := cAddressError
-    when(cAddressError) {
+    errorReg := cAddressError || !descriptorModeAllowed
+    when(cAddressError || !descriptorModeAllowed) {
       state := UnifiedEndToEndState.CloseWriteback
     } otherwise {
       state := Mux(descriptorModeIsIp,
@@ -1021,78 +1076,116 @@ class UnifiedEndToEndSystem(systemCfg: EndToEndSystemConfig) extends Component {
     }
   }
 
-  ip.io.descriptor.valid := state === UnifiedEndToEndState.StartIp
-  ip.io.descriptor.payload.matrix.rowCount := descriptorReg.rowCount
-  ip.io.descriptor.payload.matrix.columnCount := descriptorReg.columnCount
-  ip.io.descriptor.payload.matrix.kTileCount := descriptorReg.kTileCount
-  for (tile <- 0 until matrixCfg.maxKTiles) {
-    ip.io.descriptor.payload.matrix.modes(tile) := descriptorReg.mode
+  if (includeIp) {
+    ip.io.descriptor.valid := state === UnifiedEndToEndState.StartIp
+    ip.io.descriptor.payload.matrix.rowCount := descriptorReg.rowCount
+    ip.io.descriptor.payload.matrix.columnCount := descriptorReg.columnCount
+    ip.io.descriptor.payload.matrix.kTileCount := descriptorReg.kTileCount
+    for (tile <- 0 until matrixCfg.maxKTiles) {
+      ip.io.descriptor.payload.matrix.modes(tile) := descriptorReg.mode
+    }
+    ip.io.descriptor.payload.aBaseAddress := descriptorReg.ipABaseAddress
+    ip.io.descriptor.payload.bBaseAddress := descriptorReg.ipBBaseAddress
+    when(ip.io.descriptor.fire) { state := UnifiedEndToEndState.RunIp }
   }
-  ip.io.descriptor.payload.aBaseAddress := descriptorReg.ipABaseAddress
-  ip.io.descriptor.payload.bBaseAddress := descriptorReg.ipBBaseAddress
-  when(ip.io.descriptor.fire) { state := UnifiedEndToEndState.RunIp }
 
-  csr.io.descriptor.valid := state === UnifiedEndToEndState.StartGustavson
-  csr.io.descriptor.payload := descriptorReg
-  when(csr.io.descriptor.fire) { state := UnifiedEndToEndState.RunGustavson }
+  if (includeGustavson) {
+    csr.io.descriptor.valid := state === UnifiedEndToEndState.StartGustavson
+    csr.io.descriptor.payload := descriptorReg
+    when(csr.io.descriptor.fire) { state := UnifiedEndToEndState.RunGustavson }
+  }
 
   val runTrGt = descriptorReg.mode === TrapezoidDataflow.TrGt
-  trgtScheduler.io.rowCommand.valid := csr.io.command.valid && runTrGt
-  trgtScheduler.io.rowCommand.payload := csr.io.command.payload
-  trgsAdapter.io.rowCommand.valid := csr.io.command.valid && !runTrGt
-  trgsAdapter.io.rowCommand.payload := csr.io.command.payload
-  csr.io.command.ready := Mux(runTrGt,
-    trgtScheduler.io.rowCommand.ready, trgsAdapter.io.rowCommand.ready)
-  trgsScheduler.io.command <> trgsAdapter.io.spatialCommand
+  if (includeTrGt && includeTrGs) {
+    trgtScheduler.io.rowCommand.valid := csr.io.command.valid && runTrGt
+    trgtScheduler.io.rowCommand.payload := csr.io.command.payload
+    trgsAdapter.io.rowCommand.valid := csr.io.command.valid && !runTrGt
+    trgsAdapter.io.rowCommand.payload := csr.io.command.payload
+    csr.io.command.ready := Mux(runTrGt,
+      trgtScheduler.io.rowCommand.ready, trgsAdapter.io.rowCommand.ready)
+  } else if (includeTrGt) {
+    trgtScheduler.io.rowCommand <> csr.io.command
+  } else if (includeTrGs) {
+    trgsAdapter.io.rowCommand <> csr.io.command
+  }
+  if (includeTrGs) trgsScheduler.io.command <> trgsAdapter.io.spatialCommand
 
   val selectedResult = MatrixResult(cfg)
   selectedResult := MatrixResult(cfg).getZero
   val selectedResultValid = Bool()
   selectedResultValid := False
-  ip.io.result.ready := False
-  trgtScheduler.io.result.ready := False
-  trgsScheduler.io.result.ready := False
-  trgsScheduler.io.resultLine.ready := False
-  when(state === UnifiedEndToEndState.RunIp) {
-    selectedResult := ip.io.result.payload.element
-    selectedResultValid := ip.io.result.valid && ip.io.result.payload.element.valid
-    ip.io.result.ready := Mux(ip.io.result.payload.element.valid,
-      writeback.io.input.ready, True)
-  } elsewhen(state === UnifiedEndToEndState.RunGustavson && runTrGt) {
-    selectedResult := trgtScheduler.io.result.payload
-    selectedResultValid := trgtScheduler.io.result.valid &&
-      trgtScheduler.io.result.payload.valid
-    trgtScheduler.io.result.ready := Mux(trgtScheduler.io.result.payload.valid,
-      writeback.io.input.ready, True)
-  } elsewhen(state === UnifiedEndToEndState.RunGustavson) {
-    selectedResult := trgsScheduler.io.result.payload
-    selectedResultValid := trgsScheduler.io.result.valid &&
-      trgsScheduler.io.result.payload.valid
-    trgsScheduler.io.result.ready := Mux(trgsScheduler.io.result.payload.valid,
-      writeback.io.input.ready, True)
+  if (includeIp) {
+    ip.io.result.ready := False
+    when(state === UnifiedEndToEndState.RunIp) {
+      selectedResult := ip.io.result.payload.element
+      selectedResultValid := ip.io.result.valid && ip.io.result.payload.element.valid
+      ip.io.result.ready := Mux(ip.io.result.payload.element.valid,
+        writeback.io.input.ready, True)
+    }
+  }
+  if (includeTrGt) {
+    trgtScheduler.io.result.ready := False
+    when(state === UnifiedEndToEndState.RunGustavson && runTrGt) {
+      selectedResult := trgtScheduler.io.result.payload
+      selectedResultValid := trgtScheduler.io.result.valid &&
+        trgtScheduler.io.result.payload.valid
+      trgtScheduler.io.result.ready := Mux(trgtScheduler.io.result.payload.valid,
+        writeback.io.input.ready, True)
+    }
+  }
+  if (includeTrGs) {
+    trgsScheduler.io.result.ready := False
+    trgsScheduler.io.resultLine.ready := False
+    when(state === UnifiedEndToEndState.RunGustavson && !runTrGt) {
+      selectedResult := trgsScheduler.io.result.payload
+      selectedResultValid := trgsScheduler.io.result.valid &&
+        trgsScheduler.io.result.payload.valid
+      trgsScheduler.io.result.ready := Mux(trgsScheduler.io.result.payload.valid,
+        writeback.io.input.ready, True)
+    }
   }
   writeback.io.input.valid := selectedResultValid
   writeback.io.input.payload := selectedResult
 
-  val gustavsonCompleted = csr.io.done &&
-    Mux(runTrGt,
+  val gustavsonCompleted: Bool = if (includeTrGt && includeTrGs) {
+    csr.io.done && Mux(runTrGt,
       trgtScheduler.io.completedTiles === csr.io.issuedTiles &&
         !trgtScheduler.io.allocated.orR,
       trgsAdapter.io.busy === False &&
         trgsScheduler.io.completedTiles === csr.io.issuedTiles)
-  when(state === UnifiedEndToEndState.RunIp && ip.io.done) {
-    errorReg := ip.io.descriptorError || ip.io.addressError ||
-      ip.io.innerError || ip.io.memoryError
-    state := UnifiedEndToEndState.CloseWriteback
+  } else if (includeTrGt) {
+    csr.io.done &&
+      trgtScheduler.io.completedTiles === csr.io.issuedTiles &&
+      !trgtScheduler.io.allocated.orR
+  } else if (includeTrGs) {
+    csr.io.done && !trgsAdapter.io.busy &&
+      trgsScheduler.io.completedTiles === csr.io.issuedTiles
+  } else {
+    False
   }
-  when(state === UnifiedEndToEndState.RunGustavson && gustavsonCompleted) {
-    errorReg := csr.io.error || trgtScheduler.io.memoryError ||
-      trgtScheduler.io.addressError || trgtScheduler.io.unsupportedMode ||
-      trgsAdapter.io.memoryError || trgsAdapter.io.addressError ||
-      trgsAdapter.io.unsupportedMode || trgtScheduler.io.overflow ||
-      trgsScheduler.io.overflow.orR ||
-      trgsScheduler.io.unsupportedMode.orR
-    state := UnifiedEndToEndState.CloseWriteback
+  if (includeIp) {
+    when(state === UnifiedEndToEndState.RunIp && ip.io.done) {
+      errorReg := ip.io.descriptorError || ip.io.addressError ||
+        ip.io.innerError || ip.io.memoryError
+      state := UnifiedEndToEndState.CloseWriteback
+    }
+  }
+  if (includeGustavson) {
+    var gustavsonError: Bool = csr.io.error
+    if (includeTrGt) {
+      gustavsonError = gustavsonError || trgtScheduler.io.memoryError ||
+        trgtScheduler.io.addressError || trgtScheduler.io.unsupportedMode ||
+        trgtScheduler.io.overflow
+    }
+    if (includeTrGs) {
+      gustavsonError = gustavsonError || trgsAdapter.io.memoryError ||
+        trgsAdapter.io.addressError || trgsAdapter.io.unsupportedMode ||
+        trgsScheduler.io.overflow.orR || trgsScheduler.io.unsupportedMode.orR
+    }
+    when(state === UnifiedEndToEndState.RunGustavson && gustavsonCompleted) {
+      errorReg := gustavsonError
+      state := UnifiedEndToEndState.CloseWriteback
+    }
   }
 
   writeback.io.close := state === UnifiedEndToEndState.CloseWriteback
@@ -1101,25 +1194,38 @@ class UnifiedEndToEndSystem(systemCfg: EndToEndSystemConfig) extends Component {
     state := UnifiedEndToEndState.Idle
   }
 
-  for (lane <- 0 until ipReaderLanes) {
-    cache.io.requests(lane) <> ip.io.aCacheRequests(lane)
-    ip.io.aCacheResponses(lane) <> cache.io.responses(lane)
-    val bClient = ipReaderLanes + lane
-    cache.io.requests(bClient) <> ip.io.bCacheRequests(lane)
-    ip.io.bCacheResponses(lane) <> cache.io.responses(bClient)
+  var nextCacheClient = 0
+  if (includeIp) {
+    for (lane <- 0 until ipReaderLanes) {
+      cache.io.requests(nextCacheClient + lane) <> ip.io.aCacheRequests(lane)
+      ip.io.aCacheResponses(lane) <> cache.io.responses(nextCacheClient + lane)
+      cache.io.requests(nextCacheClient + ipReaderLanes + lane) <>
+        ip.io.bCacheRequests(lane)
+      ip.io.bCacheResponses(lane) <>
+        cache.io.responses(nextCacheClient + ipReaderLanes + lane)
+    }
+    nextCacheClient += 2 * ipReaderLanes
   }
-  val csrClient = 2 * ipReaderLanes
-  cache.io.requests(csrClient) <> csr.io.cacheRequest
-  csr.io.cacheResponse <> cache.io.responses(csrClient)
-  for (row <- 0 until cfg.peRows) {
-    val trgtClient = csrClient + 1 + row
-    cache.io.requests(trgtClient) <> trgtScheduler.io.cacheRequests(row)
-    trgtScheduler.io.cacheResponses(row) <> cache.io.responses(trgtClient)
+  if (includeGustavson) {
+    cache.io.requests(nextCacheClient) <> csr.io.cacheRequest
+    csr.io.cacheResponse <> cache.io.responses(nextCacheClient)
+    nextCacheClient += 1
   }
-  val trgsClient = csrClient + 1 + cfg.peRows
-  cache.io.requests(trgsClient) <> trgsAdapter.io.cacheRequest
-  trgsAdapter.io.cacheResponse <> cache.io.responses(trgsClient)
-  for (client <- trgsClient + 1 until cacheCfg.clientCount) {
+  if (includeTrGt) {
+    for (row <- 0 until cfg.peRows) {
+      cache.io.requests(nextCacheClient + row) <>
+        trgtScheduler.io.cacheRequests(row)
+      trgtScheduler.io.cacheResponses(row) <>
+        cache.io.responses(nextCacheClient + row)
+    }
+    nextCacheClient += cfg.peRows
+  }
+  if (includeTrGs) {
+    cache.io.requests(nextCacheClient) <> trgsAdapter.io.cacheRequest
+    trgsAdapter.io.cacheResponse <> cache.io.responses(nextCacheClient)
+    nextCacheClient += 1
+  }
+  for (client <- nextCacheClient until cacheCfg.clientCount) {
     cache.io.requests(client).valid := False
     cache.io.requests(client).payload := CacheReadRequest(cacheCfg).getZero
     cache.io.responses(client).ready := True

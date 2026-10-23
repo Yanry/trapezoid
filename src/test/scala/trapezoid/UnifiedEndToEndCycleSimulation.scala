@@ -3,17 +3,38 @@ package trapezoid
 import spinal.core.sim._
 import trapezoid.model.{BitmaskFiber, DenseMatrix, MatrixReference}
 
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Path, Paths}
 import scala.collection.mutable
+import scala.sys.process.Process
 import scala.util.Random
 
 /** Actual RTL descriptor-to-final-C-write-response cycle benchmark. */
 object EndToEndCycleSimulation extends App {
-  private val dimension = 16
-  private val samplesPerCategory = 3
-  private val readLatencyCycles = 12
-  private val writeLatencyCycles = 6
+  private val paperScale = sys.props.get("trapezoid.bench.scale")
+    .contains("paper")
+  private val modeFilter = sys.props.get("trapezoid.bench.mode")
+  private val hardwareProfile = if (!paperScale) {
+    EndToEndHardwareProfile.Unified
+  } else modeFilter match {
+    case Some("DenseIp") | Some("TrIp") => EndToEndHardwareProfile.IpOnly
+    case Some("TrGt") => EndToEndHardwareProfile.TrGtOnly
+    case Some("TrGs") => EndToEndHardwareProfile.TrGsOnly
+    case Some(mode) => throw new IllegalArgumentException(
+      s"unknown paper RTL mode $mode")
+    case None => throw new IllegalArgumentException(
+      "paper RTL requires -Dtrapezoid.bench.mode=<DenseIp|TrIp|TrGt|TrGs>")
+  }
+  private val dimension = if (paperScale) 128 else 16
+  private val samplesPerCategory = sys.props.get("trapezoid.bench.samples")
+    .map(_.toInt).getOrElse(3)
+  require(samplesPerCategory >= 1)
+  private val readLatencyCycles =
+    sys.props.get("trapezoid.bench.readLatency").map(_.toInt).getOrElse(12)
+  private val writeLatencyCycles =
+    sys.props.get("trapezoid.bench.writeLatency").map(_.toInt).getOrElse(6)
 
-  private val cfg = TrapezoidConfig(
+  private val cfg = if (paperScale) TrapezoidConfig.paper else TrapezoidConfig(
     dataWidth = 8,
     accumulatorWidth = 32,
     coordinateWidth = 8,
@@ -29,40 +50,133 @@ object EndToEndCycleSimulation extends App {
     responseFifoDepth = 2
   )
   private val tileCfg = TrIpTileConfig(cfg, maxColumns = dimension,
-    maxRowsOverride = 8)
+    maxRowsOverride = dimension)
   private val matrixCfg = TrIpMatrixConfig(tileCfg,
-    maxMatrixRows = dimension, maxMatrixColumns = dimension, maxKTiles = 2)
-  private val cacheCfg = CacheConfig(
+    maxMatrixRows = dimension, maxMatrixColumns = dimension,
+    maxKTiles = dimension / cfg.fiberWidth)
+  private val cacheClientCount = hardwareProfile match {
+    case EndToEndHardwareProfile.Unified =>
+      2 * cfg.localBanks + cfg.peRows + 2
+    case EndToEndHardwareProfile.IpOnly => 2 * cfg.localBanks
+    case EndToEndHardwareProfile.TrGtOnly => cfg.peRows + 1
+    case EndToEndHardwareProfile.TrGsOnly => 2
+  }
+  private val cacheCfg = if (paperScale) CacheConfig(
+    wordWidth = cfg.dataWidth,
+    wordsPerLine = 16,
+    addressWidth = 24,
+    bankCount = 128,
+    setsPerBank = 2048,
+    clientCount = cacheClientCount,
+    requestIdWidth = 12
+  ) else CacheConfig(
     wordWidth = 8,
     wordsPerLine = 16,
     addressWidth = 12,
     bankCount = 8,
     setsPerBank = 64,
-    clientCount = 2 * cfg.localBanks + cfg.peRows + 2,
+    clientCount = cacheClientCount,
     requestIdWidth = 8
   )
   private val gustCfg = GustavsonCacheConfig(
     GustavsonTileConfig(cfg, accumulatorEntries = dimension,
-      fifoDepthPerSubrow = 8),
+      fifoDepthPerSubrow = if (paperScale) 32 else 8),
     cacheCfg,
-    maxLinesPerRow = 8
+    maxLinesPerRow = if (paperScale) 256 else 8
   )
   private val systemCfg = EndToEndSystemConfig(
-    matrixCfg, gustCfg, CacheClusterConfig(cacheCfg, clusterCount = 4),
+    matrixCfg, gustCfg, CacheClusterConfig(cacheCfg,
+      clusterCount = if (paperScale) 4 else 4),
     maxCResults = dimension * dimension)
   private val fiberCacheCfg = FiberCacheConfig(cfg, cacheCfg)
+
+  private val paperKernelDirectory = Paths.get(
+    "simWorkspace", "paper-pe-row-kernel").toAbsolutePath.normalize()
+  private val paperKernelSources = Vector(
+    paperKernelDirectory.resolve("TrapezoidPERow.v"),
+    paperKernelDirectory.resolve("MultiFiberIntersection.v"),
+    paperKernelDirectory.resolve("DynamicColumnPacker.v"),
+    paperKernelDirectory.resolve("OperandDistributionNetwork.v")
+  )
+  private val paperKernelInputs = Vector(
+    Paths.get("src/main/scala/trapezoid/TrapezoidPERow.scala"),
+    Paths.get("src/main/scala/trapezoid/MultiFiberIntersection.scala"),
+    Paths.get("src/main/scala/trapezoid/TrapezoidTypes.scala"),
+    Paths.get("src/main/scala/trapezoid/TrapezoidConfig.scala")
+  ).map(_.toAbsolutePath.normalize())
+
+  private def paperKernelIsCurrent: Boolean = {
+    paperKernelSources.forall(Files.isRegularFile(_)) && {
+      val oldestOutput = paperKernelSources.map(path =>
+        Files.getLastModifiedTime(path).toMillis).min
+      val newestInput = paperKernelInputs.map(path =>
+        Files.getLastModifiedTime(path).toMillis).max
+      oldestOutput >= newestInput
+    }
+  }
+
+  private def ensurePaperKernel(): Unit = if (!paperKernelIsCurrent) {
+    Files.createDirectories(paperKernelDirectory)
+    val java = Paths.get(System.getProperty("java.home"), "bin", "java").toString
+    val status = Process(Seq(
+      java,
+      "-Xms1G",
+      "-Xmx12G",
+      "-XX:+UseG1GC",
+      "-cp",
+      System.getProperty("java.class.path"),
+      "trapezoid.GeneratePaperPERowSimulationRtl",
+      paperKernelDirectory.toString
+    )).!
+    require(status == 0,
+      s"paper PE-row RTL generation failed with status $status")
+    require(paperKernelSources.forall(Files.isRegularFile(_)),
+      s"paper PE-row RTL is incomplete in $paperKernelDirectory")
+  }
+
+  private def markPaperKernelHierarchical(): Unit = {
+    val peSource = paperKernelDirectory.resolve("TrapezoidPERow.v")
+    val marker = "/*verilator hier_block*/"
+    val source = new String(Files.readAllBytes(peSource), StandardCharsets.UTF_8)
+    val cleaned = source.replace("\n  " + marker, "")
+    val declaration = "module TrapezoidPERow ("
+    val declarationIndex = cleaned.indexOf(declaration)
+    require(declarationIndex >= 0,
+      s"cannot locate TrapezoidPERow declaration in $peSource")
+    val headerEnd = cleaned.indexOf(");", declarationIndex)
+    require(headerEnd >= 0,
+      s"cannot locate TrapezoidPERow port-list end in $peSource")
+    val annotated = cleaned.substring(0, headerEnd + 2) +
+      "\n  " + marker + cleaned.substring(headerEnd + 2)
+    Files.write(peSource, annotated.getBytes(StandardCharsets.UTF_8))
+  }
+
+  if (paperScale) {
+    ensurePaperKernel()
+    markPaperKernelHierarchical()
+  }
+  private val peFactory: TrapezoidConfig => TrapezoidPERowComponent =
+    if (paperScale) {
+      core => new PaperPERowBlackBox(core, paperKernelSources)
+    } else {
+      core => new TrapezoidPERow(core)
+    }
 
   private val highlySparseBasisPoints = 50
   private val mildlySparseBasisPoints = 2000
   private val denseBasisPoints = 10000
 
   private val ipABase = 0x100
-  private val ipBBase = 0x340
-  private val rowPointerBase = 0x600
-  private val aEntryBase = 0x640
-  private val bDescriptorBase = 0x800
-  private val bRowBase = 0x900
-  private val cBase = 0xc00
+  private val ipARegionLines = dimension * matrixCfg.maxKTiles *
+    fiberCacheCfg.linesPerFiber
+  private val ipBBase = ipABase + ipARegionLines + 0x100
+  private val ipBRegionLines = matrixCfg.maxKTiles * dimension *
+    fiberCacheCfg.linesPerFiber
+  private val rowPointerBase = ipBBase + ipBRegionLines + 0x100
+  private val aEntryBase = rowPointerBase + dimension + 0x100
+  private val bDescriptorBase = aEntryBase + dimension * dimension + 0x100
+  private val bRowBase = bDescriptorBase + dimension + 0x100
+  private val cBase = bRowBase + dimension * dimension + 0x100
 
   private case class Category(name: String, aBasisPoints: Int,
                               bBasisPoints: Int, paperMode: String)
@@ -96,7 +210,6 @@ object EndToEndCycleSimulation extends App {
   )
   private val modeOrder = Vector("DenseIp", "TrIp", "TrGt", "TrGs")
   private val categoryFilter = sys.props.get("trapezoid.bench.category")
-  private val modeFilter = sys.props.get("trapezoid.bench.mode")
   private val selectedCategories = categories.filter(category =>
     categoryFilter.forall(_ == category.name))
   private val selectedModes = modeOrder.filter(mode => modeFilter.forall(_ == mode))
@@ -269,9 +382,18 @@ object EndToEndCycleSimulation extends App {
   private val simConfig = SimConfig.withVerilator
     .addSimulatorFlag("-CFLAGS -std=c++14")
     .addSimulatorFlag("-LDFLAGS -std=c++14")
+    .addSimulatorFlag("-Wno-MODDUP")
+  if (paperScale) {
+    simConfig.addSimulatorFlag("--hierarchical")
+    simConfig.addSimulatorFlag("--verilate-jobs 1")
+    simConfig.addSimulatorFlag("--build-dep-bin /usr/bin/verilator_bin")
+    simConfig.addSimulatorFlag("--output-split 20000")
+    simConfig.addSimulatorFlag("--output-split-cfuncs 20000")
+  }
 
   private val measurements = mutable.ArrayBuffer.empty[Measurement]
-  simConfig.compile(new UnifiedEndToEndSystem(systemCfg)).doSim { dut =>
+  simConfig.compile(new UnifiedEndToEndSystem(systemCfg, peFactory,
+    hardwareProfile)).doSim { dut =>
     dut.clockDomain.forkStimulus(10)
     dut.io.clear #= false
     dut.io.descriptor.valid #= false
@@ -487,4 +609,84 @@ object EndToEndCycleSimulation extends App {
   println("\nEvery total is counted from Verilator RTL clock edges. CSR pointer walking, " +
     "clustered-cache misses/refills, compute, result backpressure, and final C write " +
     "responses are inside the measured boundary.")
+}
+
+/** Full paper-array RTL end-to-end entry point.
+  *
+  * This reuses the descriptor/DMA/HBM driver above but selects the paper
+  * hardware configuration before the benchmark object is initialized.  The
+  * matrix is one 128x128 tile so the Gustavson accumulator capacity remains
+  * the paper 128-entry tile capacity while the instantiated array is still
+  * 128 PE rows x 128 MAC lanes.
+  *
+  * Run with:
+  *   sbt -batch 'Test/runMain trapezoid.PaperUnifiedEndToEndCycleSimulation'
+  *
+  * Optional filters are shared with EndToEndCycleSimulation:
+  *   -Dtrapezoid.bench.category='MS x MS'
+  *   -Dtrapezoid.bench.mode=TrIp
+  */
+object PaperUnifiedEndToEndCycleSimulation extends App {
+  if (!sys.env.contains("TRAPEZOID_PAPER_RTL_WORKER")) {
+    val root = Paths.get("simWorkspace", "verilator-root")
+      .toAbsolutePath.normalize()
+    val bin = root.resolve("bin")
+    Files.createDirectories(bin)
+
+    def ensureLink(link: Path, target: Path): Unit = {
+      if (!Files.exists(link)) Files.createSymbolicLink(link, target)
+    }
+
+    ensureLink(root.resolve("include"), Paths.get("/usr/share/verilator/include"))
+    ensureLink(bin.resolve("verilator_bin"), Paths.get("/usr/bin/verilator_bin"))
+    for (tool <- Seq("verilator_includer", "verilator_ccache_report",
+        "verilator_difftree")) {
+      ensureLink(bin.resolve(tool), Paths.get("/usr/share/verilator/bin", tool))
+    }
+
+    val requestedMode = args.collectFirst {
+      case argument if argument.startsWith("--mode=") =>
+        argument.stripPrefix("--mode=")
+    }
+    val modes = requestedMode match {
+      case None | Some("all") => Vector("DenseIp", "TrIp", "TrGt", "TrGs")
+      case Some(mode) => Vector(mode)
+    }
+    val commonArgs = args.filterNot(_.startsWith("--mode="))
+    val java = Paths.get(System.getProperty("java.home"), "bin", "java").toString
+    for (mode <- modes) {
+      val status = Process(Seq(
+        java,
+        "-Xms1G",
+        "-Xmx14G",
+        "-XX:+UseG1GC",
+        "-cp",
+        System.getProperty("java.class.path"),
+        "trapezoid.PaperUnifiedEndToEndCycleSimulation",
+        s"--mode=$mode"
+      ) ++ commonArgs, None,
+        "TRAPEZOID_PAPER_RTL_WORKER" -> "1",
+        "VERILATOR_ROOT" -> root.toString).!
+      require(status == 0,
+        s"paper RTL worker for $mode failed with status $status")
+    }
+  } else {
+    args.foreach { argument =>
+      val parts = argument.stripPrefix("--").split("=", 2)
+      require(parts.length == 2,
+        s"expected --mode=..., --category=..., or --samples=..., got $argument")
+      parts(0) match {
+        case "mode" => System.setProperty("trapezoid.bench.mode", parts(1))
+        case "category" => System.setProperty("trapezoid.bench.category", parts(1))
+        case "samples" => System.setProperty("trapezoid.bench.samples", parts(1))
+        case "read-latency" =>
+          System.setProperty("trapezoid.bench.readLatency", parts(1))
+        case "write-latency" =>
+          System.setProperty("trapezoid.bench.writeLatency", parts(1))
+        case key => throw new IllegalArgumentException(s"unknown option --$key")
+      }
+    }
+    System.setProperty("trapezoid.bench.scale", "paper")
+    EndToEndCycleSimulation.main(args)
+  }
 }

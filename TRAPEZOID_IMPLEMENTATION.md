@@ -57,6 +57,14 @@
 | `PaperSinglePERowCycleSimulation` | 论文规模单 row | 128x128 logical tile，1 row，128 MAC/row，`TrapezoidConfig.paper` |
 | full paper array | 论文规模完整阵列 | 128 rows，128 MAC/row，当前生成/编译资源消耗很大 |
 
+`CacheConfig.paper(...)` 和 paper-scale end-to-end profile 的 global cache 参数已对齐论文 Table I 的主要容量结构：4 clusters、每 cluster 32 banks、每 bank 128 sets x 16 ways、每 line 16 x 32-bit words（64 B）。总容量为：
+
+```text
+4 clusters x 32 banks x 128 sets x 16 ways x 64 B = 16 MB
+```
+
+默认小规模 `EndToEndCycleSimulation` 仍使用 1-way cache，以控制 RTL 和 Verilator 编译规模；它不是 paper cache 的缩容等比例模型。
+
 ### 2.3 派生容量
 
 - `distributionWidth = macLanes`；paper 配置为 128。
@@ -191,15 +199,20 @@ local buffer 的 bank/line 结构影响 TrGt/TrGs 的访问和命令分组，但
 
 源文件主要为 `BankedReadCache.scala` 和相关 clustered cache 封装。
 
-当前 cache 是只读、banked、direct-mapped 的 RTL 模型：
+当前 cache 是只读、banked、可参数化 set-associative 的 RTL 模型：
 
 - 地址按 cache line 切分；
 - bank 选择和 set 选择分开；
+- `ways=1` 时为 direct-mapped，paper profile 使用 16-way；
+- lookup 并行比较一个 set 中的所有 tag；
+- refill 优先选择 invalid way，set 填满后采用 per-set round-robin replacement；
 - miss 产生 refill 请求；
 - refill 完成后响应等待中的读请求；
 - cluster 将多个 bank 组合起来，系统级模型再将多个 cluster 连接到 DMA 读路径。
 
-当前没有完整的 dirty writeback、真实 HBM/AXI 协议、NoC 路由和 cache coherence。C 写路径是系统级测试中的最终响应边界，不能理解为已经实现了论文硬件的完整内存子系统。
+cluster wrapper 会先用 global bank bits 选择 cluster，再删除 cluster index bits，将剩余地址交给 local cache 做 bank/set/tag 解码；refill 请求返回系统边界时再插回 cluster bits。这样每个 cluster 都能使用全部 128 sets，避免 cluster bits 固定后只访问部分 sets。
+
+当前没有完整的 dirty writeback、论文未明确的 replacement policy 复刻、真实 HBM/AXI 协议、NoC 路由和 cache coherence。C 写路径是系统级测试中的最终响应边界，不能理解为已经实现了论文硬件的完整内存子系统。
 
 ## 5. 四种 mode 的 dataflow
 
@@ -341,9 +354,11 @@ final C write response consumed
 | HS x HS | 1131.0 | 779.0 | 357.0 | 356.0 |
 | HS x MS | 1163.0 | 811.0 | 357.7 | 356.0 |
 | HS x D | 1251.0 | 899.0 | 411.0 | 356.0 |
-| MS x MS | 2079.3 | 1724.7 | 1784.7 | 1814.3 |
-| MS x D | 3159.3 | 2791.3 | 3420.7 | 2612.7 |
-| D x D | 3202.0 | 3266.0 | 14616.0 | 9077.0 |
+| MS x MS | 2079.3 | 1724.7 | 1772.7 | 1750.7 |
+| MS x D | 3159.3 | 2791.3 | 3393.7 | 2525.3 |
+| D x D | 3202.0 | 3266.0 | 14380.0 | 7447.0 |
+
+这些数字是在修正 clustered-cache set/tag 地址映射后的结果。DenseIp/TrIp 的访问集合没有改变，周期保持不变；TrGt/TrGs 在中高密度下减少了人为的 conflict miss，因而周期下降。该变化说明 cache 地址映射会显著影响 mode 趋势，也说明小规模结果仍不能替代论文的 16-way paper-scale cache 仿真。
 
 ### 7.2 `PaperSinglePERowCycleSimulation`
 
@@ -411,7 +426,7 @@ sbt -batch 'Test/runMain trapezoid.PaperSinglePERowCycleSimulation'
 
 ### 8.5 memory system 和 NoC 仍是模型
 
-当前 cache 是 banked read cache，DMA 是固定 latency 模型，尚未实现论文平台的真实 HBM/AXI/NoC 拓扑、带宽竞争和 multicast routing。因此 TrGt/TrGs 的 memory advantage 或 DenseIp 的带宽瓶颈不一定呈现为论文中的比例。
+paper profile 已配置为论文的 4 clusters、128 banks、16-way、64 B line 和 16 MB 总容量，但替换策略采用当前 RTL 的 round-robin，DMA 仍是固定 latency 模型，也尚未实现论文平台的真实 2 TB/s HBM、32x32 cluster crossbar 时序、NoC 竞争和 multicast routing。因此 TrGt/TrGs 的 memory advantage 或 DenseIp 的带宽瓶颈仍不一定呈现为论文中的比例。
 
 ### 8.6 hardware implementation 仍有结构差异
 
@@ -450,7 +465,7 @@ utilization = usefulMacs / laneSlots
 2. 先完成 128-row full array 的实际 Verilator 编译和运行，再比较阵列级周期。
 3. 统一两类测试的计时边界，分别报告 setup、memory、compute、writeback，不要把不同边界的数字放在同一排名中。
 4. 将 paper scheduler 的 subrow、动态 B packing、row balancing、buffer occupancy 和 mode selection 规则直接编码到前端。
-5. 用论文相同的 cache line、bank 数、带宽、miss latency、DMA burst 和 NoC/multicast 假设替换当前模型参数。
+5. 保持已经对齐的 16 MB、128-bank、16-way、64 B cache 结构，并继续对齐论文的 32x32 cluster crossbar、2 TB/s HBM 带宽、miss latency、DMA burst 和 NoC/multicast 竞争。
 6. 将 Benes distribution control、完整跨命令 Gustavson accumulator 和真实结果写回路径接入系统。
 7. 如果要比较面积和功耗，使用固定工艺/FPGA、时钟约束、综合脚本和 switching activity；SpinalHDL/Verilator 仿真本身不能给出论文可比的面积功耗。
 

@@ -58,6 +58,18 @@ class TrapezoidStructureSpec extends AnyFunSuite {
     assert(TrapezoidConfig.paper.localDepthPerBank *
       TrapezoidConfig.paper.localWordsPerBank >= paperTile.maxColumns)
     assert(GustavsonTileConfig(TrapezoidConfig.paper).accumulatorEntries == 128)
+
+    val paperCache = CacheConfig.paper(clientCount = 128)
+    assert(paperCache.bankCount == 128)
+    assert(paperCache.setsPerBank == 128)
+    assert(paperCache.ways == 16)
+    assert(paperCache.wordsPerLine == 16)
+    assert(paperCache.capacityBytes == BigInt(16) * 1024 * 1024)
+    val paperClusters = CacheClusterConfig(paperCache, clusterCount = 4)
+    assert(paperClusters.localCache.bankCount == 32)
+    assert(paperClusters.localCache.capacityBytes == BigInt(4) * 1024 * 1024)
+    val singleCluster = CacheClusterConfig(paperCache, clusterCount = 1)
+    assert(singleCluster.localCache.addressWidth == paperCache.addressWidth)
   }
 
   test("multi-row Gustavson array elaborates") {

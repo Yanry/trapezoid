@@ -7,14 +7,19 @@ object CacheBankState extends SpinalEnum {
   val Idle, Lookup, RequestRefill, WaitRefill, Respond = newElement()
 }
 
-/** Multi-client, banked, direct-mapped read cache.
+/** Multi-client, banked, set-associative read cache.
   *
   * Each bank accepts one request at a time and may hold one independent miss.
   * A client may have one outstanding request, which makes response routing
   * deterministic without a reorder buffer.  The shared refill port can return
   * banks out of order by carrying the bank and line address in every response.
+  * Refills choose an invalid way first, then use a per-set round-robin pointer.
   */
 class BankedReadCache(cacheCfg: CacheConfig) extends Component {
+  private val setDataWidth = cacheCfg.lineWidth * cacheCfg.ways
+  private val setTagWidth = cacheCfg.tagWidth * cacheCfg.ways
+  private val validBitCount = cacheCfg.setsPerBank * cacheCfg.ways
+
   val io = new Bundle {
     val clear = in Bool()
     val requests = Vec(slave(Stream(CacheReadRequest(cacheCfg))), cacheCfg.clientCount)
@@ -46,11 +51,13 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
 
   val states = Vec((0 until cacheCfg.bankCount).map(_ => RegInit(CacheBankState.Idle)))
   val validBits = Vec((0 until cacheCfg.bankCount).map(_ =>
-    Reg(Bits(cacheCfg.setsPerBank bits)) init 0))
+    Reg(Bits(validBitCount bits)) init 0))
   val dataMemories = Array.fill(cacheCfg.bankCount)(
-    Mem(Bits(cacheCfg.lineWidth bits), cacheCfg.setsPerBank))
+    Mem(Bits(setDataWidth bits), cacheCfg.setsPerBank))
   val tagMemories = Array.fill(cacheCfg.bankCount)(
-    Mem(UInt(cacheCfg.tagWidth bits), cacheCfg.setsPerBank))
+    Mem(Bits(setTagWidth bits), cacheCfg.setsPerBank))
+  val replacementMemories = Array.fill(cacheCfg.bankCount)(
+    Mem(UInt(cacheCfg.wayIndexWidth bits), cacheCfg.setsPerBank))
 
   val addressRegs = Vec((0 until cacheCfg.bankCount).map(_ =>
     Reg(UInt(cacheCfg.addressWidth bits)) init 0))
@@ -60,6 +67,12 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
     Reg(UInt(cacheCfg.clientIndexWidth bits)) init 0))
   val requestIdRegs = Vec((0 until cacheCfg.bankCount).map(_ =>
     Reg(UInt(cacheCfg.requestIdWidth bits)) init 0))
+  val victimWayRegs = Vec((0 until cacheCfg.bankCount).map(_ =>
+    Reg(UInt(cacheCfg.wayIndexWidth bits)) init 0))
+  val setDataRegs = Vec((0 until cacheCfg.bankCount).map(_ =>
+    Reg(Bits(setDataWidth bits)) init 0))
+  val setTagRegs = Vec((0 until cacheCfg.bankCount).map(_ =>
+    Reg(Bits(setTagWidth bits)) init 0))
   val responseData = Vec((0 until cacheCfg.bankCount).map(_ =>
     Reg(Bits(cacheCfg.lineWidth bits)) init 0))
   val responseWasHit = Vec((0 until cacheCfg.bankCount).map(_ => RegInit(False)))
@@ -104,8 +117,9 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
     }
   }
 
-  val readData = Vec(Bits(cacheCfg.lineWidth bits), cacheCfg.bankCount)
-  val readTag = Vec(UInt(cacheCfg.tagWidth bits), cacheCfg.bankCount)
+  val readSetData = Vec(Bits(setDataWidth bits), cacheCfg.bankCount)
+  val readSetTags = Vec(Bits(setTagWidth bits), cacheCfg.bankCount)
+  val readReplacement = Vec(UInt(cacheCfg.wayIndexWidth bits), cacheCfg.bankCount)
   for (bank <- 0 until cacheCfg.bankCount) {
     hitEvents(bank) := False
     missEvents(bank) := False
@@ -118,8 +132,9 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
     }
     val accept = bankAccepts(bank) && !io.clear
     val requestSet = setOf(selectedRequest.address)
-    readData(bank) := dataMemories(bank).readSync(requestSet, accept)
-    readTag(bank) := tagMemories(bank).readSync(requestSet, accept)
+    readSetData(bank) := dataMemories(bank).readSync(requestSet, accept)
+    readSetTags(bank) := tagMemories(bank).readSync(requestSet, accept)
+    readReplacement(bank) := replacementMemories(bank).readSync(requestSet, accept)
 
     when(accept) {
       addressRegs(bank) := selectedRequest.address
@@ -133,9 +148,41 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
     }
 
     when(states(bank) === CacheBankState.Lookup) {
-      when(validBits(bank)(setRegs(bank)) &&
-          readTag(bank) === tagOf(addressRegs(bank))) {
-        responseData(bank) := readData(bank)
+      setDataRegs(bank) := readSetData(bank)
+      setTagRegs(bank) := readSetTags(bank)
+
+      val hitWays = Bits(cacheCfg.ways bits)
+      val invalidWays = Bits(cacheCfg.ways bits)
+      val selectedHitData = Bits(cacheCfg.lineWidth bits)
+      val selectedVictim = UInt(cacheCfg.wayIndexWidth bits)
+      selectedHitData := 0
+      selectedVictim := readReplacement(bank)
+      for (way <- 0 until cacheCfg.ways) {
+        val validIndex = if (cacheCfg.ways == 1) {
+          setRegs(bank)
+        } else {
+          (setRegs(bank).asBits ## U(way, cacheCfg.wayIndexWidth bits).asBits).asUInt
+        }
+        val tagHigh = (way + 1) * cacheCfg.tagWidth - 1
+        val tagLow = way * cacheCfg.tagWidth
+        val dataHigh = (way + 1) * cacheCfg.lineWidth - 1
+        val dataLow = way * cacheCfg.lineWidth
+        hitWays(way) := validBits(bank)(validIndex) &&
+          readSetTags(bank)(tagHigh downto tagLow).asUInt === tagOf(addressRegs(bank))
+        invalidWays(way) := !validBits(bank)(validIndex)
+        when(hitWays(way)) {
+          selectedHitData := readSetData(bank)(dataHigh downto dataLow)
+        }
+      }
+      for (way <- (0 until cacheCfg.ways).reverse) {
+        when(invalidWays(way)) {
+          selectedVictim := way
+        }
+      }
+      victimWayRegs(bank) := selectedVictim
+
+      when(hitWays.orR) {
+        responseData(bank) := selectedHitData
         responseWasHit(bank) := True
         responseError(bank) := False
         hitEvents(bank) := True
@@ -187,9 +234,36 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
       responseData(bank) := io.refillResponse.payload.data
       responseError(bank) := io.refillResponse.payload.error
       when(!io.refillResponse.payload.error) {
-        dataMemories(bank).write(setRegs(bank), io.refillResponse.payload.data)
-        tagMemories(bank).write(setRegs(bank), tagOf(addressRegs(bank)))
-        validBits(bank)(setRegs(bank)) := True
+        val updatedSetData = Bits(setDataWidth bits)
+        val updatedSetTags = Bits(setTagWidth bits)
+        updatedSetData := setDataRegs(bank)
+        updatedSetTags := setTagRegs(bank)
+        for (way <- 0 until cacheCfg.ways) {
+          val dataHigh = (way + 1) * cacheCfg.lineWidth - 1
+          val dataLow = way * cacheCfg.lineWidth
+          val tagHigh = (way + 1) * cacheCfg.tagWidth - 1
+          val tagLow = way * cacheCfg.tagWidth
+          when(victimWayRegs(bank) === way) {
+            updatedSetData(dataHigh downto dataLow) :=
+              io.refillResponse.payload.data
+            updatedSetTags(tagHigh downto tagLow) := tagOf(addressRegs(bank)).asBits
+          }
+        }
+        val validIndex = if (cacheCfg.ways == 1) {
+          setRegs(bank)
+        } else {
+          (setRegs(bank).asBits ## victimWayRegs(bank).asBits).asUInt
+        }
+        dataMemories(bank).write(setRegs(bank), updatedSetData)
+        tagMemories(bank).write(setRegs(bank), updatedSetTags)
+        validBits(bank)(validIndex) := True
+        if (cacheCfg.ways == 1) {
+          replacementMemories(bank).write(setRegs(bank),
+            U(0, cacheCfg.wayIndexWidth bits))
+        } else {
+          replacementMemories(bank).write(setRegs(bank),
+            (victimWayRegs(bank) + 1).resized)
+        }
         refillCount := refillCount + 1
       }
       states(bank) := CacheBankState.Respond
@@ -237,7 +311,8 @@ object GenerateBankedReadCache extends App {
     wordsPerLine = 16,
     addressWidth = 24,
     bankCount = 32,
-    setsPerBank = 64,
-    clientCount = 32
+    setsPerBank = 128,
+    clientCount = 32,
+    ways = 16
   )))
 }

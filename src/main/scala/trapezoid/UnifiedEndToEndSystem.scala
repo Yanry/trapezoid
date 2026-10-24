@@ -12,6 +12,23 @@ class ClusteredReadCache(clusterCfg: CacheClusterConfig) extends Component {
   private val clusterCount = clusterCfg.clusterCount
   private val localBankWidth = log2Up(clusterCfg.banksPerCluster)
 
+  private def localAddressOf(address: UInt): UInt = if (clusterCount == 1) {
+    address.resized
+  } else {
+    (address(cacheCfg.addressWidth - 1 downto
+      localBankWidth + clusterCfg.clusterIndexWidth) ##
+      address(localBankWidth - 1 downto 0)).asUInt
+  }
+
+  private def globalAddressOf(address: UInt, cluster: Int): UInt =
+    if (clusterCount == 1) {
+      address.resized
+    } else {
+      (address(localCfg.addressWidth - 1 downto localBankWidth) ##
+        U(cluster, clusterCfg.clusterIndexWidth bits) ##
+        address(localBankWidth - 1 downto 0)).asUInt
+    }
+
   val io = new Bundle {
     val clear = in Bool()
     val requests = Vec(slave(Stream(CacheReadRequest(cacheCfg))), cacheCfg.clientCount)
@@ -44,7 +61,7 @@ class ClusteredReadCache(clusterCfg: CacheClusterConfig) extends Component {
       clusters(cluster).io.requests(client).valid :=
         io.requests(client).valid && selected
       clusters(cluster).io.requests(client).payload.address :=
-        io.requests(client).payload.address
+        localAddressOf(io.requests(client).payload.address)
       clusters(cluster).io.requests(client).payload.requestId :=
         io.requests(client).payload.requestId
       when(selected) {
@@ -92,7 +109,8 @@ class ClusteredReadCache(clusterCfg: CacheClusterConfig) extends Component {
       io.refillRequest.ready && refillChoices(cluster)
     when(refillChoices(cluster)) {
       io.refillRequest.payload.address :=
-        clusters(cluster).io.refillRequest.payload.address
+          globalAddressOf(clusters(cluster).io.refillRequest.payload.address,
+            cluster)
       if (clusterCount == 1) {
         io.refillRequest.payload.bank :=
           clusters(cluster).io.refillRequest.payload.bank.resized
@@ -118,7 +136,7 @@ class ClusteredReadCache(clusterCfg: CacheClusterConfig) extends Component {
     clusters(cluster).io.refillResponse.payload.bank :=
       io.refillResponse.payload.bank(localBankWidth - 1 downto 0).resized
     clusters(cluster).io.refillResponse.payload.address :=
-      io.refillResponse.payload.address
+      localAddressOf(io.refillResponse.payload.address)
     clusters(cluster).io.refillResponse.payload.data :=
       io.refillResponse.payload.data
     clusters(cluster).io.refillResponse.payload.error :=

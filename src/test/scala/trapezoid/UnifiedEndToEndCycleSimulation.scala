@@ -61,15 +61,9 @@ object EndToEndCycleSimulation extends App {
     case EndToEndHardwareProfile.TrGtOnly => cfg.peRows + 1
     case EndToEndHardwareProfile.TrGsOnly => 2
   }
-  private val cacheCfg = if (paperScale) CacheConfig(
-    wordWidth = cfg.dataWidth,
-    wordsPerLine = 16,
-    addressWidth = 24,
-    bankCount = 128,
-    setsPerBank = 2048,
-    clientCount = cacheClientCount,
-    requestIdWidth = 12
-  ) else CacheConfig(
+  private val cacheCfg = if (paperScale) {
+    CacheConfig.paper(cacheClientCount)
+  } else CacheConfig(
     wordWidth = 8,
     wordsPerLine = 16,
     addressWidth = 12,

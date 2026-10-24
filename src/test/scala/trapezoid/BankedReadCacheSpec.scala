@@ -281,4 +281,145 @@ class BankedReadCacheSpec extends AnyFunSuite {
       assert(dut.io.bankBusy.toBigInt == 0)
     }
   }
+
+  test("set-associative ways retain conflicting tags and replace round robin") {
+    val associativeCfg = CacheConfig(
+      wordWidth = 8,
+      wordsPerLine = 4,
+      addressWidth = 6,
+      bankCount = 1,
+      setsPerBank = 2,
+      clientCount = 1,
+      requestIdWidth = 4,
+      ways = 2
+    )
+
+    simConfig.compile(new BankedReadCache(associativeCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.refillRequest.ready #= true
+      dut.io.refillResponse.valid #= false
+      dut.io.requests(0).valid #= false
+      dut.io.responses(0).ready #= false
+
+      def line(address: Int): BigInt = BigInt(address + 1) * 0x01010101L
+
+      fork {
+        while (true) {
+          dut.io.refillResponse.valid #= false
+          sleep(1)
+          if (dut.io.refillRequest.valid.toBoolean) {
+            val address = dut.io.refillRequest.payload.address.toInt
+            dut.clockDomain.waitSampling()
+            dut.io.refillResponse.payload.bank #= 0
+            dut.io.refillResponse.payload.address #= address
+            dut.io.refillResponse.payload.data #= line(address)
+            dut.io.refillResponse.payload.error #= false
+            dut.io.refillResponse.valid #= true
+            while (!dut.io.refillResponse.ready.toBoolean) {
+              dut.clockDomain.waitSampling()
+            }
+            dut.clockDomain.waitSampling()
+            dut.io.refillResponse.valid #= false
+          } else {
+            dut.clockDomain.waitSampling()
+          }
+        }
+      }
+
+      def transact(address: Int, requestId: Int): Boolean = {
+        dut.io.requests(0).payload.address #= address
+        dut.io.requests(0).payload.requestId #= requestId
+        dut.io.requests(0).valid #= true
+        while (!dut.io.requests(0).ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        dut.io.requests(0).valid #= false
+        dut.io.responses(0).ready #= true
+        while (!dut.io.responses(0).valid.toBoolean) dut.clockDomain.waitSampling()
+        assert(dut.io.responses(0).payload.data.toBigInt == line(address))
+        val wasHit = dut.io.responses(0).payload.wasHit.toBoolean
+        dut.clockDomain.waitSampling()
+        dut.io.responses(0).ready #= false
+        wasHit
+      }
+
+      assert(!transact(0, 1))
+      assert(!transact(2, 2))
+      assert(transact(0, 3))
+      assert(transact(2, 4))
+      assert(!transact(4, 5))
+      assert(transact(2, 6), "round-robin refill must retain the other way")
+      assert(!transact(0, 7), "the oldest way must be replaced after the set fills")
+    }
+  }
+
+  test("cluster address mapping preserves every global set index") {
+    val clusteredCfg = CacheConfig(
+      wordWidth = 8,
+      wordsPerLine = 4,
+      addressWidth = 6,
+      bankCount = 4,
+      setsPerBank = 2,
+      clientCount = 1,
+      requestIdWidth = 4
+    )
+    val clusterCfg = CacheClusterConfig(clusteredCfg, clusterCount = 2)
+
+    simConfig.compile(new ClusteredReadCache(clusterCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.refillRequest.ready #= true
+      dut.io.refillResponse.valid #= false
+      dut.io.requests(0).valid #= false
+      dut.io.responses(0).ready #= false
+
+      def line(address: Int): BigInt = BigInt(address + 1) * 0x01010101L
+
+      fork {
+        while (true) {
+          dut.io.refillResponse.valid #= false
+          sleep(1)
+          if (dut.io.refillRequest.valid.toBoolean) {
+            val bank = dut.io.refillRequest.payload.bank.toInt
+            val address = dut.io.refillRequest.payload.address.toInt
+            dut.clockDomain.waitSampling()
+            dut.io.refillResponse.payload.bank #= bank
+            dut.io.refillResponse.payload.address #= address
+            dut.io.refillResponse.payload.data #= line(address)
+            dut.io.refillResponse.payload.error #= false
+            dut.io.refillResponse.valid #= true
+            while (!dut.io.refillResponse.ready.toBoolean) {
+              dut.clockDomain.waitSampling()
+            }
+            dut.clockDomain.waitSampling()
+            dut.io.refillResponse.valid #= false
+          } else {
+            dut.clockDomain.waitSampling()
+          }
+        }
+      }
+
+      def transact(address: Int, requestId: Int): Boolean = {
+        dut.io.requests(0).payload.address #= address
+        dut.io.requests(0).payload.requestId #= requestId
+        dut.io.requests(0).valid #= true
+        while (!dut.io.requests(0).ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        dut.io.requests(0).valid #= false
+        dut.io.responses(0).ready #= true
+        while (!dut.io.responses(0).valid.toBoolean) dut.clockDomain.waitSampling()
+        assert(dut.io.responses(0).payload.data.toBigInt == line(address))
+        val wasHit = dut.io.responses(0).payload.wasHit.toBoolean
+        dut.clockDomain.waitSampling()
+        dut.io.responses(0).ready #= false
+        wasHit
+      }
+
+      assert(!transact(0, 1))
+      assert(!transact(4, 2))
+      assert(transact(0, 3),
+        "global set 1 must not evict global set 0 inside a cluster")
+      assert(transact(4, 4))
+    }
+  }
 }

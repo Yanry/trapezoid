@@ -158,7 +158,7 @@ case class TrIpMatrixConfig(
   val kTileIndexWidth: Int = math.max(1, log2Up(maxKTiles))
 }
 
-/** Direct-mapped banked read-cache sizing.
+/** Set-associative banked read-cache sizing.
   * Addresses identify complete cache lines rather than bytes.
   */
 case class CacheConfig(
@@ -168,7 +168,8 @@ case class CacheConfig(
     bankCount: Int,
     setsPerBank: Int,
     clientCount: Int,
-    requestIdWidth: Int = 8
+    requestIdWidth: Int = 8,
+    ways: Int = 1
 ) {
   require(wordWidth > 0 && wordsPerLine > 0)
   require(addressWidth > 0 && requestIdWidth > 0)
@@ -176,14 +177,32 @@ case class CacheConfig(
     "cache bankCount must be a power of two")
   require(setsPerBank >= 2 && (setsPerBank & (setsPerBank - 1)) == 0,
     "cache setsPerBank must be a power of two and at least two")
+  require(ways >= 1 && (ways & (ways - 1)) == 0,
+    "cache ways must be a power of two")
   require(clientCount > 0)
 
   val lineWidth: Int = wordWidth * wordsPerLine
   val bankIndexWidth: Int = math.max(1, log2Up(bankCount))
   val setIndexWidth: Int = math.max(1, log2Up(setsPerBank))
+  val wayIndexWidth: Int = math.max(1, log2Up(ways))
   val clientIndexWidth: Int = math.max(1, log2Up(clientCount))
   val tagWidth: Int = addressWidth - log2Up(bankCount) - log2Up(setsPerBank)
   require(tagWidth >= 1, "cache addressWidth must leave at least one tag bit")
+  val capacityBytes: BigInt = BigInt(bankCount) * setsPerBank * ways *
+    wordsPerLine * wordWidth / 8
+}
+
+object CacheConfig {
+  def paper(clientCount: Int, requestIdWidth: Int = 12): CacheConfig =
+    CacheConfig(
+      wordWidth = 32,
+      wordsPerLine = 16,
+      addressWidth = 24,
+      bankCount = 128,
+      setsPerBank = 128,
+      clientCount = clientCount,
+      requestIdWidth = requestIdWidth,
+      ways = 16)
 }
 
 /** Fixed-width representation used to move one bitmask fiber through cache.
@@ -263,8 +282,11 @@ case class CacheClusterConfig(cache: CacheConfig, clusterCount: Int) {
     (banksPerCluster & (banksPerCluster - 1)) == 0,
     "each cache cluster needs at least two power-of-two banks")
 
-  val clusterIndexWidth: Int = math.max(1, log2Up(clusterCount))
-  val localCache: CacheConfig = cache.copy(bankCount = banksPerCluster)
+  val clusterAddressBits: Int = log2Up(clusterCount)
+  val clusterIndexWidth: Int = math.max(1, clusterAddressBits)
+  val localCache: CacheConfig = cache.copy(
+    addressWidth = cache.addressWidth - clusterAddressBits,
+    bankCount = banksPerCluster)
 }
 
 /** Bounds for the descriptor-to-C-write-response RTL system. */

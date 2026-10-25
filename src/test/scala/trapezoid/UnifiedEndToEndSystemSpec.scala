@@ -269,6 +269,11 @@ class UnifiedEndToEndSystemSpec extends AnyFunSuite {
         assert(writes.map(_._1) == (cBase until cBase + expected.size))
         assert(writes.map(entry => decodeResult(entry._2)).toMap == expected)
         assert(dut.io.writtenResults.toLong == expected.size)
+        if (mode == TrapezoidDataflow.TrGt) {
+          assert(dut.io.trgtAssignedTiles.toLong == 1,
+            "two short CSR rows should share one packed TrGT tile")
+          assert(dut.io.trgtCompletedTiles.toLong == 1)
+        }
         assert(lastWriteResponseEdge >= startEdge)
         assert(doneEdge >= lastWriteResponseEdge,
           "completion must not precede the final C write response")

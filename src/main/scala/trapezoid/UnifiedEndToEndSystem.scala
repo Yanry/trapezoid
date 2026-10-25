@@ -353,10 +353,8 @@ class CsrGustavsonDescriptorFrontend(systemCfg: EndToEndSystemConfig)
   io.command.valid := !io.clear && state === CsrGustavsonState.Emit
   io.command.payload.mode := descriptorReg.mode
   io.command.payload.endOfTile := entryIndex + 1 >= rowEnd
-  val packedSubrow = rowEntryOrdinal % cfg.localBanks
-  val packedOffset = rowEntryOrdinal / cfg.localBanks
-  io.command.payload.aIndex :=
-    (packedSubrow * cfg.macLanesPerSubrow + packedOffset).resized
+  io.command.payload.aRowLength := (rowEnd - rowStart).resized
+  io.command.payload.aIndex := rowEntryOrdinal.resized
   io.command.payload.a.valid := True
   io.command.payload.a.row := rowIndex.resized
   io.command.payload.a.k := aK
@@ -383,16 +381,15 @@ class CsrGustavsonDescriptorFrontend(systemCfg: EndToEndSystemConfig)
 }
 
 object CachedTrGtState extends SpinalEnum {
-  val Collect, LoadA, Start, FindA, RequestLine, WaitLine, EmitLine,
+  val Collect, Start, FindA, RequestLine, WaitLine, EmitLine,
       Finish, WaitDone = newElement()
 }
 
-/** Aggregates one CSR A row before starting the four temporal TrGT subrows.
+/** Aggregates one packed group of CSR A rows for the four temporal TrGT subrows.
   *
-  * The CSR walker emits one B-row descriptor per A entry.  TrGT needs all A
-  * entries resident before its four FIFO streams can run, so this adapter
-  * buffers the row descriptors, loads the stationary A registers, and then
-  * streams each packed B line into the FIFO selected by the A index.
+  * The row scheduler maps short A rows into disjoint subrows. This adapter
+  * loads each stationary A entry as its descriptor arrives, then streams each
+  * referenced B line into the FIFO selected by the packed A index.
   */
 class CachedTrGtSubrowAdapter(
     systemCfg: EndToEndSystemConfig,
@@ -456,7 +453,7 @@ class CachedTrGtSubrowAdapter(
   io.memoryError := memoryErrorReg
   io.addressError := addressErrorReg
   io.unsupportedMode := unsupportedModeReg
-  io.phase := state.asBits.asUInt
+  io.phase := state.asBits.asUInt.resize(io.phase.getWidth)
   io.schedulerBusy := scheduler.io.busy
   io.fifoOccupancy := scheduler.io.fifoOccupancy
     .map(_.resize(16)).reduce(_ + _).resize(16)
@@ -505,8 +502,10 @@ class CachedTrGtSubrowAdapter(
   val selectedElementValid = elementChoices.orR
   val selectedElement = lineElements(selectedElementIndex)
 
-  scheduler.io.aLoad.valid := False
-  scheduler.io.aLoad.payload := IndexedGustavsonA(cfg).getZero
+  scheduler.io.aLoad.valid := state === CachedTrGtState.Collect &&
+    io.rowCommand.valid && io.rowCommand.payload.a.valid
+  scheduler.io.aLoad.payload.index := io.rowCommand.payload.aIndex
+  scheduler.io.aLoad.payload.element := io.rowCommand.payload.a
   scheduler.io.start.payload.mode := TrapezoidDataflow.TrGt
   scheduler.io.finish := False
   for (subrow <- 0 until cfg.localBanks) {
@@ -527,12 +526,6 @@ class CachedTrGtSubrowAdapter(
     }
   }
   val nextAFound = nextAChoices.orR
-
-  when(state === CachedTrGtState.LoadA && nextAFound) {
-    scheduler.io.aLoad.valid := True
-    scheduler.io.aLoad.payload.index := nextAIndex.resized
-    scheduler.io.aLoad.payload.element := aStorage(nextAIndex)
-  }
 
   val currentSubrow = UInt(subrowIndexWidth bits)
   currentSubrow := (currentIndex / cfg.macLanesPerSubrow).resized
@@ -564,7 +557,8 @@ class CachedTrGtSubrowAdapter(
   val currentAddressError = currentAValid &&
     (currentLineCount === 0 || exclusiveEnd > addressLimit)
 
-  io.rowCommand.ready := !io.clear && state === CachedTrGtState.Collect
+  io.rowCommand.ready := !io.clear && state === CachedTrGtState.Collect &&
+    (!io.rowCommand.payload.a.valid || scheduler.io.aLoad.ready)
   when(io.rowCommand.fire) {
     doneReg := False
     when(!rowCollectOpen) {
@@ -581,28 +575,21 @@ class CachedTrGtSubrowAdapter(
       state := CachedTrGtState.Collect
       doneReg := True
     } otherwise {
-      aValid(io.rowCommand.payload.aIndex) := io.rowCommand.payload.a.valid
-      aStorage(io.rowCommand.payload.aIndex) := io.rowCommand.payload.a
-      bBaseStorage(io.rowCommand.payload.aIndex) :=
-        io.rowCommand.payload.bBaseAddress
-      lineCountStorage(io.rowCommand.payload.aIndex) :=
-        io.rowCommand.payload.lineCount
+      when(io.rowCommand.payload.a.valid) {
+        aValid(io.rowCommand.payload.aIndex) := True
+        aStorage(io.rowCommand.payload.aIndex) := io.rowCommand.payload.a
+        bBaseStorage(io.rowCommand.payload.aIndex) :=
+          io.rowCommand.payload.bBaseAddress
+        lineCountStorage(io.rowCommand.payload.aIndex) :=
+          io.rowCommand.payload.lineCount
+      }
       when(io.rowCommand.payload.endOfTile) {
         currentIndex := 0
         rowCollectOpen := False
         schedulerStarted := False
-        state := CachedTrGtState.LoadA
+        state := CachedTrGtState.FindA
       }
     }
-  }
-
-  when(state === CachedTrGtState.LoadA && !nextAFound) {
-    currentIndex := 0
-    state := CachedTrGtState.FindA
-  }
-  when(state === CachedTrGtState.LoadA && nextAFound &&
-      scheduler.io.aLoad.fire) {
-    currentIndex := nextAIndex.resize(scanIndexWidth) + 1
   }
   when(state === CachedTrGtState.Start && scheduler.io.start.fire) {
     schedulerStarted := True
@@ -729,7 +716,7 @@ class CachedTrGtSubrowAdapter(
   }
 }
 
-/** Allocates complete CSR rows across independent temporal TrGT PE rows. */
+/** Packs CSR rows into subrows and allocates groups across temporal TrGT PE rows. */
 class CachedTrGtRowScheduler(
     systemCfg: EndToEndSystemConfig,
     peFactory: TrapezoidConfig => TrapezoidPERowComponent =
@@ -743,11 +730,13 @@ class CachedTrGtRowScheduler(
   val io = new Bundle {
     val clear = in Bool()
     val rowCommand = slave(Stream(CachedGustavsonBRowCommand(gustCfg)))
+    val inputDone = in Bool()
     val cacheRequests = Vec(master(Stream(CacheReadRequest(cacheCfg))), cfg.peRows)
     val cacheResponses = Vec(slave(Stream(CacheReadResponse(cacheCfg))), cfg.peRows)
     val result = master(Stream(MatrixResult(cfg)))
     val allocated = out Bits(cfg.peRows bits)
     val completedTiles = out UInt(32 bits)
+    val assignedTiles = out UInt(32 bits)
     val overflow = out Bool()
     val memoryError = out Bool()
     val addressError = out Bool()
@@ -762,6 +751,8 @@ class CachedTrGtRowScheduler(
   val allocated = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
   val inputActive = RegInit(False)
   val inputRow = Reg(UInt(rowIndexWidth bits)) init 0
+  val usedSubrows = Reg(UInt(log2Up(cfg.localBanks + 1) bits)) init 0
+  val assignedTiles = Reg(UInt(32 bits)) init 0
   val completedTiles = Reg(UInt(32 bits)) init 0
 
   for (row <- 0 until cfg.peRows) {
@@ -786,27 +777,75 @@ class CachedTrGtRowScheduler(
   val selectedInputRow = UInt(rowIndexWidth bits)
   selectedInputRow := Mux(inputActive, inputRow, freeRow)
   val inputRouteValid = inputActive || freeFound
+  val rowLength = io.rowCommand.payload.aRowLength
+  val requiredSubrows = UInt(log2Up(cfg.localBanks + 1) bits)
+  requiredSubrows := ((rowLength + cfg.macLanesPerSubrow - 1) /
+    cfg.macLanesPerSubrow).resized
+  val startsRow = io.rowCommand.payload.aIndex === 0
+  val rowFits = usedSubrows.resize(log2Up(cfg.localBanks + 2)) +
+    requiredSubrows.resize(log2Up(cfg.localBanks + 2)) <= cfg.localBanks
+  val flushBeforeRow = inputActive && startsRow && !rowFits
+  val flushAtEnd = inputActive && io.inputDone && !io.rowCommand.valid
+  val flushGroup = flushBeforeRow || flushAtEnd
+
+  val packedCommand = CachedGustavsonBRowCommand(gustCfg)
+  packedCommand.mode := io.rowCommand.payload.mode
+  packedCommand.aRowLength := io.rowCommand.payload.aRowLength
+  packedCommand.aIndex := (usedSubrows * cfg.macLanesPerSubrow +
+    io.rowCommand.payload.aIndex).resized
+  packedCommand.a := io.rowCommand.payload.a
+  packedCommand.bBaseAddress := io.rowCommand.payload.bBaseAddress
+  packedCommand.lineCount := io.rowCommand.payload.lineCount
+  val closesFullGroup = io.rowCommand.payload.endOfTile &&
+    usedSubrows.resize(log2Up(cfg.localBanks + 2)) +
+      requiredSubrows.resize(log2Up(cfg.localBanks + 2)) >= cfg.localBanks
+  packedCommand.endOfTile := closesFullGroup
+
+  val flushCommand = CachedGustavsonBRowCommand(gustCfg)
+  flushCommand.mode := TrapezoidDataflow.TrGt
+  flushCommand.endOfTile := True
+  flushCommand.aRowLength := 0
+  flushCommand.aIndex := 0
+  flushCommand.a := GustavsonA(cfg).getZero
+  flushCommand.bBaseAddress := 0
+  flushCommand.lineCount := 0
+  val routedValid = inputRouteValid &&
+    (flushGroup || (io.rowCommand.valid && !flushBeforeRow))
+  val routedPayload = CachedGustavsonBRowCommand(gustCfg)
+  routedPayload := Mux(flushGroup, flushCommand, packedCommand)
   io.rowCommand.ready := False
   for (row <- 0 until cfg.peRows) {
-    adapters(row).io.rowCommand.valid := io.rowCommand.valid &&
-      inputRouteValid && selectedInputRow === row
-    adapters(row).io.rowCommand.payload := io.rowCommand.payload
+    adapters(row).io.rowCommand.valid := routedValid && selectedInputRow === row
+    adapters(row).io.rowCommand.payload := routedPayload
     when(inputRouteValid && selectedInputRow === row) {
-      io.rowCommand.ready := adapters(row).io.rowCommand.ready
+      io.rowCommand.ready := adapters(row).io.rowCommand.ready && !flushGroup
     }
   }
 
-  when(io.rowCommand.fire) {
+  val routedFire = adapters.zipWithIndex.map { case (adapter, row) =>
+    adapter.io.rowCommand.fire && selectedInputRow === row
+  }.reduce(_ || _)
+  when(routedFire && flushGroup) {
+    inputActive := False
+    usedSubrows := 0
+    assignedTiles := assignedTiles + 1
+  }
+  when(io.rowCommand.fire && !flushGroup) {
     when(!inputActive) {
       for (row <- 0 until cfg.peRows) {
         when(selectedInputRow === row) { allocated(row) := True }
       }
+      inputRow := selectedInputRow
     }
-    when(io.rowCommand.payload.endOfTile) {
+    when(closesFullGroup) {
       inputActive := False
+      usedSubrows := 0
+      assignedTiles := assignedTiles + 1
+    } elsewhen(io.rowCommand.payload.endOfTile) {
+      inputActive := True
+      usedSubrows := usedSubrows + requiredSubrows
     } otherwise {
       inputActive := True
-      inputRow := selectedInputRow
     }
   }
 
@@ -858,6 +897,7 @@ class CachedTrGtRowScheduler(
 
   io.allocated := allocated.asBits
   io.completedTiles := completedTiles
+  io.assignedTiles := assignedTiles
   io.overflow := adapters.map(_.io.overflow).reduce(_ || _)
   io.memoryError := adapters.map(_.io.memoryError).reduce(_ || _)
   io.addressError := adapters.map(_.io.addressError).reduce(_ || _)
@@ -874,6 +914,8 @@ class CachedTrGtRowScheduler(
     for (row <- 0 until cfg.peRows) allocated(row) := False
     inputActive := False
     outputLocked := False
+    usedSubrows := 0
+    assignedTiles := 0
     completedTiles := 0
   }
 }
@@ -1025,6 +1067,8 @@ class UnifiedEndToEndSystem(
     val trgtPhase = out UInt(4 bits)
     val trgtSchedulerBusy = out Bool()
     val trgtFifoOccupancy = out UInt(16 bits)
+    val trgtAssignedTiles = out UInt(32 bits)
+    val trgtCompletedTiles = out UInt(32 bits)
   }
 
   val state = RegInit(UnifiedEndToEndState.Idle)
@@ -1060,7 +1104,10 @@ class UnifiedEndToEndSystem(
 
   if (includeIp) ip.io.clear := io.clear
   if (includeGustavson) csr.io.clear := io.clear
-  if (includeTrGt) trgtScheduler.io.clear := io.clear
+  if (includeTrGt) {
+    trgtScheduler.io.clear := io.clear
+    trgtScheduler.io.inputDone := csr.io.done
+  }
   if (includeTrGs) {
     trgsAdapter.io.clear := io.clear
     trgsScheduler.io.clear := io.clear
@@ -1079,10 +1126,14 @@ class UnifiedEndToEndSystem(
     io.trgtPhase := trgtScheduler.io.phase
     io.trgtSchedulerBusy := trgtScheduler.io.schedulerBusy
     io.trgtFifoOccupancy := trgtScheduler.io.fifoOccupancy
+    io.trgtAssignedTiles := trgtScheduler.io.assignedTiles
+    io.trgtCompletedTiles := trgtScheduler.io.completedTiles
   } else {
     io.trgtPhase := 0
     io.trgtSchedulerBusy := False
     io.trgtFifoOccupancy := 0
+    io.trgtAssignedTiles := 0
+    io.trgtCompletedTiles := 0
   }
   doneReg := False
 
@@ -1197,13 +1248,13 @@ class UnifiedEndToEndSystem(
 
   val gustavsonCompleted: Bool = if (includeTrGt && includeTrGs) {
     csr.io.done && Mux(runTrGt,
-      trgtScheduler.io.completedTiles === csr.io.issuedTiles &&
+      trgtScheduler.io.completedTiles === trgtScheduler.io.assignedTiles &&
         !trgtScheduler.io.allocated.orR,
       trgsAdapter.io.busy === False &&
         trgsScheduler.io.completedTiles === csr.io.issuedTiles)
   } else if (includeTrGt) {
     csr.io.done &&
-      trgtScheduler.io.completedTiles === csr.io.issuedTiles &&
+      trgtScheduler.io.completedTiles === trgtScheduler.io.assignedTiles &&
       !trgtScheduler.io.allocated.orR
   } else if (includeTrGs) {
     csr.io.done && !trgsAdapter.io.busy &&

@@ -11,10 +11,25 @@ import scala.util.Random
 
 /** Actual RTL descriptor-to-final-C-write-response cycle benchmark. */
 object EndToEndCycleSimulation extends App {
-  private val paperScale = sys.props.get("trapezoid.bench.scale")
-    .contains("paper")
+  args.foreach { argument =>
+    val parts = argument.stripPrefix("--").split("=", 2)
+    require(parts.length == 2,
+      s"expected --mode=..., --category=..., --samples=..., or --scale=..., got $argument")
+    parts(0) match {
+      case "mode" => System.setProperty("trapezoid.bench.mode", parts(1))
+      case "category" => System.setProperty("trapezoid.bench.category", parts(1))
+      case "samples" => System.setProperty("trapezoid.bench.samples", parts(1))
+      case "scale" => System.setProperty("trapezoid.bench.scale", parts(1))
+      case other => throw new IllegalArgumentException(s"unknown benchmark option $other")
+    }
+  }
+  private val benchmarkScale = sys.props.getOrElse("trapezoid.bench.scale", "small")
+  private val paperScale = benchmarkScale == "paper"
+  private val scaledPaperWorkload = benchmarkScale == "scaled-paper"
+  require(Set("small", "scaled-paper", "paper").contains(benchmarkScale),
+    s"unknown benchmark scale $benchmarkScale")
   private val modeFilter = sys.props.get("trapezoid.bench.mode")
-  private val hardwareProfile = if (!paperScale) {
+  private val hardwareProfile = if (!paperScale && !scaledPaperWorkload) {
     EndToEndHardwareProfile.Unified
   } else modeFilter match {
     case Some("DenseIp") | Some("TrIp") => EndToEndHardwareProfile.IpOnly
@@ -23,32 +38,34 @@ object EndToEndCycleSimulation extends App {
     case Some(mode) => throw new IllegalArgumentException(
       s"unknown paper RTL mode $mode")
     case None => throw new IllegalArgumentException(
-      "paper RTL requires -Dtrapezoid.bench.mode=<DenseIp|TrIp|TrGt|TrGs>")
+      s"$benchmarkScale RTL requires --mode=<DenseIp|TrIp|TrGt|TrGs>")
   }
-  private val dimension = if (paperScale) 128 else 16
+  private val dimension = if (paperScale || scaledPaperWorkload) 128 else 16
   private val samplesPerCategory = sys.props.get("trapezoid.bench.samples")
-    .map(_.toInt).getOrElse(3)
+    .map(_.toInt).getOrElse(if (scaledPaperWorkload) 1 else 3)
   require(samplesPerCategory >= 1)
   private val readLatencyCycles =
     sys.props.get("trapezoid.bench.readLatency").map(_.toInt).getOrElse(12)
   private val writeLatencyCycles =
     sys.props.get("trapezoid.bench.writeLatency").map(_.toInt).getOrElse(6)
 
-  private val cfg = if (paperScale) TrapezoidConfig.paper else TrapezoidConfig(
-    dataWidth = 8,
-    accumulatorWidth = 32,
-    coordinateWidth = 8,
-    fiberWidth = 8,
-    maxFibers = 2,
-    macLanes = 16,
-    cacheLineWords = 4,
-    outputLanes = 4,
-    peRows = 4,
-    localBanks = 4,
-    localWordsPerBank = 4,
-    localDepthPerBank = 32,
-    responseFifoDepth = 2
-  )
+  private val cfg = if (paperScale) TrapezoidConfig.paper
+    else if (scaledPaperWorkload) TrapezoidConfig.paper.copy(peRows = 1)
+    else TrapezoidConfig(
+      dataWidth = 8,
+      accumulatorWidth = 32,
+      coordinateWidth = 8,
+      fiberWidth = 8,
+      maxFibers = 2,
+      macLanes = 16,
+      cacheLineWords = 4,
+      outputLanes = 4,
+      peRows = 4,
+      localBanks = 4,
+      localWordsPerBank = 4,
+      localDepthPerBank = 32,
+      responseFifoDepth = 2
+    )
   private val tileCfg = TrIpTileConfig(cfg, maxColumns = dimension,
     maxRowsOverride = if (paperScale) dimension else cfg.peRows * cfg.maxFibers)
   private val matrixCfg = TrIpMatrixConfig(tileCfg,
@@ -63,6 +80,16 @@ object EndToEndCycleSimulation extends App {
   }
   private val cacheCfg = if (paperScale) {
     CacheConfig.paper(cacheClientCount)
+  } else if (scaledPaperWorkload) {
+    CacheConfig(
+      wordWidth = 32,
+      wordsPerLine = 16,
+      addressWidth = 18,
+      bankCount = 8,
+      setsPerBank = 64,
+      clientCount = cacheClientCount,
+      requestIdWidth = 12,
+      ways = 1)
   } else CacheConfig(
     wordWidth = 8,
     wordsPerLine = 16,
@@ -73,10 +100,13 @@ object EndToEndCycleSimulation extends App {
     requestIdWidth = 8
   )
   private val gustCfg = GustavsonCacheConfig(
-    GustavsonTileConfig(cfg, accumulatorEntries = dimension,
-      fifoDepthPerSubrow = if (paperScale) 32 else 8),
+    GustavsonTileConfig(cfg,
+      accumulatorEntries = if (scaledPaperWorkload) dimension
+        else dimension * cfg.localBanks,
+      fifoDepthPerSubrow = if (paperScale || scaledPaperWorkload) 32 else 8),
     cacheCfg,
-    maxLinesPerRow = if (paperScale) 256 else 8
+    maxLinesPerRow = if (paperScale) 256
+      else if (scaledPaperWorkload) 32 else 8
   )
   private val systemCfg = EndToEndSystemConfig(
     matrixCfg, gustCfg, CacheClusterConfig(cacheCfg,
@@ -145,12 +175,12 @@ object EndToEndCycleSimulation extends App {
     Files.write(peSource, annotated.getBytes(StandardCharsets.UTF_8))
   }
 
-  if (paperScale) {
+  if (paperScale || scaledPaperWorkload) {
     ensurePaperKernel()
     markPaperKernelHierarchical()
   }
   private val peFactory: TrapezoidConfig => TrapezoidPERowComponent =
-    if (paperScale) {
+    if (paperScale || scaledPaperWorkload) {
       core => new PaperPERowBlackBox(core, paperKernelSources)
     } else {
       core => new TrapezoidPERow(core)
@@ -205,7 +235,7 @@ object EndToEndCycleSimulation extends App {
   private val modeOrder = Vector("DenseIp", "TrIp", "TrGt", "TrGs")
   private val categoryFilter = sys.props.get("trapezoid.bench.category")
   private val selectedCategories = categories.filter(category =>
-    categoryFilter.forall(_ == category.name))
+    categoryFilter.forall(_.replace(" ", "") == category.name.replace(" ", "")))
   private val selectedModes = modeOrder.filter(mode => modeFilter.forall(_ == mode))
   require(selectedCategories.nonEmpty, s"unknown benchmark category $categoryFilter")
   require(selectedModes.nonEmpty, s"unknown benchmark mode $modeFilter")
@@ -566,9 +596,12 @@ object EndToEndCycleSimulation extends App {
   }
 
   println("\nTrapezoid RTL descriptor-to-C-write-response end-to-end cycles")
+  println(s"Benchmark scale: $benchmarkScale")
   println(s"Matrix: ${dimension}x${dimension}; array: ${cfg.peRows} PE rows x " +
     s"${cfg.macLanes} MACs; cache: ${systemCfg.clusters.clusterCount} clusters x " +
     s"${systemCfg.clusters.banksPerCluster} banks")
+  println(s"Cache line: ${cacheCfg.wordsPerLine} x ${cacheCfg.wordWidth}-bit; " +
+    s"capacity: ${cacheCfg.capacityBytes} bytes; ways: ${cacheCfg.ways}")
   println(s"Cold cache; read DMA latency: $readLatencyCycles cycles; " +
     s"write response latency: $writeLatencyCycles cycles")
   println(s"C write DMA: up to ${systemCfg.writeOutstandingDepth} ordered " +

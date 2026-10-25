@@ -54,6 +54,7 @@
 | --- | --- | --- |
 | `TrapezoidConfig.small` | 通用小配置 | 4 rows，16 MAC/row，16-bit input |
 | `EndToEndCycleSimulation` | 小规模完整系统 | 16x16 tile，4 rows，16 MAC/row，8-bit input，4 clusters x 2 banks |
+| `EndToEndCycleSimulation --scale=scaled-paper` | 论文宽度单 row 端到端 | 128x128 matrix，1 row，128 MAC/row，32-bit input，4 clusters x 2 banks |
 | `PaperSinglePERowCycleSimulation` | 论文规模单 row | 128x128 logical tile，1 row，128 MAC/row，`TrapezoidConfig.paper` |
 | full paper array | 论文规模完整阵列 | 128 rows，128 MAC/row，当前生成/编译资源消耗很大 |
 
@@ -63,7 +64,7 @@
 4 clusters x 32 banks x 128 sets x 16 ways x 64 B = 16 MB
 ```
 
-默认小规模 `EndToEndCycleSimulation` 仍使用 1-way cache，以控制 RTL 和 Verilator 编译规模；它不是 paper cache 的缩容等比例模型。
+默认小规模 `EndToEndCycleSimulation` 仍使用 1-way cache，以控制 RTL 和 Verilator 编译规模；它不是 paper cache 的缩容等比例模型。`scaled-paper` 保留论文的 128 MAC/row、128-wide fiber、32-bit word 和 64 B cache line，但只实例化一个 PE row，并使用 4 clusters x 2 banks、32 KiB、direct-mapped cache。它用于在可承受资源下观察论文宽 PE row 的端到端行为，不等于 128-row/16 MB paper system。
 
 系统级 `EndToEndSystemConfig.writeOutstandingDepth` 控制 C DMA 最多在飞的有序写请求数，默认是 16。当前响应接口按单一 AXI ID 的语义要求 write responses 保持请求顺序。这个参数不改变计算结果，只决定写回能否隐藏 response latency。
 
@@ -261,6 +262,10 @@ A 的 K 非零元素驻留到 local subrow/bank
 
 TrGt 的 B 输入通过四个独立 subrow FIFO temporally gather。最终 B 元素被接收时，adapter 会同时发送 `finish`；scheduler 使用 accepted/issued element 计数区分“FIFO 真空”和“同步 SRAM 预取尚未返回”，从而把 `endOfTile` 附着在最后一条有效 temporal issue 上，避免额外的空终止命令。
 
+当前 cached TrGT scheduler 已按 A-row occupancy 做 subrow packing。CSR command 携带 `aRowLength`，一行需要的 subrow 数为 `ceil(aRowLength / macLanesPerSubrow)`；短行可与后续行共享同一个 PE row 的四个 subrow，长行可连续占用多个 subrow。四个 subrow 填满、下一行放不下或 CSR 输入结束时关闭 packed tile。完成判断使用 packed tile 的 `assignedTiles/completedTiles`，不再把 CSR 非空行数误当成 TrGT tile 数。
+
+仍有一个关键差距：adapter 要等 packed tile 关闭后才开始逐 A entry 请求 B line。论文式实现应允许 A-row packing、B prefetch 和已就绪 subrow 的执行重叠，并支持多个 outstanding B-line 请求。当前串行 request/wait 路径会增加 TrGT 的启动等待。
+
 ### 5.4 `TrGs`
 
 ```text
@@ -325,7 +330,15 @@ descriptor accepted
 sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation'
 ```
 
-可通过 `-Dtrapezoid.bench.mode=TrIp` 等参数只运行一个 mode，也可以使用 `-Dtrapezoid.bench.scale=paper -Dtrapezoid.bench.mode=TrIp` 生成论文规模、单一 mode 的系统配置。默认小规模测试使用 16x16 logical matrix、4 rows x 16 MAC、4 clusters x 2 cache banks，并运行 6 个稀疏度类别、4 个 mode、3 个样本，共 72 个 workload case。
+默认小规模测试使用 16x16 logical matrix、4 rows x 16 MAC、4 clusters x 2 cache banks，并运行 6 个稀疏度类别、4 个 mode、3 个样本，共 72 个 workload case。命令行可以筛选 scale、mode、category 和 sample：
+
+```bash
+sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation --scale=small'
+sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation --scale=scaled-paper --mode=TrGt --category=HSxHS --samples=1'
+sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation --scale=paper --mode=TrGt --category=HSxHS --samples=1'
+```
+
+`scaled-paper` 和 `paper` 必须一次只选一个 mode，以便生成 mode-specialized RTL。`scaled-paper` 使用一个真实 128-MAC paper PE row 和缩放 cache；`paper` 才是 128 PE rows 与完整 paper cache。两者首次 Verilator 编译都明显慢于 `small`。
 
 计时起点和终点是：
 
@@ -357,20 +370,22 @@ final C write response consumed
 
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
-| HS x HS | 1131.0 | 779.0 | 311.0 | 312.0 |
-| HS x MS | 1144.7 | 792.7 | 311.0 | 312.0 |
-| HS x D | 1176.0 | 824.0 | 311.0 | 312.0 |
-| MS x MS | 1551.7 | 1197.0 | 1693.3 | 1656.3 |
-| MS x D | 1917.0 | 1549.0 | 2893.7 | 2219.3 |
-| D x D | 1933.0 | 1997.0 | 13979.0 | 7302.0 |
+| HS x HS | 1131.0 | 779.0 | 351.0 | 312.0 |
+| HS x MS | 1144.7 | 792.7 | 403.0 | 312.0 |
+| HS x D | 1176.0 | 824.0 | 546.0 | 312.0 |
+| MS x MS | 1551.7 | 1197.0 | 1794.3 | 1656.3 |
+| MS x D | 1917.0 | 1549.0 | 3806.0 | 2219.3 |
+| D x D | 1933.0 | 1997.0 | 13891.0 | 7302.0 |
 
-这些数字包含 clustered-cache 地址修复和 16-entry C write outstanding FIFO。现在关键推荐趋势为：`MS x MS`、`MS x D` 下 TrIP 最快，`D x D` 下 DenseIp 最快；HS 类仍由 Gustavson 路径领先。该趋势更接近论文的数据流选择，但数值仍是当前 16x16 缩比 RTL，不是论文性能数字。
+这些数字包含 occupancy-aware TrGT row packing、clustered cache 和 16-entry C write outstanding FIFO。关键推荐趋势为：`HS x MS/D` 下 TrGS 最快，`MS x MS/D` 下 TrIP 最快，`D x D` 下 DenseIp 最快。`HS x HS` 的推荐 mode 仍未在这个缩比 workload 中复现；数值是当前 16x16 RTL，不是论文性能数字。
 
-旧实现中 `MS x D` 的 TrIP 为 2791.3 cycles，TrGS 为 2525.3 cycles。两者都有约 251 个非零 C writes，但旧 `ResultWritebackDma` 必须等待当前 write 的 6-cycle response，才能接受下一个结果。TrIP 约在 446 cycle 才开始输出，而 TrGS 能较早流式输出并把串行写延迟与计算重叠，因此旧模型人为偏向 TrGS。改成多 outstanding 后，TrIP 为 1549.0 cycles，低于 TrGS 的 2242.3 cycles；最终计时终点仍然是最后一个 C write response。
+旧实现中 `MS x D` 的 TrIP 为 2791.3 cycles，TrGS 为 2525.3 cycles。两者都有约 251 个非零 C writes，但旧 `ResultWritebackDma` 必须等待当前 write 的 6-cycle response，才能接受下一个结果。TrIP 约在 446 cycle 才开始输出，而 TrGS 能较早流式输出并把串行写延迟与计算重叠，因此旧模型人为偏向 TrGS。改成多 outstanding 后，TrIP 为 1549.0 cycles，低于 TrGS 的 2219.3 cycles；最终计时终点仍然是最后一个 C write response。
 
-旧的 `HS x HS` 结果是 TrGt 357 cycles、TrGS 356 cycles。原因有两层：TrGt 的同步 local-buffer FIFO 在最后一个元素尚处于预取阶段时，会被误判为空并发出额外终止命令；共享 CSR walker 还会重复读取每个内部 row pointer。修复后，TrGt 的 first C write 从 114 降到 103 cycles，CSR cache hits 从 15 降到 0，最终 TrGt 为 311 cycles、TrGS 为 312 cycles。
+旧表中的 `HS x HS/HS x MS/HS x D` 都是 TrGT 311、TrGS 312。它不是 TrGT 在三类 workload 上稳定快 1 cycle，而是三个类别的 A 都只有一个非零，CSR/control tail 完全相同；旧 scheduler 又把每个非空 A row 直接当作独立 tile，因此两个数据流几乎退化成同一条单元素路径，最后只剩状态机终止时序的 1-cycle 差。
 
-这里的 1-cycle 差值不能解释为论文级加速比。默认 `16x16 @ 0.39%` 的 HS 矩阵实际只有一个非零，最终周期主要由 16 行 CSR 扫描决定。也因此 `HS x MS/D` 的总周期会掩盖 TrGS 更早产生结果的优势：first C write 分别是 TrGt 151/283 cycles，而 TrGS 是 109/146 cycles。论文趋势应在 128x128 paper profile、真实 HS 行长度分布和完整 subrow row-packing 下判断。
+加入 occupancy-aware row packing 后，这个偶然排序消失。默认 `16x16 @ 0.39%` 仍只有一个 A 非零，TrGT 找不到第二条可打包行，只能等 CSR walker 扫完 16 行后用 synthetic flush 关闭 partial group；它的 first C write 因而是 342 cycles。TrGS 不需要等待成组，first C write 是 98 cycles，最终为 312 cycles。当前 HS x HS 的 `351 > 312` 说明小规模测试不具备验证论文 TrGT 优势所需的 row occupancy，而不是应通过人为 latency 常数把 TrGT 调快。
+
+对于 HS x MS/D，当前结果 `403/546 > 312` 与论文选择 TrGS 的方向一致：TrGS 一次把整条 B line 空间展开，TrGT 每个 subrow 每周期只消费一个 temporal element。要判断 HS x HS，应运行 128x128 的 `scaled-paper`/`paper` profile，并继续实现 packing、B prefetch 和执行重叠。
 
 ### 7.2 `PaperSinglePERowCycleSimulation`
 
@@ -446,7 +461,9 @@ paper profile 已配置为论文的 4 clusters、128 banks、16-way、64 B line 
 
 当前 PE row 使用 radix-2 distribution tree，Benes 通用 runtime control 尚未接入；local buffer、Gustavson accumulator 和跨命令 partial state 也比论文完整实现简化。功能等价不代表面积、频率、功耗或拥塞等价。
 
-论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows；当前 cached TrGT scheduler 仍以“一个完整 CSR row 分配一个 PE row”为主，subrow 主要用于拆分同一行的 A nonzeros。因此当前实现已经具备四路 temporal B FIFO，但尚未获得论文的 4x spatial-M 映射能力。这是 HS x HS 吞吐仍不能直接对齐论文的最大结构差异之一。
+论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows。当前 scheduler 已实现 occupancy-aware 多行 packing 和长行多 subrow 占用，具备这部分 spatial-M 映射；但 packed group 关闭后才串行读取各 A entry 对应的 B lines，尚未实现多 outstanding prefetch、边收集边执行和论文式跨 subrow memory scheduling。
+
+另一个面积差距是 `GustavsonTileEngine` 仍采用 coordinate-sorted、全比较的寄存器 accumulator。为了容纳多个 packed output rows，小规模 benchmark 将容量设为 `dimension * localBanks`。这种结构会随着 entry 数快速增加比较器、移位 mux 和 Verilator 生成量；它是功能模型，不是论文流式 MRN/local-buffer merge 的面积复现。下一步应以 banked SRAM 和有序流式 merge 替换它，而不是继续增大寄存器数组。
 
 ### 8.7 数值和验证对象不同
 
@@ -477,13 +494,13 @@ utilization = usefulMacs / laneSlots
 
 按优先级建议：
 
-1. 将 TrGT scheduler 改为 occupancy-aware row packing，把不同 A rows 映射到四个 subrows，并正确处理长行占用多个 subrows 的情况。
-2. 导入论文相同的矩阵或相同 fiber 统计，而不是只匹配四个 density 百分比。
-3. 先完成 128-row full array 的实际 Verilator 编译和运行，再比较阵列级周期。
-4. 继续细分并报告 setup、memory、compute、writeback；当前已经输出 first C write、DMA active、hit/miss 和总周期，但还没有独立的 compute-only counter。
-5. 将 paper scheduler 的动态 B packing、row balancing、buffer occupancy 和 mode selection 规则直接编码到前端。
-6. 保持已经对齐的 16 MB、128-bank、16-way、64 B cache 结构，并继续对齐论文的 32x32 cluster crossbar、2 TB/s HBM 带宽、miss latency、DMA burst 和 NoC/multicast 竞争。
-7. 将 Benes distribution control、完整跨命令 Gustavson accumulator 和真实结果写回路径接入系统。
-8. 如果要比较面积和功耗，使用固定工艺/FPGA、时钟约束、综合脚本和 switching activity；SpinalHDL/Verilator 仿真本身不能给出论文可比的面积功耗。
+1. 让 TrGT 的 A-row packing、B-line prefetch 和 subrow execution 重叠，并支持每个 PE row 多个 outstanding cache requests；当前 row packing 已完成，但 B fetch 仍串行。
+2. 用 banked SRAM + ordered streaming merge 替换 `GustavsonTileEngine` 的全比较/移位寄存器 accumulator，降低论文规模的面积与 Verilator 编译量。
+3. 导入论文相同的矩阵或至少相同 row/fiber length histogram，而不是只匹配四个 density 百分比。
+4. 先完成 `scaled-paper` 的 TrGT/TrGS HS x HS 实际周期，再扩展到 128-row full array；不要把 RTL 生成成功当作仿真完成。
+5. 继续细分并报告 setup、memory、compute、writeback；当前已经输出 first C write、DMA active、hit/miss 和总周期，但还没有独立的 compute-only counter。
+6. 将 paper scheduler 的动态 B packing、row balancing、buffer occupancy 和 mode selection 规则直接编码到前端。
+7. 保持已经对齐的 16 MB、128-bank、16-way、64 B full-paper cache 结构，并继续对齐论文的 32x32 cluster crossbar、2 TB/s HBM 带宽、miss latency、DMA burst 和 NoC/multicast 竞争。
+8. 将 Benes distribution control 和真实结果写回路径接入系统；如果要比较面积和功耗，还需要固定工艺/FPGA、时钟约束、综合脚本和 switching activity。
 
 在这些条件全部满足之前，当前结果最适合表述为“真实 RTL 对当前实现的数据流和计时边界进行验证”，而不是“复现论文性能曲线”。

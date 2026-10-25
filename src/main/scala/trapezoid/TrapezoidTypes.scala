@@ -232,6 +232,7 @@ case class CachedGustavsonBRowCommand(gustCfg: GustavsonCacheConfig) extends Bun
 
   val mode = TrapezoidDataflow()
   val endOfTile = Bool()
+  val aRowLength = UInt((cfg.coordinateWidth + 1) bits)
   val aIndex = UInt(cfg.aRegisterIndexWidth bits)
   val a = GustavsonA(cfg)
   val bBaseAddress = UInt(gustCfg.cache.addressWidth bits)

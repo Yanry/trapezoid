@@ -308,6 +308,54 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     }
   }
 
+  test("TrGT carries finish with the first and final streamed B element") {
+    simConfig.compile(new TrGtSubrowScheduler(tileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      initializeTrGt(dut)
+      dut.io.result.ready #= true
+
+      loadA(dut, 0, row = 1, k = 2, value = 3)
+
+      dut.io.start.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.start.valid #= true
+      dut.io.bPush(0).payload.valid #= true
+      dut.io.bPush(0).payload.aIndex #= 0
+      dut.io.bPush(0).payload.k #= 2
+      dut.io.bPush(0).payload.column #= 4
+      dut.io.bPush(0).payload.value #= 5
+      dut.io.bPush(0).valid #= true
+      dut.io.finish #= true
+      sleep(1)
+      assert(dut.io.start.ready.toBoolean)
+      assert(dut.io.bPush(0).ready.toBoolean)
+      dut.clockDomain.waitSampling()
+      dut.io.start.valid #= false
+      dut.io.bPush(0).valid #= false
+      dut.io.finish #= false
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long, Boolean)]
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 200) {
+        sleep(1)
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong,
+            dut.io.result.payload.endOfTile.toBoolean))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+
+      assert(dut.io.done.toBoolean)
+      assert(observed == Seq((1, 4, 15L, true)))
+      assert(dut.io.acceptedBElements.toLong == 1)
+      assert(dut.io.issuedBElements.toLong == 1)
+      assert(!dut.io.overflow.toBoolean)
+      assert(!dut.io.unsupportedMode.toBoolean)
+    }
+  }
+
   test("TrGT scheduler runs through an externally supplied synchronous SRAM") {
     simConfig.compile(new ExternalBufferedTrGtHarness(tileCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)

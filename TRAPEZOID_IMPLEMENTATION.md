@@ -259,6 +259,8 @@ A 的 K 非零元素驻留到 local subrow/bank
 
 `TrGt` 以 B column 为主要工作单位。B lane 中的 `aIndex` 选择对应 A nonzero，local bank 和 K 检查保证只使用匹配元素。由于一条命令的 A 侧通常按 local bank/subrow 分组，A 非零数增加时命令数和等待更明显。
 
+TrGt 的 B 输入通过四个独立 subrow FIFO temporally gather。最终 B 元素被接收时，adapter 会同时发送 `finish`；scheduler 使用 accepted/issued element 计数区分“FIFO 真空”和“同步 SRAM 预取尚未返回”，从而把 `endOfTile` 附着在最后一条有效 temporal issue 上，避免额外的空终止命令。
+
 ### 5.4 `TrGs`
 
 ```text
@@ -276,7 +278,7 @@ A 的一个驻留 K/nonzero 广播
 
 | 输入稀疏度 | 论文常见推荐方向 | 当前工程允许 |
 | --- | --- | --- |
-| `HS * HS` | `TrGt`/`TrGs`，取决于驻留方向 | 四种 mode 全部运行 |
+| `HS * HS` | `TrGt` | 四种 mode 全部运行 |
 | `HS * MS/D` | 通常 `TrGs` | 四种 mode 全部运行 |
 | `MS * MS/D` | `TrIp` 或 Gustavson | 四种 mode 全部运行 |
 | `D * D` | `DenseIp` | 四种 mode 全部运行 |
@@ -292,6 +294,8 @@ A 的一个驻留 K/nonzero 广播
 ### 6.2 Gustavson 路径
 
 `GustavsonFrontends` 负责从 CSR/压缩输入构造 A resident 和 B stream。`GustavsonTileEngine` 将其分发到 `TrGt` 或 `TrGs` 的命令队列，并处理 local buffer、partial result 和 output ordering。PE row 只看到已经编码好的 Gustavson command，不直接解析完整 CSR 矩阵。
+
+CSR walker 首先读取 `rowPtr(0)`，随后每次只读取下一个 row pointer；上一行的 `rowEnd` 直接作为下一行的 `rowStart`。这样不会把同一个 `rowPtr(i)` 重复读取为“上一行 end”和“下一行 start”，空行仍被正确跳过，但不再产生多余 cache hit 和控制周期。
 
 ### 6.3 Unified end-to-end
 
@@ -353,16 +357,20 @@ final C write response consumed
 
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
-| HS x HS | 1131.0 | 779.0 | 357.0 | 356.0 |
-| HS x MS | 1144.7 | 792.7 | 357.7 | 356.0 |
-| HS x D | 1176.0 | 824.0 | 360.0 | 356.0 |
-| MS x MS | 1551.7 | 1197.0 | 1731.7 | 1715.3 |
-| MS x D | 1917.0 | 1549.0 | 2905.0 | 2242.3 |
-| D x D | 1933.0 | 1997.0 | 13961.0 | 7343.0 |
+| HS x HS | 1131.0 | 779.0 | 311.0 | 312.0 |
+| HS x MS | 1144.7 | 792.7 | 311.0 | 312.0 |
+| HS x D | 1176.0 | 824.0 | 311.0 | 312.0 |
+| MS x MS | 1551.7 | 1197.0 | 1693.3 | 1656.3 |
+| MS x D | 1917.0 | 1549.0 | 2893.7 | 2219.3 |
+| D x D | 1933.0 | 1997.0 | 13979.0 | 7302.0 |
 
 这些数字包含 clustered-cache 地址修复和 16-entry C write outstanding FIFO。现在关键推荐趋势为：`MS x MS`、`MS x D` 下 TrIP 最快，`D x D` 下 DenseIp 最快；HS 类仍由 Gustavson 路径领先。该趋势更接近论文的数据流选择，但数值仍是当前 16x16 缩比 RTL，不是论文性能数字。
 
 旧实现中 `MS x D` 的 TrIP 为 2791.3 cycles，TrGS 为 2525.3 cycles。两者都有约 251 个非零 C writes，但旧 `ResultWritebackDma` 必须等待当前 write 的 6-cycle response，才能接受下一个结果。TrIP 约在 446 cycle 才开始输出，而 TrGS 能较早流式输出并把串行写延迟与计算重叠，因此旧模型人为偏向 TrGS。改成多 outstanding 后，TrIP 为 1549.0 cycles，低于 TrGS 的 2242.3 cycles；最终计时终点仍然是最后一个 C write response。
+
+旧的 `HS x HS` 结果是 TrGt 357 cycles、TrGS 356 cycles。原因有两层：TrGt 的同步 local-buffer FIFO 在最后一个元素尚处于预取阶段时，会被误判为空并发出额外终止命令；共享 CSR walker 还会重复读取每个内部 row pointer。修复后，TrGt 的 first C write 从 114 降到 103 cycles，CSR cache hits 从 15 降到 0，最终 TrGt 为 311 cycles、TrGS 为 312 cycles。
+
+这里的 1-cycle 差值不能解释为论文级加速比。默认 `16x16 @ 0.39%` 的 HS 矩阵实际只有一个非零，最终周期主要由 16 行 CSR 扫描决定。也因此 `HS x MS/D` 的总周期会掩盖 TrGS 更早产生结果的优势：first C write 分别是 TrGt 151/283 cycles，而 TrGS 是 109/146 cycles。论文趋势应在 128x128 paper profile、真实 HS 行长度分布和完整 subrow row-packing 下判断。
 
 ### 7.2 `PaperSinglePERowCycleSimulation`
 
@@ -438,6 +446,8 @@ paper profile 已配置为论文的 4 clusters、128 banks、16-way、64 B line 
 
 当前 PE row 使用 radix-2 distribution tree，Benes 通用 runtime control 尚未接入；local buffer、Gustavson accumulator 和跨命令 partial state 也比论文完整实现简化。功能等价不代表面积、频率、功耗或拥塞等价。
 
+论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows；当前 cached TrGT scheduler 仍以“一个完整 CSR row 分配一个 PE row”为主，subrow 主要用于拆分同一行的 A nonzeros。因此当前实现已经具备四路 temporal B FIFO，但尚未获得论文的 4x spatial-M 映射能力。这是 HS x HS 吞吐仍不能直接对齐论文的最大结构差异之一。
+
 ### 8.7 数值和验证对象不同
 
 当前 paper config 使用整数 32-bit input 和 72-bit accumulator，论文硬件的具体数值格式、FP/INT 数据路径和综合约束需要逐项对齐。当前测试验证的是 C 结果、坐标、overflow 和 checksum，不是论文 ASIC/FPGA 的 PPA。
@@ -467,12 +477,13 @@ utilization = usefulMacs / laneSlots
 
 按优先级建议：
 
-1. 导入论文相同的矩阵或相同 fiber 统计，而不是只匹配四个 density 百分比。
-2. 先完成 128-row full array 的实际 Verilator 编译和运行，再比较阵列级周期。
-3. 继续细分并报告 setup、memory、compute、writeback；当前已经输出 first C write、DMA active、hit/miss 和总周期，但还没有独立的 compute-only counter。
-4. 将 paper scheduler 的 subrow、动态 B packing、row balancing、buffer occupancy 和 mode selection 规则直接编码到前端。
-5. 保持已经对齐的 16 MB、128-bank、16-way、64 B cache 结构，并继续对齐论文的 32x32 cluster crossbar、2 TB/s HBM 带宽、miss latency、DMA burst 和 NoC/multicast 竞争。
-6. 将 Benes distribution control、完整跨命令 Gustavson accumulator 和真实结果写回路径接入系统。
-7. 如果要比较面积和功耗，使用固定工艺/FPGA、时钟约束、综合脚本和 switching activity；SpinalHDL/Verilator 仿真本身不能给出论文可比的面积功耗。
+1. 将 TrGT scheduler 改为 occupancy-aware row packing，把不同 A rows 映射到四个 subrows，并正确处理长行占用多个 subrows 的情况。
+2. 导入论文相同的矩阵或相同 fiber 统计，而不是只匹配四个 density 百分比。
+3. 先完成 128-row full array 的实际 Verilator 编译和运行，再比较阵列级周期。
+4. 继续细分并报告 setup、memory、compute、writeback；当前已经输出 first C write、DMA active、hit/miss 和总周期，但还没有独立的 compute-only counter。
+5. 将 paper scheduler 的动态 B packing、row balancing、buffer occupancy 和 mode selection 规则直接编码到前端。
+6. 保持已经对齐的 16 MB、128-bank、16-way、64 B cache 结构，并继续对齐论文的 32x32 cluster crossbar、2 TB/s HBM 带宽、miss latency、DMA burst 和 NoC/multicast 竞争。
+7. 将 Benes distribution control、完整跨命令 Gustavson accumulator 和真实结果写回路径接入系统。
+8. 如果要比较面积和功耗，使用固定工艺/FPGA、时钟约束、综合脚本和 switching activity；SpinalHDL/Verilator 仿真本身不能给出论文可比的面积功耗。
 
 在这些条件全部满足之前，当前结果最适合表述为“真实 RTL 对当前实现的数据流和计时边界进行验证”，而不是“复现论文性能曲线”。

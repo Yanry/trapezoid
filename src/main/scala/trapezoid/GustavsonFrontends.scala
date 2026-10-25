@@ -273,7 +273,7 @@ class TrGtSubrowScheduler(
     modeError := io.start.payload.mode =/= TrapezoidDataflow.TrGt
     when(io.start.payload.mode === TrapezoidDataflow.TrGt) {
       running := True
-      finishSeen := False
+      finishSeen := io.finish
     } otherwise {
       controlDone := True
     }
@@ -292,13 +292,14 @@ class TrGtSubrowScheduler(
   }
 
   val anyFifoValid = fifos.io.pops.map(_.valid).reduce(_ || _)
-  val allHeadsAreFinal = (0 until subrows).map { subrow =>
-    fifos.io.occupancy(subrow) <= 1
-  }.reduce(_ && _)
+  val pendingBElements = acceptedBElements - issuedBElements
+  val visibleBElements = CountOne(fifos.io.pops.map(_.valid).asBits).resize(32)
+  val allPendingBElementsVisible = pendingBElements === visibleBElements
   // The finish marker is attached to the last non-empty temporal issue when
   // possible.  An empty terminal command is only needed for an empty tile.
   val issueFinal = running && finishSeen &&
-    ((!anyFifoValid) || allHeadsAreFinal)
+    ((!anyFifoValid && pendingBElements === 0) ||
+      (anyFifoValid && allPendingBElementsVisible))
   val scheduledCommand = PERowCommand(cfg)
   scheduledCommand.mode := TrapezoidDataflow.TrGt
   scheduledCommand.endOfTile := issueFinal

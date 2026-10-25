@@ -279,14 +279,15 @@ class CsrGustavsonDescriptorFrontend(systemCfg: EndToEndSystemConfig)
     state === CsrGustavsonState.WaitBRow
   io.cacheResponse.ready := !io.clear && waitingForResponse
 
-  def finishOrAdvanceRow(): Unit = {
+  def finishOrAdvanceRow(nextRowStart: UInt): Unit = {
     when(rowIndex.resize(matrixCfg.rowCountWidth + 1) + 1 >=
         descriptorReg.rowCount.resize(matrixCfg.rowCountWidth + 1)) {
       doneReg := True
       state := CsrGustavsonState.Idle
     } otherwise {
       rowIndex := rowIndex + 1
-      state := CsrGustavsonState.RequestRowStart
+      rowStart := nextRowStart
+      state := CsrGustavsonState.RequestRowEnd
     }
   }
 
@@ -310,7 +311,7 @@ class CsrGustavsonDescriptorFrontend(systemCfg: EndToEndSystemConfig)
             doneReg := True
             state := CsrGustavsonState.Idle
           } elsewhen(nextRowEnd === rowStart) {
-            finishOrAdvanceRow()
+            finishOrAdvanceRow(nextRowEnd)
           } otherwise {
             entryIndex := rowStart
             rowEntryOrdinal := 0
@@ -365,7 +366,7 @@ class CsrGustavsonDescriptorFrontend(systemCfg: EndToEndSystemConfig)
   when(io.command.fire) {
     when(entryIndex + 1 >= rowEnd) {
       issuedTiles := issuedTiles + 1
-      finishOrAdvanceRow()
+      finishOrAdvanceRow(rowEnd)
     } otherwise {
       entryIndex := entryIndex + 1
       rowEntryOrdinal := rowEntryOrdinal + 1
@@ -659,9 +660,26 @@ class CachedTrGtSubrowAdapter(
     when(selectedElementValid && element > selectedElementIndex &&
         lineElements(element).valid) { laterElement := True }
   }
+  val laterAChoices = Bits(cfg.macLanes bits)
+  for (index <- 0 until cfg.macLanes) {
+    laterAChoices(index) := U(index, scanIndexWidth bits) > currentIndex &&
+      aValid(index)
+  }
+  val terminalElement = state === CachedTrGtState.EmitLine &&
+    selectedElementValid && !laterElement &&
+    requestIndex + 1 >= currentLineCount && !laterAChoices.orR
+  val terminalElementFire = terminalElement &&
+    scheduler.io.bPush.map(_.fire).reduce(_ || _)
+  when(terminalElementFire) {
+    scheduler.io.finish := True
+  }
   when(state === CachedTrGtState.EmitLine && selectedElementValid &&
       scheduler.io.bPush.map(_.fire).reduce(_ || _)) {
-    when(laterElement) {
+    when(terminalElement) {
+      lineValid := False
+      currentIndex := (currentIndex + 1).resized
+      state := CachedTrGtState.WaitDone
+    } elsewhen(laterElement) {
       elementCursor := selectedElementIndex + 1
     } otherwise {
       lineValid := False

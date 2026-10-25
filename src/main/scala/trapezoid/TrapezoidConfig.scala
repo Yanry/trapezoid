@@ -289,12 +289,15 @@ case class CacheClusterConfig(cache: CacheConfig, clusterCount: Int) {
     bankCount = banksPerCluster)
 }
 
-/** Bounds for the descriptor-to-C-write-response RTL system. */
+/** Bounds for the descriptor-to-C-write-response RTL system.
+  * Write responses use one ordered completion stream, matching a single AXI ID.
+  */
 case class EndToEndSystemConfig(
     matrix: TrIpMatrixConfig,
     gustavson: GustavsonCacheConfig,
     clusters: CacheClusterConfig,
-    maxCResults: Int
+    maxCResults: Int,
+    writeOutstandingDepth: Int = 16
 ) {
   require(matrix.tile.core == gustavson.tile.core,
     "all dataflows must share one core configuration")
@@ -304,6 +307,8 @@ case class EndToEndSystemConfig(
     "an end-to-end system needs at least two cache clients")
   require(maxCResults >= matrix.maxMatrixRows * matrix.maxMatrixColumns,
     "C DMA capacity must cover the largest configured output matrix")
+  require(writeOutstandingDepth >= 1,
+    "C DMA must allow at least one outstanding write")
   require(BigInt(maxCResults) <= (BigInt(1) << clusters.cache.addressWidth),
     "the C result region must fit the DMA line address space")
 

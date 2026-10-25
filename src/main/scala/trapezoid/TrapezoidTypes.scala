@@ -270,7 +270,9 @@ case class DmaWriteRequest(cacheCfg: CacheConfig) extends Bundle {
   val mask = Bits((cacheCfg.lineWidth / 8) bits)
 }
 
-/** Completion for one result DMA write. */
+/** Completion for one result DMA write.
+  * Multiple writes may be outstanding, but responses remain request-ordered.
+  */
 case class DmaWriteResponse(cacheCfg: CacheConfig) extends Bundle {
   val address = UInt(cacheCfg.addressWidth bits)
   val error = Bool()

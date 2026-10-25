@@ -860,11 +860,12 @@ class CachedTrGtRowScheduler(
   }
 }
 
-object ResultWritebackState extends SpinalEnum {
-  val Idle, Request, WaitResponse = newElement()
-}
-
-/** Writes one sparse C coordinate/value record per DMA cache line. */
+/** Writes one sparse C coordinate/value record per DMA cache line.
+  *
+  * Requests are pipelined through a FIFO and their ordered completions are
+  * tracked independently. This models a bandwidth-oriented DMA interface
+  * instead of serializing every result behind its round-trip response.
+  */
 class ResultWritebackDma(systemCfg: EndToEndSystemConfig) extends Component {
   private val cfg = systemCfg.core
   private val cacheCfg = systemCfg.cache
@@ -886,14 +887,18 @@ class ResultWritebackDma(systemCfg: EndToEndSystemConfig) extends Component {
     val writtenResults = out UInt(32 bits)
   }
 
-  val state = RegInit(ResultWritebackState.Idle)
   val active = RegInit(False)
   val baseAddress = Reg(UInt(cacheCfg.addressWidth bits)) init 0
-  val requestAddress = Reg(UInt(cacheCfg.addressWidth bits)) init 0
-  val requestData = Reg(Bits(cacheCfg.lineWidth bits)) init 0
+  val acceptedResults = Reg(UInt(32 bits)) init 0
   val writtenResults = Reg(UInt(32 bits)) init 0
   val doneReg = RegInit(False)
   val errorReg = RegInit(False)
+  val requestFifo = new StreamFifo(
+    DmaWriteRequest(cacheCfg), systemCfg.writeOutstandingDepth)
+  val completionFifo = new StreamFifo(
+    UInt(cacheCfg.addressWidth bits), systemCfg.writeOutstandingDepth)
+  requestFifo.io.flush := io.clear
+  completionFifo.io.flush := io.clear
 
   io.busy := active
   io.done := doneReg
@@ -905,58 +910,65 @@ class ResultWritebackDma(systemCfg: EndToEndSystemConfig) extends Component {
   when(io.start.fire) {
     active := True
     baseAddress := io.start.payload
+    acceptedResults := 0
     writtenResults := 0
     errorReg := False
   }
 
-  io.input.ready := active && state === ResultWritebackState.Idle &&
-    writtenResults < systemCfg.maxCResults
+  val packedResult = Bits(cacheCfg.lineWidth bits)
+  packedResult := 0
+  packedResult(0) := io.input.payload.valid
+  packedResult(cfg.coordinateWidth downto 1) := io.input.payload.row.asBits
+  packedResult(2 * cfg.coordinateWidth downto cfg.coordinateWidth + 1) :=
+    io.input.payload.column.asBits
+  packedResult(recordWidth - 1 downto 2 * cfg.coordinateWidth + 1) :=
+    io.input.payload.value.asBits
+
+  requestFifo.io.push.valid := active && io.input.valid &&
+    acceptedResults < systemCfg.maxCResults
+  requestFifo.io.push.payload.address :=
+    (baseAddress + acceptedResults.resized).resized
+  requestFifo.io.push.payload.data := packedResult
+  requestFifo.io.push.payload.mask.setAll()
+  io.input.ready := active && acceptedResults < systemCfg.maxCResults &&
+    requestFifo.io.push.ready
   when(io.input.fire) {
-    val packed = Bits(cacheCfg.lineWidth bits)
-    packed := 0
-    packed(0) := io.input.payload.valid
-    packed(cfg.coordinateWidth downto 1) := io.input.payload.row.asBits
-    packed(2 * cfg.coordinateWidth downto cfg.coordinateWidth + 1) :=
-      io.input.payload.column.asBits
-    packed(recordWidth - 1 downto 2 * cfg.coordinateWidth + 1) :=
-      io.input.payload.value.asBits
-    requestData := packed
-    requestAddress := (baseAddress + writtenResults.resized).resized
-    state := ResultWritebackState.Request
+    acceptedResults := acceptedResults + 1
   }
 
-  io.writeRequest.valid := active && state === ResultWritebackState.Request
-  io.writeRequest.payload.address := requestAddress
-  io.writeRequest.payload.data := requestData
-  io.writeRequest.payload.mask.setAll()
-  when(io.writeRequest.fire) {
-    state := ResultWritebackState.WaitResponse
-  }
+  io.writeRequest.valid := active && requestFifo.io.pop.valid &&
+    completionFifo.io.push.ready
+  io.writeRequest.payload := requestFifo.io.pop.payload
+  requestFifo.io.pop.ready := active && io.writeRequest.ready &&
+    completionFifo.io.push.ready
+  completionFifo.io.push.valid := io.writeRequest.fire
+  completionFifo.io.push.payload := requestFifo.io.pop.payload.address
 
-  io.writeResponse.ready := active && state === ResultWritebackState.WaitResponse &&
-    io.writeResponse.payload.address === requestAddress
+  val responseMatchesHead = completionFifo.io.pop.valid &&
+    io.writeResponse.payload.address === completionFifo.io.pop.payload
+  io.writeResponse.ready := active && responseMatchesHead
+  completionFifo.io.pop.ready := io.writeResponse.fire
   when(io.writeResponse.fire) {
     errorReg := errorReg || io.writeResponse.payload.error
     writtenResults := writtenResults + 1
-    state := ResultWritebackState.Idle
   }
 
-  when(active && io.close && state === ResultWritebackState.Idle &&
-      !io.input.valid) {
+  val allWritesCompleted = requestFifo.io.occupancy === 0 &&
+    completionFifo.io.occupancy === 0 && acceptedResults === writtenResults
+  when(active && io.close && !io.input.valid && allWritesCompleted) {
     active := False
     doneReg := True
   }
 
-  when(active && state === ResultWritebackState.Idle &&
-      writtenResults === systemCfg.maxCResults && io.input.valid) {
+  when(active && acceptedResults === systemCfg.maxCResults && io.input.valid) {
     errorReg := True
   }
 
   when(io.clear) {
-    state := ResultWritebackState.Idle
     active := False
     doneReg := False
     errorReg := False
+    acceptedResults := 0
     writtenResults := 0
   }
 }

@@ -571,6 +571,8 @@ object EndToEndCycleSimulation extends App {
     s"${systemCfg.clusters.banksPerCluster} banks")
   println(s"Cold cache; read DMA latency: $readLatencyCycles cycles; " +
     s"write response latency: $writeLatencyCycles cycles")
+  println(s"C write DMA: up to ${systemCfg.writeOutstandingDepth} ordered " +
+    "outstanding requests")
   println("Boundary: unified descriptor acceptance through the final C DMA write response.")
   println(s"| Category | A density | B density | Paper mode | " +
     s"${selectedModes.mkString(" | ")} |")

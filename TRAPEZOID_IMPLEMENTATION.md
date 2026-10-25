@@ -65,6 +65,8 @@
 
 默认小规模 `EndToEndCycleSimulation` 仍使用 1-way cache，以控制 RTL 和 Verilator 编译规模；它不是 paper cache 的缩容等比例模型。
 
+系统级 `EndToEndSystemConfig.writeOutstandingDepth` 控制 C DMA 最多在飞的有序写请求数，默认是 16。当前响应接口按单一 AXI ID 的语义要求 write responses 保持请求顺序。这个参数不改变计算结果，只决定写回能否隐藏 response latency。
+
 ### 2.3 派生容量
 
 - `distributionWidth = macLanes`；paper 配置为 128。
@@ -305,7 +307,7 @@ descriptor accepted
   -> final C write request/response
 ```
 
-此边界比只测 PE row 更完整，但其中 DMA/cache 延迟仍是本工程的可配置模型，不是论文平台的实测内存时序。
+`ResultWritebackDma` 在结果和外部 DMA 之间包含 request FIFO 与 completion FIFO。它最多保留 `writeOutstandingDepth` 个有序 outstanding write，可以连续接收并发出 C records；系统只有在所有已接受结果都收到 write response 后才完成。此边界比只测 PE row 更完整，但其中 DMA/cache 延迟仍是本工程的可配置模型，不是论文平台的实测内存时序。
 
 ## 7. 两个 RTL 周期测试
 
@@ -352,13 +354,15 @@ final C write response consumed
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
 | HS x HS | 1131.0 | 779.0 | 357.0 | 356.0 |
-| HS x MS | 1163.0 | 811.0 | 357.7 | 356.0 |
-| HS x D | 1251.0 | 899.0 | 411.0 | 356.0 |
-| MS x MS | 2079.3 | 1724.7 | 1772.7 | 1750.7 |
-| MS x D | 3159.3 | 2791.3 | 3393.7 | 2525.3 |
-| D x D | 3202.0 | 3266.0 | 14380.0 | 7447.0 |
+| HS x MS | 1144.7 | 792.7 | 357.7 | 356.0 |
+| HS x D | 1176.0 | 824.0 | 360.0 | 356.0 |
+| MS x MS | 1551.7 | 1197.0 | 1731.7 | 1715.3 |
+| MS x D | 1917.0 | 1549.0 | 2905.0 | 2242.3 |
+| D x D | 1933.0 | 1997.0 | 13961.0 | 7343.0 |
 
-这些数字是在修正 clustered-cache set/tag 地址映射后的结果。DenseIp/TrIp 的访问集合没有改变，周期保持不变；TrGt/TrGs 在中高密度下减少了人为的 conflict miss，因而周期下降。该变化说明 cache 地址映射会显著影响 mode 趋势，也说明小规模结果仍不能替代论文的 16-way paper-scale cache 仿真。
+这些数字包含 clustered-cache 地址修复和 16-entry C write outstanding FIFO。现在关键推荐趋势为：`MS x MS`、`MS x D` 下 TrIP 最快，`D x D` 下 DenseIp 最快；HS 类仍由 Gustavson 路径领先。该趋势更接近论文的数据流选择，但数值仍是当前 16x16 缩比 RTL，不是论文性能数字。
+
+旧实现中 `MS x D` 的 TrIP 为 2791.3 cycles，TrGS 为 2525.3 cycles。两者都有约 251 个非零 C writes，但旧 `ResultWritebackDma` 必须等待当前 write 的 6-cycle response，才能接受下一个结果。TrIP 约在 446 cycle 才开始输出，而 TrGS 能较早流式输出并把串行写延迟与计算重叠，因此旧模型人为偏向 TrGS。改成多 outstanding 后，TrIP 为 1549.0 cycles，低于 TrGS 的 2242.3 cycles；最终计时终点仍然是最后一个 C write response。
 
 ### 7.2 `PaperSinglePERowCycleSimulation`
 
@@ -424,6 +428,8 @@ sbt -batch 'Test/runMain trapezoid.PaperSinglePERowCycleSimulation'
 
 `EndToEndCycleSimulation` 包含 DMA/cache/C write；`PaperSinglePERowCycleSimulation` 只包含 PE row command-to-response。一个 mode 在计算层更快，不代表在 cache miss、DMA 等待或写回拥塞后仍然更快。两张表不能直接比较，也不能直接与论文的 kernel-only 或 normalized throughput 图比较。
 
+当前端到端写回支持默认 16 个有序 outstanding requests，消除了逐结果等待 response 的串行瓶颈。它仍然只有一个 request Stream，最多每 cycle 发一个 cache line，也没有模拟多个 HBM channel；因此它比旧模型合理，但仍不是论文 2 TB/s HBM 的完整带宽模型。
+
 ### 8.5 memory system 和 NoC 仍是模型
 
 paper profile 已配置为论文的 4 clusters、128 banks、16-way、64 B line 和 16 MB 总容量，但替换策略采用当前 RTL 的 round-robin，DMA 仍是固定 latency 模型，也尚未实现论文平台的真实 2 TB/s HBM、32x32 cluster crossbar 时序、NoC 竞争和 multicast routing。因此 TrGt/TrGs 的 memory advantage 或 DenseIp 的带宽瓶颈仍不一定呈现为论文中的比例。
@@ -463,7 +469,7 @@ utilization = usefulMacs / laneSlots
 
 1. 导入论文相同的矩阵或相同 fiber 统计，而不是只匹配四个 density 百分比。
 2. 先完成 128-row full array 的实际 Verilator 编译和运行，再比较阵列级周期。
-3. 统一两类测试的计时边界，分别报告 setup、memory、compute、writeback，不要把不同边界的数字放在同一排名中。
+3. 继续细分并报告 setup、memory、compute、writeback；当前已经输出 first C write、DMA active、hit/miss 和总周期，但还没有独立的 compute-only counter。
 4. 将 paper scheduler 的 subrow、动态 B packing、row balancing、buffer occupancy 和 mode selection 规则直接编码到前端。
 5. 保持已经对齐的 16 MB、128-bank、16-way、64 B cache 结构，并继续对齐论文的 32x32 cluster crossbar、2 TB/s HBM 带宽、miss latency、DMA burst 和 NoC/multicast 竞争。
 6. 将 Benes distribution control、完整跨命令 Gustavson accumulator 和真实结果写回路径接入系统。

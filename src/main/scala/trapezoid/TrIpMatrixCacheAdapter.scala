@@ -352,7 +352,8 @@ class TrIpCachedMatrixController(
     cacheCfg: CacheConfig,
     parallelReaders: Int = 1,
     peFactory: TrapezoidConfig => TrapezoidPERowComponent =
-      cfg => new TrapezoidPERow(cfg)
+      cfg => new TrapezoidPERow(cfg),
+    externalTileController: Boolean = false
 ) extends Component {
   private val tileCfg = matrixCfg.tile
   private val cfg = tileCfg.core
@@ -395,12 +396,31 @@ class TrIpCachedMatrixController(
     val columnBase = out UInt(matrixCfg.columnCountWidth bits)
     val kTileIndex = out UInt(matrixCfg.kTileIndexWidth bits)
     val completedOutputTiles = out UInt(32 bits)
+    val tileALoad = if (externalTileController)
+      master(Stream(IndexedFiber(cfg, tileCfg.rowIndexWidth))) else null
+    val tileBLoad = if (externalTileController)
+      master(Stream(IndexedFiber(cfg, tileCfg.columnIndexWidth))) else null
+    val tileStart = if (externalTileController)
+      master(Stream(TrIpTileStart(tileCfg))) else null
+    val tileResult = if (externalTileController)
+      slave(Stream(MatrixResult(cfg))) else null
+    val tileDone = if (externalTileController) in Bool() else null
+    val tileUnsupportedMode = if (externalTileController) in Bool() else null
   }
 
-  val controller = new TrIpMatrixController(matrixCfg, peFactory)
+  val controller = new TrIpMatrixController(matrixCfg, peFactory,
+    externalTileController)
   val loader = new TrIpMatrixFiberLoader(matrixCfg, cacheCfg)(parallelReaders)
   controller.io.clear := io.clear
   loader.io.clear := io.clear
+  if (externalTileController) {
+    io.tileALoad << controller.io.tileALoad
+    io.tileBLoad << controller.io.tileBLoad
+    io.tileStart << controller.io.tileStart
+    controller.io.tileResult << io.tileResult
+    controller.io.tileDone := io.tileDone
+    controller.io.tileUnsupportedMode := io.tileUnsupportedMode
+  }
 
   val aBaseAddress = Reg(UInt(cacheCfg.addressWidth bits)) init 0
   val bBaseAddress = Reg(UInt(cacheCfg.addressWidth bits)) init 0

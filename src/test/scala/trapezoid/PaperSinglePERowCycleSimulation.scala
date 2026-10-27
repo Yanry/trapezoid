@@ -1,9 +1,13 @@
 package trapezoid
 
 import spinal.core.sim._
+import spinal.core._
 import trapezoid.model.DenseMatrix
 
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Path, Paths}
 import scala.collection.mutable
+import scala.sys.process.Process
 
 /** Real Verilator throughput simulation of one paper-sized PE row.
   *
@@ -58,7 +62,9 @@ object PaperSinglePERowCycleSimulation extends App {
                                  mode: String, cycles: Long,
                                  commandCount: Int, responseCount: Int,
                                  outputCount: Int, usefulMacs: Long,
-                                 laneSlots: Long, checksum: Long)
+                                 laneSlots: Long, checksum: Long,
+                                 routeCycles: Long, macCycles: Long,
+                                 mrnCycles: Long, responseCycles: Long)
 
   private val categories = Vector(
     Category("HS x HS", 50, 50, "TrGt"),
@@ -102,6 +108,97 @@ object PaperSinglePERowCycleSimulation extends App {
     Vector.tabulate(samples)(sample => workloadFor(category, sample))
   }
 
+  private val kernelDirectory = Paths.get(
+    "simWorkspace", "paper-single-pe-row-kernel").toAbsolutePath.normalize()
+  private val requiredKernelSources = Vector(
+    "TrapezoidPERow.v",
+    "MultiFiberIntersection.v",
+    "BenesDistributionFabric.v",
+    "PipelinedBenesRouteControlGenerator.v"
+  ).map(kernelDirectory.resolve)
+  private val kernelInputs = Vector(
+    Paths.get("src/main/scala/trapezoid/TrapezoidPERow.scala"),
+    Paths.get("src/main/scala/trapezoid/MultiFiberIntersection.scala"),
+    Paths.get("src/main/scala/trapezoid/TrapezoidTypes.scala"),
+    Paths.get("src/main/scala/trapezoid/TrapezoidConfig.scala")
+  ).map(_.toAbsolutePath.normalize())
+
+  private def kernelIsCurrent: Boolean = {
+    requiredKernelSources.forall(Files.isRegularFile(_)) && {
+      val oldestOutput = requiredKernelSources.map(path =>
+        Files.getLastModifiedTime(path).toMillis).min
+      val newestInput = kernelInputs.map(path =>
+        Files.getLastModifiedTime(path).toMillis).max
+      oldestOutput >= newestInput
+    }
+  }
+
+  private def generateKernel(): Unit = {
+    Files.createDirectories(kernelDirectory)
+    val java = Paths.get(System.getProperty("java.home"), "bin", "java").toString
+    val status = Process(Seq(
+      java,
+      "-Xms1G",
+      "-Xmx12G",
+      "-XX:+UseG1GC",
+      "-cp",
+      System.getProperty("java.class.path"),
+      "trapezoid.GeneratePaperPERowSimulationRtl",
+      kernelDirectory.toString
+    )).!
+    require(status == 0,
+      s"paper PE-row RTL generation failed with status $status")
+    require(requiredKernelSources.forall(Files.isRegularFile(_)),
+      s"paper PE-row RTL is incomplete in $kernelDirectory")
+  }
+
+  private def markHierarchical(path: Path, moduleName: String): Unit = {
+    val marker = "/*verilator hier_block*/"
+    val source = new String(Files.readAllBytes(path), StandardCharsets.UTF_8)
+    val cleaned = source.replace("\n  " + marker, "")
+    val declaration = s"module $moduleName ("
+    val declarationIndex = cleaned.indexOf(declaration)
+    require(declarationIndex >= 0,
+      s"cannot locate $moduleName declaration in $path")
+    val headerEnd = cleaned.indexOf(");", declarationIndex)
+    require(headerEnd >= 0,
+      s"cannot locate $moduleName port-list end in $path")
+    val annotated = cleaned.substring(0, headerEnd + 2) +
+      "\n  " + marker + cleaned.substring(headerEnd + 2)
+    Files.write(path, annotated.getBytes(StandardCharsets.UTF_8))
+  }
+
+  if (!kernelIsCurrent) generateKernel()
+  markHierarchical(kernelDirectory.resolve("TrapezoidPERow.v"),
+    "TrapezoidPERow")
+  markHierarchical(kernelDirectory.resolve(
+    "PipelinedBenesRouteControlGenerator.v"),
+    "PipelinedBenesRouteControlGenerator")
+
+  private val kernelSources: Vector[Path] = {
+    val stream = Files.list(kernelDirectory)
+    try {
+      import scala.collection.JavaConverters._
+      stream.iterator().asScala.filter(path =>
+        path.getFileName.toString.endsWith(".v")).toVector
+    } finally stream.close()
+  }
+
+  private class PaperPERowSimulationTop extends Component {
+    val io = TrapezoidPERowIo(cfg)
+    val core = new PaperPERowBlackBox(cfg, kernelSources)
+    core.io.command.valid := io.command.valid
+    core.io.command.payload := io.command.payload
+    io.command.ready := core.io.command.ready
+    io.response.valid := core.io.response.valid
+    io.response.payload := core.io.response.payload
+    core.io.response.ready := io.response.ready
+    io.routeCycles := core.io.routeCycles
+    io.macCycles := core.io.macCycles
+    io.mrnCycles := core.io.mrnCycles
+    io.responseCycles := core.io.responseCycles
+  }
+
   private def modeValue(mode: String): TrapezoidDataflow.E = mode match {
     case "DenseIp" => TrapezoidDataflow.DenseIp
     case "TrIp" => TrapezoidDataflow.TrIp
@@ -110,7 +207,7 @@ object PaperSinglePERowCycleSimulation extends App {
     case other => throw new IllegalArgumentException(s"unknown mode $other")
   }
 
-  private def clearPayload(dut: TrapezoidPERow): Unit = {
+  private def clearPayload(dut: PaperPERowSimulationTop): Unit = {
     dut.io.command.payload.endOfTile #= false
     dut.io.command.payload.mode #= TrapezoidDataflow.DenseIp
     for (fiber <- 0 until cfg.maxFibers) {
@@ -223,11 +320,19 @@ object PaperSinglePERowCycleSimulation extends App {
 
   private def runSimulation(): Unit = {
     val simConfig = SimConfig.withVerilator
+      .workspaceName(s"PaperSinglePERowCycleSimulation-${
+        modeFilter.getOrElse("all")}")
+      .disableCache
       .addSimulatorFlag("-CFLAGS -std=c++14")
       .addSimulatorFlag("-LDFLAGS -std=c++14")
+      .addSimulatorFlag("--hierarchical")
+      .addSimulatorFlag("--verilate-jobs 1")
+      .addSimulatorFlag("--build-dep-bin /usr/bin/verilator_bin")
+      .addSimulatorFlag("--output-split 20000")
+      .addSimulatorFlag("--output-split-cfuncs 20000")
     val measurements = mutable.ArrayBuffer.empty[Measurement]
 
-    simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
+    simConfig.compile(new PaperPERowSimulationTop).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       dut.io.command.valid #= false
       dut.io.response.ready #= true
@@ -309,6 +414,14 @@ object PaperSinglePERowCycleSimulation extends App {
         var cycles = 0L
         var firstAccepted = -1L
         var lastResponse = -1L
+        // Let initialized RTL registers settle before taking per-case deltas.
+        dut.io.command.valid #= false
+        dut.io.response.ready #= true
+        step()
+        val routeStart = dut.io.routeCycles.toLong
+        val macStart = dut.io.macCycles.toLong
+        val mrnStart = dut.io.mrnCycles.toLong
+        val responseStart = dut.io.responseCycles.toLong
 
         dut.io.command.valid #= false
         dut.io.response.ready #= true
@@ -363,7 +476,10 @@ object PaperSinglePERowCycleSimulation extends App {
         Measurement(workload.category, workload.sample, mode,
           lastResponse - firstAccepted + 1, commands.size, responses,
           observed.size, usefulMacs, commands.size.toLong * cfg.macLanes,
-          checksum(observed))
+          checksum(observed), dut.io.routeCycles.toLong - routeStart,
+          dut.io.macCycles.toLong - macStart,
+          dut.io.mrnCycles.toLong - mrnStart,
+          dut.io.responseCycles.toLong - responseStart)
       }
 
       for (workload <- workloads; mode <- modes) {
@@ -395,13 +511,17 @@ object PaperSinglePERowCycleSimulation extends App {
         s"${values.mkString(" | ")} |")
     }
     println("\nDetailed streamed measurements")
-    println("| Category | Mode | Cycles | Commands | Responses | " +
-      "Output coordinates | Useful MACs | Lane slots | Utilization | Checksum |")
-    println("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    println("| Category | Mode | E2E cycles | Route | MAC | MRN | Response | " +
+      "Commands | Responses | Output coordinates | Useful MACs | Lane slots | " +
+      "Utilization | Checksum |")
+    println("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | " +
+      "---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     measurements.foreach { measurement =>
       val utilization = 100.0 * measurement.usefulMacs / measurement.laneSlots
       println(s"| ${measurement.category.name} | ${measurement.mode} | " +
-        s"${measurement.cycles} | ${measurement.commandCount} | " +
+        s"${measurement.cycles} | ${measurement.routeCycles} | " +
+        s"${measurement.macCycles} | ${measurement.mrnCycles} | " +
+        s"${measurement.responseCycles} | ${measurement.commandCount} | " +
         s"${measurement.responseCount} | ${measurement.outputCount} | " +
         s"${measurement.usefulMacs} | ${measurement.laneSlots} | " +
         f"$utilization%.2f%% | ${measurement.checksum} |")

@@ -103,7 +103,8 @@ object EndToEndCycleSimulation extends App {
     GustavsonTileConfig(cfg,
       accumulatorEntries = if (scaledPaperWorkload) dimension
         else dimension * cfg.localBanks,
-      fifoDepthPerSubrow = if (paperScale || scaledPaperWorkload) 32 else 8),
+      fifoDepthPerSubrow = if (paperScale || scaledPaperWorkload) 32 else 8,
+      bPrefetchDepth = if (paperScale || scaledPaperWorkload) 4 else 2),
     cacheCfg,
     maxLinesPerRow = if (paperScale) 256
       else if (scaledPaperWorkload) 32 else 8
@@ -557,8 +558,27 @@ object EndToEndCycleSimulation extends App {
           s"fifo=${dut.io.trgtFifoOccupancy.toInt}")
       require(!dut.io.error.toBoolean,
         s"$modeName ${workload.category.name} reported an RTL error")
-      require(observed.toMap == expected,
-        s"$modeName ${workload.category.name} result mismatch")
+      val observedMap = observed.toMap
+      val resultDifferences = (observedMap.keySet ++ expected.keySet).toVector.sorted
+        .collect {
+          case coordinate if observedMap.get(coordinate) != expected.get(coordinate) =>
+            s"$coordinate:${observedMap.get(coordinate)}!=${expected.get(coordinate)}"
+        }.take(8)
+      val missingRows = expected.keySet.diff(observedMap.keySet).toVector
+        .groupBy(_._1).toVector.sortBy(_._1)
+        .map { case (row, coordinates) => s"$row:${coordinates.size}" }
+      val aRowNonZeros = workload.a.values.zipWithIndex.collect {
+        case (row, index) if row.exists(_ != 0) =>
+          s"$index:${row.count(_ != 0)}"
+      }
+      require(observedMap == expected,
+        s"$modeName ${workload.category.name} sample ${workload.sample} result mismatch: " +
+          s"observed=${observedMap.size}, expected=${expected.size}, " +
+          s"missingRows=${missingRows.mkString(",")}, " +
+          s"aRows=${aRowNonZeros.mkString(",")}, " +
+          s"assigned=${dut.io.trgtAssignedTiles.toLong}, " +
+          s"completed=${dut.io.trgtCompletedTiles.toLong}, " +
+          s"differences=${resultDifferences.mkString(",")}")
       require(writeRequests == expected.size)
 
       Measurement(workload.category, workload.sample, modeName,

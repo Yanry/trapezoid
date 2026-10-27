@@ -17,7 +17,8 @@ object TrIpMatrixState extends SpinalEnum {
 class TrIpMatrixController(
     matrixCfg: TrIpMatrixConfig,
     peFactory: TrapezoidConfig => TrapezoidPERowComponent =
-      cfg => new TrapezoidPERow(cfg)
+      cfg => new TrapezoidPERow(cfg),
+    externalTileController: Boolean = false
 ) extends Component {
   private val tileCfg = matrixCfg.tile
   private val cfg = tileCfg.core
@@ -39,10 +40,42 @@ class TrIpMatrixController(
     val tileRowCount = out UInt(tileCfg.rowCountWidth bits)
     val tileColumnCount = out UInt(tileCfg.columnCountWidth bits)
     val completedOutputTiles = out UInt(32 bits)
+    val tileALoad = if (externalTileController)
+      master(Stream(IndexedFiber(cfg, tileCfg.rowIndexWidth))) else null
+    val tileBLoad = if (externalTileController)
+      master(Stream(IndexedFiber(cfg, tileCfg.columnIndexWidth))) else null
+    val tileStart = if (externalTileController)
+      master(Stream(TrIpTileStart(tileCfg))) else null
+    val tileResult = if (externalTileController)
+      slave(Stream(MatrixResult(cfg))) else null
+    val tileDone = if (externalTileController) in Bool() else null
+    val tileUnsupportedMode = if (externalTileController) in Bool() else null
   }
 
-  val inner = new TrIpTileController(tileCfg, peFactory)
-  inner.io.clear := io.clear
+  val inner = if (externalTileController) null
+    else new TrIpTileController(tileCfg, peFactory)
+  if (!externalTileController) inner.io.clear := io.clear
+  val tileALoad = Stream(IndexedFiber(cfg, tileCfg.rowIndexWidth))
+  val tileBLoad = Stream(IndexedFiber(cfg, tileCfg.columnIndexWidth))
+  val tileStart = Stream(TrIpTileStart(tileCfg))
+  val tileResult = Stream(MatrixResult(cfg))
+  val tileDone = Bool()
+  val tileUnsupportedMode = Bool()
+  if (externalTileController) {
+    io.tileALoad << tileALoad
+    io.tileBLoad << tileBLoad
+    io.tileStart << tileStart
+    tileResult << io.tileResult
+    tileDone := io.tileDone
+    tileUnsupportedMode := io.tileUnsupportedMode
+  } else {
+    inner.io.aLoad << tileALoad
+    inner.io.bLoad << tileBLoad
+    inner.io.start << tileStart
+    tileResult << inner.io.result
+    tileDone := inner.io.done
+    tileUnsupportedMode := inner.io.unsupportedMode
+  }
 
   val state = RegInit(TrIpMatrixState.Idle)
   val descriptorReg = Reg(TrIpMatrixDescriptor(matrixCfg))
@@ -75,7 +108,7 @@ class TrIpMatrixController(
   io.busy := state =/= TrIpMatrixState.Idle
   io.done := doneReg
   io.descriptorError := descriptorError
-  io.innerError := inner.io.unsupportedMode
+  io.innerError := tileUnsupportedMode
   io.acceptingFibers := state === TrIpMatrixState.Load
   io.rowBase := rowBase
   io.columnBase := columnBase
@@ -85,16 +118,16 @@ class TrIpMatrixController(
   io.completedOutputTiles := completedOutputTiles
 
   io.descriptor.ready := !io.clear && state === TrIpMatrixState.Idle
-  inner.io.aLoad.valid := io.aLoad.valid && state === TrIpMatrixState.Load &&
+  tileALoad.valid := io.aLoad.valid && state === TrIpMatrixState.Load &&
     io.aLoad.payload.index < currentRows
-  inner.io.aLoad.payload := io.aLoad.payload
+  tileALoad.payload := io.aLoad.payload
   io.aLoad.ready := state === TrIpMatrixState.Load &&
-    io.aLoad.payload.index < currentRows && inner.io.aLoad.ready
-  inner.io.bLoad.valid := io.bLoad.valid && state === TrIpMatrixState.Load &&
+    io.aLoad.payload.index < currentRows && tileALoad.ready
+  tileBLoad.valid := io.bLoad.valid && state === TrIpMatrixState.Load &&
     io.bLoad.payload.index < currentColumns
-  inner.io.bLoad.payload := io.bLoad.payload
+  tileBLoad.payload := io.bLoad.payload
   io.bLoad.ready := state === TrIpMatrixState.Load &&
-    io.bLoad.payload.index < currentColumns && inner.io.bLoad.ready
+    io.bLoad.payload.index < currentColumns && tileBLoad.ready
 
   when(io.aLoad.fire) {
     for (row <- 0 until tileCfg.maxRows) {
@@ -122,21 +155,21 @@ class TrIpMatrixController(
     }
   }
 
-  inner.io.start.valid := state === TrIpMatrixState.Launch
-  inner.io.start.payload.mode := (if (matrixCfg.maxKTiles == 1) {
+  tileStart.valid := state === TrIpMatrixState.Launch
+  tileStart.payload.mode := (if (matrixCfg.maxKTiles == 1) {
     descriptorReg.modes(0)
   } else {
     descriptorReg.modes(kTileIndex)
   })
-  inner.io.start.payload.rowCount := currentRows
-  inner.io.start.payload.columnCount := currentColumns
-  inner.io.start.payload.firstKTile := kTileIndex === 0
-  inner.io.start.payload.lastKTile := finalKTile
+  tileStart.payload.rowCount := currentRows
+  tileStart.payload.columnCount := currentColumns
+  tileStart.payload.firstKTile := kTileIndex === 0
+  tileStart.payload.lastKTile := finalKTile
 
-  io.result.valid := !io.clear && state === TrIpMatrixState.Run && inner.io.result.valid
-  io.result.payload.element := inner.io.result.payload
-  io.result.payload.endOfMatrix := inner.io.result.payload.endOfTile && finalOutputTile
-  inner.io.result.ready := !io.clear && state === TrIpMatrixState.Run && io.result.ready
+  io.result.valid := !io.clear && state === TrIpMatrixState.Run && tileResult.valid
+  io.result.payload.element := tileResult.payload
+  io.result.payload.endOfMatrix := tileResult.payload.endOfTile && finalOutputTile
+  tileResult.ready := !io.clear && state === TrIpMatrixState.Run && io.result.ready
 
   def clearLoadState(): Unit = {
     for (row <- 0 until tileCfg.maxRows) aLoaded(row) := False
@@ -173,13 +206,13 @@ class TrIpMatrixController(
     }
 
     is(TrIpMatrixState.Launch) {
-      when(inner.io.start.fire) { state := TrIpMatrixState.Run }
+      when(tileStart.fire) { state := TrIpMatrixState.Run }
     }
 
     is(TrIpMatrixState.Run) {
-      when(inner.io.done) {
+      when(tileDone) {
         clearLoadState()
-        when(inner.io.unsupportedMode) {
+        when(tileUnsupportedMode) {
           descriptorError := True
           doneReg := True
           state := TrIpMatrixState.Idle

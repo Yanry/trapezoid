@@ -169,7 +169,8 @@ case class CacheConfig(
     setsPerBank: Int,
     clientCount: Int,
     requestIdWidth: Int = 8,
-    ways: Int = 1
+    ways: Int = 1,
+    maxOutstandingPerClient: Int = 4
 ) {
   require(wordWidth > 0 && wordsPerLine > 0)
   require(addressWidth > 0 && requestIdWidth > 0)
@@ -180,6 +181,8 @@ case class CacheConfig(
   require(ways >= 1 && (ways & (ways - 1)) == 0,
     "cache ways must be a power of two")
   require(clientCount > 0)
+  require(maxOutstandingPerClient >= 1,
+    "each cache client needs at least one request credit")
 
   val lineWidth: Int = wordWidth * wordsPerLine
   val bankIndexWidth: Int = math.max(1, log2Up(bankCount))
@@ -202,7 +205,8 @@ object CacheConfig {
       setsPerBank = 128,
       clientCount = clientCount,
       requestIdWidth = requestIdWidth,
-      ways = 16)
+      ways = 16,
+      maxOutstandingPerClient = 8)
 }
 
 /** Fixed-width representation used to move one bitmask fiber through cache.
@@ -225,13 +229,19 @@ case class FiberCacheConfig(core: TrapezoidConfig, cache: CacheConfig) {
 case class GustavsonTileConfig(
     core: TrapezoidConfig,
     accumulatorEntries: Int,
-    fifoDepthPerSubrow: Int = 8
+    fifoDepthPerSubrow: Int = 8,
+    bPrefetchDepth: Int = 4
 ) {
   require(accumulatorEntries >= core.outputLanes,
     "the accumulator must hold at least one complete PE response")
   require(fifoDepthPerSubrow >= 2)
   require(fifoDepthPerSubrow <= core.localDepthPerBank,
     "each TrGT FIFO must fit in one local-buffer bank")
+  require(bPrefetchDepth >= 2 &&
+    (bPrefetchDepth & (bPrefetchDepth - 1)) == 0,
+    "TrGT B prefetch depth must be a power of two")
+  require(bPrefetchDepth <= core.localDepthPerBank,
+    "TrGT B prefetch window must fit in one local-buffer bank")
   require(core.cacheLineWords >= core.localBanks,
     "TrGT needs one cache-line lane per PE subrow")
 
@@ -239,6 +249,8 @@ case class GustavsonTileConfig(
   val entryCountWidth: Int = log2Up(accumulatorEntries + 1)
   val fifoPointerWidth: Int = math.max(1, log2Up(fifoDepthPerSubrow))
   val fifoCountWidth: Int = log2Up(fifoDepthPerSubrow + 1)
+  val bPrefetchSlotWidth: Int = math.max(1, log2Up(bPrefetchDepth))
+  val bPrefetchCountWidth: Int = log2Up(bPrefetchDepth + 1)
 }
 
 object GustavsonTileConfig {

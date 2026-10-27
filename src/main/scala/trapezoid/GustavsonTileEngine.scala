@@ -14,7 +14,7 @@ object GustavsonTileState extends SpinalEnum {
   * The command carrying endOfTile closes the tile and streams the sorted prefix
   * directly. TrGT and TrGS are both legal at every lane density.
   */
-class GustavsonTileEngine(
+class LegacyGustavsonTileEngine(
     tileCfg: GustavsonTileConfig,
     peFactory: TrapezoidConfig => TrapezoidPERowComponent =
       cfg => new TrapezoidPERow(cfg),
@@ -48,12 +48,44 @@ class GustavsonTileEngine(
   val outputIndex = Reg(UInt(tileCfg.entryIndexWidth bits)) init 0
 
   val entryCount = Reg(UInt(tileCfg.entryCountWidth bits)) init 0
-  val entryRow = Vec((0 until tileCfg.accumulatorEntries).map(_ =>
-    Reg(UInt(cfg.coordinateWidth bits)) init 0))
-  val entryColumn = Vec((0 until tileCfg.accumulatorEntries).map(_ =>
-    Reg(UInt(cfg.coordinateWidth bits)) init 0))
-  val entryValue = Vec((0 until tileCfg.accumulatorEntries).map(_ =>
-    Reg(SInt(cfg.accumulatorWidth bits)) init 0))
+  private val accumulatorBankCount = cfg.localBanks
+  require(tileCfg.accumulatorEntries % accumulatorBankCount == 0,
+    "Gustavson accumulator entries must divide evenly across local banks")
+  private val entriesPerAccumulatorBank =
+    tileCfg.accumulatorEntries / accumulatorBankCount
+  val entryRowBanks = Array.fill(accumulatorBankCount)(
+    Vec((0 until entriesPerAccumulatorBank).map(_ =>
+      Reg(UInt(cfg.coordinateWidth bits)) init 0)))
+  val entryColumnBanks = Array.fill(accumulatorBankCount)(
+    Vec((0 until entriesPerAccumulatorBank).map(_ =>
+      Reg(UInt(cfg.coordinateWidth bits)) init 0)))
+  val entryValueBanks = Array.fill(accumulatorBankCount)(
+    Vec((0 until entriesPerAccumulatorBank).map(_ =>
+      Reg(SInt(cfg.accumulatorWidth bits)) init 0)))
+
+  // Interleaving entries keeps adjacent sorted coordinates in separate banks.
+  // The current merge policy still commits one coordinate per cycle; this
+  // mapping makes the storage boundary explicit for a later SRAM replacement.
+  def entryRowAt(entry: Int): UInt =
+    entryRowBanks(entry % accumulatorBankCount)(entry / accumulatorBankCount)
+  def entryColumnAt(entry: Int): UInt =
+    entryColumnBanks(entry % accumulatorBankCount)(entry / accumulatorBankCount)
+  def entryValueAt(entry: Int): SInt =
+    entryValueBanks(entry % accumulatorBankCount)(entry / accumulatorBankCount)
+
+  val outputRow = UInt(cfg.coordinateWidth bits)
+  val outputColumn = UInt(cfg.coordinateWidth bits)
+  val outputValue = SInt(cfg.accumulatorWidth bits)
+  outputRow := 0
+  outputColumn := 0
+  outputValue := 0
+  for (entry <- 0 until tileCfg.accumulatorEntries) {
+    when(outputIndex === entry) {
+      outputRow := entryRowAt(entry)
+      outputColumn := entryColumnAt(entry)
+      outputValue := entryValueAt(entry)
+    }
+  }
 
   io.busy := tileOpen || state =/= GustavsonTileState.Accept
   io.done := doneReg
@@ -62,9 +94,9 @@ class GustavsonTileEngine(
   io.activeEntries := entryCount
   io.result.valid := state === GustavsonTileState.Output
   io.result.payload.valid := True
-  io.result.payload.row := entryRow(outputIndex)
-  io.result.payload.column := entryColumn(outputIndex)
-  io.result.payload.value := entryValue(outputIndex)
+  io.result.payload.row := outputRow
+  io.result.payload.column := outputColumn
+  io.result.payload.value := outputValue
   io.result.payload.endOfTile :=
     outputIndex.resize(tileCfg.entryCountWidth) + 1 === entryCount
 
@@ -107,11 +139,12 @@ class GustavsonTileEngine(
   for (entry <- 0 until tileCfg.accumulatorEntries) {
     val active = U(entry, tileCfg.entryCountWidth bits) < entryCount
     coordinateMatches(entry) := active &&
-      entryRow(entry) === currentResult.row && entryColumn(entry) === currentResult.column
+      entryRowAt(entry) === currentResult.row &&
+        entryColumnAt(entry) === currentResult.column
     currentComesBefore(entry) := active &&
-      (currentResult.row < entryRow(entry) ||
-        (currentResult.row === entryRow(entry) &&
-          currentResult.column < entryColumn(entry)))
+      (currentResult.row < entryRowAt(entry) ||
+        (currentResult.row === entryRowAt(entry) &&
+          currentResult.column < entryColumnAt(entry)))
     insertionChoices(entry) := currentComesBefore(entry) && !insertionPrefix(entry)
     insertionPrefix(entry + 1) := insertionPrefix(entry) || currentComesBefore(entry)
   }
@@ -179,22 +212,27 @@ class GustavsonTileEngine(
     is(GustavsonTileState.Merge) {
       when(currentResult.valid) {
         when(matchFound) {
-          entryValue(matchIndex) := (entryValue(matchIndex) + currentResult.value).resized
+          for (entry <- 0 until tileCfg.accumulatorEntries) {
+            when(matchIndex === entry) {
+              entryValueAt(entry) :=
+                (entryValueAt(entry) + currentResult.value).resized
+            }
+          }
         } elsewhen(entryCount =/= tileCfg.accumulatorEntries) {
           for (entry <- 1 until tileCfg.accumulatorEntries) {
             when(U(entry, tileCfg.entryCountWidth bits) >
                 insertionIndex.resize(tileCfg.entryCountWidth) &&
                 U(entry, tileCfg.entryCountWidth bits) <= entryCount) {
-              entryRow(entry) := entryRow(entry - 1)
-              entryColumn(entry) := entryColumn(entry - 1)
-              entryValue(entry) := entryValue(entry - 1)
+              entryRowAt(entry) := entryRowAt(entry - 1)
+              entryColumnAt(entry) := entryColumnAt(entry - 1)
+              entryValueAt(entry) := entryValueAt(entry - 1)
             }
           }
           for (entry <- 0 until tileCfg.accumulatorEntries) {
             when(insertionIndex === entry) {
-              entryRow(entry) := currentResult.row
-              entryColumn(entry) := currentResult.column
-              entryValue(entry) := currentResult.value
+              entryRowAt(entry) := currentResult.row
+              entryColumnAt(entry) := currentResult.column
+              entryValueAt(entry) := currentResult.value
             }
           }
           entryCount := entryCount + 1

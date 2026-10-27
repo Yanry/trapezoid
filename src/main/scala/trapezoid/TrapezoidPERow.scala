@@ -64,6 +64,10 @@ case class PERowReductionPayload(cfg: TrapezoidConfig) extends Bundle {
 case class TrapezoidPERowIo(cfg: TrapezoidConfig) extends Bundle {
   val command = slave(Stream(PERowCommand(cfg)))
   val response = master(Stream(PERowResponse(cfg)))
+  val routeCycles = out UInt(32 bits)
+  val macCycles = out UInt(32 bits)
+  val mrnCycles = out UInt(32 bits)
+  val responseCycles = out UInt(32 bits)
 }
 
 trait TrapezoidPERowComponent {
@@ -79,6 +83,10 @@ trait TrapezoidPERowComponent {
 class TrapezoidPERow(cfg: TrapezoidConfig)
     extends Component with TrapezoidPERowComponent {
   val io = TrapezoidPERowIo(cfg)
+  val routeCycleCounter = Reg(UInt(32 bits)) init 0
+  val macCycleCounter = Reg(UInt(32 bits)) init 0
+  val mrnCycleCounter = Reg(UInt(32 bits)) init 0
+  val responseCycleCounter = Reg(UInt(32 bits)) init 0
 
   private case class ReductionGroup(
       entries: Vec[PERowReducedProduct],
@@ -155,9 +163,17 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
 
   // Stage 1: the MFIU/shift equivalent distributes operands to fixed lanes.
   val mfiu = new MultiFiberIntersection(cfg)
-  val columnPacker = new DynamicColumnPacker(cfg)
-  val aDistribution = new OperandDistributionNetwork(cfg)
-  val bDistribution = new OperandDistributionNetwork(cfg)
+  private val pipelinedBenesControls = cfg.macLanes > 16
+  val aBenesControls = if (!pipelinedBenesControls)
+    new BenesRouteControlGenerator(cfg) else null
+  val bBenesControls = if (!pipelinedBenesControls)
+    new BenesRouteControlGenerator(cfg) else null
+  val aPipelinedBenesControls = if (pipelinedBenesControls)
+    new PipelinedBenesRouteControlGenerator(cfg) else null
+  val bPipelinedBenesControls = if (pipelinedBenesControls)
+    new PipelinedBenesRouteControlGenerator(cfg) else null
+  val aBenesFabric = new BenesDistributionFabric(cfg)
+  val bBenesFabric = new BenesDistributionFabric(cfg)
   val input = inputStage.payload
   val fullFiberMask = B((BigInt(1) << cfg.fiberWidth) - 1,
     cfg.fiberWidth bits)
@@ -190,14 +206,6 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     mfiu.io.bValid(fiber) := useSparseTripRoute && input.trip.b(fiber).valid
     mfiu.io.bMask(fiber) := Mux(useSparseTripRoute,
       input.trip.b(fiber).mask, B(0, cfg.fiberWidth bits))
-    columnPacker.io.aValid(fiber) := useSparseTripRoute &&
-      input.trip.a(fiber).valid
-    columnPacker.io.aMask(fiber) := Mux(useSparseTripRoute,
-      input.trip.a(fiber).mask, B(0, cfg.fiberWidth bits))
-    columnPacker.io.bValid(fiber) := useSparseTripRoute &&
-      input.trip.b(fiber).valid
-    columnPacker.io.bMask(fiber) := Mux(useSparseTripRoute,
-      input.trip.b(fiber).mask, B(0, cfg.fiberWidth bits))
     for (value <- 0 until cfg.fiberWidth) {
       mfiu.io.aValues(fiber)(value) := Mux(useSparseTripRoute,
         input.trip.a(fiber).values(value), S(0, cfg.dataWidth bits))
@@ -205,24 +213,74 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
         input.trip.b(fiber).values(value), S(0, cfg.dataWidth bits))
     }
   }
-  aDistribution.io.sources := mfiu.io.aSources
-  aDistribution.io.sourceValid := mfiu.io.aSourceValid
-  bDistribution.io.sources := mfiu.io.bSources
-  bDistribution.io.sourceValid := mfiu.io.bSourceValid
+  val routeControlsReady = Bool()
+  val aRouteRoutable = Bool()
+  val bRouteRoutable = Bool()
+  val sparseRouteNeedsControl = useSparseTripRoute && mfiu.io.count =/= 0
+  val controlsStarted = if (pipelinedBenesControls) RegInit(False) else null
   for (lane <- 0 until cfg.macLanes) {
-    aDistribution.io.laneValid(lane) := useSparseTripRoute &&
-      mfiu.io.routes(lane).valid
-    bDistribution.io.laneValid(lane) := useSparseTripRoute &&
-      mfiu.io.routes(lane).valid
-    aDistribution.io.sourceIndex(lane) := mfiu.io.routes(lane).aSourceIndex
-    bDistribution.io.sourceIndex(lane) := mfiu.io.routes(lane).bSourceIndex
+    aBenesFabric.io.sources(lane)(0) := mfiu.io.aSourceValid(lane)
+    aBenesFabric.io.sources(lane)(cfg.dataWidth downto 1) :=
+      mfiu.io.aSources(lane).asBits
+    bBenesFabric.io.sources(lane)(0) := mfiu.io.bSourceValid(lane)
+    bBenesFabric.io.sources(lane)(cfg.dataWidth downto 1) :=
+      mfiu.io.bSources(lane).asBits
+  }
+  if (pipelinedBenesControls) {
+    val startBoth = inputStage.valid && sparseRouteNeedsControl &&
+      !controlsStarted && aPipelinedBenesControls.io.start.ready &&
+      bPipelinedBenesControls.io.start.ready
+    aPipelinedBenesControls.io.start.valid := startBoth
+    bPipelinedBenesControls.io.start.valid := startBoth
+    for (lane <- 0 until cfg.macLanes) {
+      aPipelinedBenesControls.io.start.payload.routeValid(lane) :=
+        mfiu.io.routes(lane).valid
+      bPipelinedBenesControls.io.start.payload.routeValid(lane) :=
+        mfiu.io.routes(lane).valid
+      aPipelinedBenesControls.io.start.payload.sourceIndices(lane) :=
+        mfiu.io.routes(lane).aSourceIndex
+      bPipelinedBenesControls.io.start.payload.sourceIndices(lane) :=
+        mfiu.io.routes(lane).bSourceIndex
+    }
+    when(aPipelinedBenesControls.io.start.fire &&
+        bPipelinedBenesControls.io.start.fire) {
+      controlsStarted := True
+    }
+    routeControlsReady := !sparseRouteNeedsControl ||
+      (aPipelinedBenesControls.io.result.valid &&
+        bPipelinedBenesControls.io.result.valid)
+    aRouteRoutable := !sparseRouteNeedsControl ||
+      (aPipelinedBenesControls.io.result.valid &&
+        aPipelinedBenesControls.io.result.payload.routable)
+    bRouteRoutable := !sparseRouteNeedsControl ||
+      (bPipelinedBenesControls.io.result.valid &&
+        bPipelinedBenesControls.io.result.payload.routable)
+    aBenesFabric.io.controls :=
+      aPipelinedBenesControls.io.result.payload.controls
+    bBenesFabric.io.controls :=
+      bPipelinedBenesControls.io.result.payload.controls
+  } else {
+    for (lane <- 0 until cfg.macLanes) {
+      aBenesControls.io.routeValid(lane) := mfiu.io.routes(lane).valid
+      bBenesControls.io.routeValid(lane) := mfiu.io.routes(lane).valid
+      aBenesControls.io.sourceIndices(lane) := mfiu.io.routes(lane).aSourceIndex
+      bBenesControls.io.sourceIndices(lane) := mfiu.io.routes(lane).bSourceIndex
+    }
+    routeControlsReady := True
+    aRouteRoutable := aBenesControls.io.routable
+    bRouteRoutable := bBenesControls.io.routable
+    aBenesFabric.io.controls := aBenesControls.io.controls
+    bBenesFabric.io.controls := bBenesControls.io.controls
   }
 
   val routed = PERowRoutePayload(cfg)
   routed.mode := input.mode
   routed.endOfTile := input.endOfTile
   routed.selectedColumns := Mux(denseFastPath,
-    U(1, routed.selectedColumns.getWidth bits), columnPacker.io.selectedColumns)
+    U(1, routed.selectedColumns.getWidth bits),
+    Mux(mfiu.io.overflow,
+      U(0, routed.selectedColumns.getWidth bits),
+      CountOne(input.trip.b.map(_.valid).asBits).resized))
   routed.effectualMacs := Mux(denseFastPath,
     U(cfg.fiberWidth, cfg.matchCountWidth bits), mfiu.io.count)
 
@@ -242,20 +300,24 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     val tripValid = Bool()
     val tripAOperand = SInt(cfg.dataWidth bits)
     val tripBOperand = SInt(cfg.dataWidth bits)
+    val benesA = aBenesFabric.io.outputs(lane)
+    val benesB = bBenesFabric.io.outputs(lane)
+    val benesAOperand = benesA(cfg.dataWidth downto 1).asSInt
+    val benesBOperand = benesB(cfg.dataWidth downto 1).asSInt
     if (lane < cfg.fiberWidth) {
       tripValid := Mux(denseFastPath, True, laneRoute.valid)
       tripAFiber := Mux(denseFastPath, denseAFiber, laneRoute.aFiber)
       tripBFiber := Mux(denseFastPath, denseBFiber, laneRoute.bFiber)
       tripAOperand := Mux(denseFastPath, denseA.values(lane),
-        aDistribution.io.outputs(lane))
+        benesAOperand)
       tripBOperand := Mux(denseFastPath, denseB.values(lane),
-        bDistribution.io.outputs(lane))
+        benesBOperand)
     } else {
       tripValid := laneRoute.valid
       tripAFiber := laneRoute.aFiber
       tripBFiber := laneRoute.bFiber
-      tripAOperand := aDistribution.io.outputs(lane)
-      tripBOperand := bDistribution.io.outputs(lane)
+      tripAOperand := benesAOperand
+      tripBOperand := benesBOperand
     }
 
     val gustValid = Bool()
@@ -308,13 +370,26 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       tripBOperand, gustBOperand)
   }
   routed.overflow := Mux(denseFastPath, False,
-    Mux(inputTripMode, mfiu.io.overflow || aDistribution.io.routeError ||
-      bDistribution.io.routeError, gustRouteErrors.orR))
+    Mux(inputTripMode, mfiu.io.overflow ||
+      (mfiu.io.count =/= 0 && (!aRouteRoutable ||
+        !bRouteRoutable)), gustRouteErrors.orR))
 
   val routeInput = Stream(PERowRoutePayload(cfg))
-  routeInput.valid := inputStage.valid
+  routeInput.valid := inputStage.valid && routeControlsReady
   routeInput.payload := routed
-  inputStage.ready := routeInput.ready
+  inputStage.ready := routeInput.ready && routeControlsReady
+  if (pipelinedBenesControls) {
+    val consumeControls = routeInput.fire && sparseRouteNeedsControl
+    aPipelinedBenesControls.io.result.ready := consumeControls
+    bPipelinedBenesControls.io.result.ready := consumeControls
+    when(consumeControls) {
+      controlsStarted := False
+    }
+  }
+  when(routeInput.valid && useSparseTripRoute && mfiu.io.count =/= 0) {
+    assert(aRouteRoutable && bRouteRoutable,
+      "MFIU emitted a route pattern not supported by the Benes solver")
+  }
   val routeStage = routeInput.m2sPipe()
 
   // Stage 2: signed multiplier lanes. Invalid lanes are explicitly zeroed.
@@ -562,4 +637,13 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   io.response.valid := outputStage.valid
   io.response.payload := outputStage.payload
   outputStage.ready := io.response.ready
+
+  when(routeStage.valid) { routeCycleCounter := routeCycleCounter + 1 }
+  when(macStage.valid) { macCycleCounter := macCycleCounter + 1 }
+  when(reductionStage.valid) { mrnCycleCounter := mrnCycleCounter + 1 }
+  when(outputStage.valid) { responseCycleCounter := responseCycleCounter + 1 }
+  io.routeCycles := routeCycleCounter
+  io.macCycles := macCycleCounter
+  io.mrnCycles := mrnCycleCounter
+  io.responseCycles := responseCycleCounter
 }

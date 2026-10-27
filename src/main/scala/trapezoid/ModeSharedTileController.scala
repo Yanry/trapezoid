@@ -46,6 +46,8 @@ class ModeSharedTileController(
     val trgtDone = out Bits(cfg.peRows bits)
     val trgtOverflow = out Bits(cfg.peRows bits)
     val trgtUnsupportedMode = out Bits(cfg.peRows bits)
+    val trgtFifoOccupancy = out Vec(
+      Vec(UInt(gustavsonCfg.fifoCountWidth bits), cfg.localBanks), cfg.peRows)
 
     val trgsCommand = Vec(slave(Stream(TrGsCommand(cfg))), cfg.peRows)
     val trgsResult = Vec(master(Stream(MatrixResult(cfg))), cfg.peRows)
@@ -124,6 +126,9 @@ class ModeSharedTileController(
     io.trgtDone(row) := scheduler.io.done
     io.trgtOverflow(row) := scheduler.io.overflow
     io.trgtUnsupportedMode(row) := scheduler.io.unsupportedMode
+    for (subrow <- 0 until cfg.localBanks) {
+      io.trgtFifoOccupancy(row)(subrow) := scheduler.io.fifoOccupancy(subrow)
+    }
 
     val trgtClaimsRow = io.trgtStart(row).valid && trgtMayStart
     val trgsMayStart = !trip.io.busy && !tripClaimsArray && rowFree &&

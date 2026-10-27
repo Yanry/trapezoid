@@ -263,7 +263,12 @@ class UnifiedEndToEndSystemSpec extends AnyFunSuite {
           dut.clockDomain.waitSampling()
           timeout += 1
         }
-        assert(timeout < 5000, s"mode $mode timed out")
+        assert(timeout < 5000,
+          s"mode $mode timed out phase=${dut.io.trgtPhase.toInt} " +
+            s"schedulerBusy=${dut.io.trgtSchedulerBusy.toBoolean} " +
+            s"fifo=${dut.io.trgtFifoOccupancy.toLong} " +
+            s"assigned=${dut.io.trgtAssignedTiles.toLong} " +
+            s"completed=${dut.io.trgtCompletedTiles.toLong}")
         val doneEdge = edge
         assert(!dut.io.error.toBoolean, s"mode $mode reported an error")
         assert(writes.map(_._1) == (cBase until cBase + expected.size))

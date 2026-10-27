@@ -282,6 +282,88 @@ class BankedReadCacheSpec extends AnyFunSuite {
     }
   }
 
+  test("one client keeps multiple bank misses outstanding and retires in request order") {
+    simConfig.compile(new BankedReadCache(cacheCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.refillRequest.ready #= false
+      dut.io.refillResponse.valid #= false
+      for (client <- 0 until cacheCfg.clientCount) {
+        dut.io.requests(client).valid #= false
+        dut.io.responses(client).ready #= false
+      }
+
+      def issue(address: Int, requestId: Int): Unit = {
+        dut.io.requests(0).payload.address #= address
+        dut.io.requests(0).payload.requestId #= requestId
+        dut.io.requests(0).valid #= true
+        while (!dut.io.requests(0).ready.toBoolean) {
+          dut.clockDomain.waitSampling()
+        }
+        dut.clockDomain.waitSampling()
+        dut.io.requests(0).valid #= false
+      }
+
+      issue(address = 0, requestId = 5)
+      issue(address = 1, requestId = 6)
+      assert(dut.io.clientOutstanding.toBigInt.testBit(0))
+
+      val refills = mutable.ArrayBuffer.empty[(Int, Int)]
+      dut.io.refillRequest.ready #= true
+      var timeout = 0
+      while (refills.size < 2 && timeout < 100) {
+        sleep(1)
+        if (dut.io.refillRequest.valid.toBoolean &&
+            dut.io.refillRequest.ready.toBoolean) {
+          refills += ((dut.io.refillRequest.payload.bank.toInt,
+            dut.io.refillRequest.payload.address.toInt))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      dut.io.refillRequest.ready #= false
+      assert(refills.toSeq == Seq(0 -> 0, 1 -> 1))
+
+      def returnRefill(bank: Int, address: Int): Unit = {
+        dut.io.refillResponse.payload.bank #= bank
+        dut.io.refillResponse.payload.address #= address
+        dut.io.refillResponse.payload.data #= BigInt(address + 1) * 0x01010101L
+        dut.io.refillResponse.payload.error #= false
+        dut.io.refillResponse.valid #= true
+        while (!dut.io.refillResponse.ready.toBoolean) {
+          dut.clockDomain.waitSampling()
+        }
+        dut.clockDomain.waitSampling()
+        dut.io.refillResponse.valid #= false
+      }
+
+      returnRefill(bank = 1, address = 1)
+      sleep(1)
+      assert(!dut.io.responses(0).valid.toBoolean,
+        "the younger bank completion must wait for the older request ID")
+      returnRefill(bank = 0, address = 0)
+
+      dut.io.responses(0).ready #= true
+      val observed = mutable.ArrayBuffer.empty[(Int, BigInt)]
+      timeout = 0
+      while (observed.size < 2 && timeout < 100) {
+        sleep(1)
+        if (dut.io.responses(0).valid.toBoolean) {
+          observed += ((dut.io.responses(0).payload.requestId.toInt,
+            dut.io.responses(0).payload.data.toBigInt))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(observed.toSeq == Seq(
+        5 -> BigInt(0x01010101L),
+        6 -> BigInt(0x02020202L)))
+      sleep(1)
+      assert(!dut.io.clientOutstanding.toBigInt.testBit(0))
+      assert(dut.io.bankBusy.toBigInt == 0)
+    }
+  }
+
   test("set-associative ways retain conflicting tags and replace round robin") {
     val associativeCfg = CacheConfig(
       wordWidth = 8,

@@ -394,15 +394,18 @@ object CachedTrGtState extends SpinalEnum {
 class CachedTrGtSubrowAdapter(
     systemCfg: EndToEndSystemConfig,
     peFactory: TrapezoidConfig => TrapezoidPERowComponent =
-      cfg => new TrapezoidPERow(cfg)
+      cfg => new TrapezoidPERow(cfg),
+    externalScheduler: Boolean = false
 ) extends Component {
   private val cfg = systemCfg.core
   private val gustCfg = systemCfg.gustavson
+  private val tileCfg = gustCfg.tile
   private val cacheCfg = systemCfg.cache
   private val scanIndexWidth = scala.math.max(1, log2Up(cfg.macLanes + 1))
   private val addressIndexWidth = scala.math.max(1, log2Up(cfg.macLanes))
   private val elementIndexWidth = scala.math.max(1, log2Up(gustCfg.elementsPerLine))
   private val subrowIndexWidth = scala.math.max(1, log2Up(cfg.localBanks))
+  private val prefetchDepth = tileCfg.bPrefetchDepth
 
   val io = new Bundle {
     val clear = in Bool()
@@ -419,14 +422,69 @@ class CachedTrGtSubrowAdapter(
     val phase = out UInt(4 bits)
     val schedulerBusy = out Bool()
     val fifoOccupancy = out UInt(16 bits)
+    val schedulerALoad = if (externalScheduler)
+      master(Stream(IndexedGustavsonA(cfg))) else null
+    val schedulerStart = if (externalScheduler)
+      master(Stream(GustavsonStart())) else null
+    val schedulerBPush = if (externalScheduler)
+      Vec(master(Stream(GustavsonB(cfg))), cfg.localBanks) else null
+    val schedulerFinish = if (externalScheduler) out Bool() else null
+    val schedulerResult = if (externalScheduler)
+      slave(Stream(MatrixResult(cfg))) else null
+    val schedulerBusyIn = if (externalScheduler) in Bool() else null
+    val schedulerDoneIn = if (externalScheduler) in Bool() else null
+    val schedulerOverflowIn = if (externalScheduler) in Bool() else null
+    val schedulerUnsupportedModeIn = if (externalScheduler) in Bool() else null
+    val schedulerFifoOccupancyIn = if (externalScheduler)
+      in Vec(UInt(tileCfg.fifoCountWidth bits), cfg.localBanks) else null
   }
 
-  val scheduler = new TrGtSubrowScheduler(gustCfg.tile,
-    peFactory = peFactory)
-  scheduler.io.clear := io.clear
-  io.result <> scheduler.io.result
+  val scheduler = if (externalScheduler) null else new TrGtSubrowScheduler(
+    gustCfg.tile, peFactory = peFactory)
+  val schedulerALoad = Stream(IndexedGustavsonA(cfg))
+  val schedulerStart = Stream(GustavsonStart())
+  val schedulerBPush = Vec(Stream(GustavsonB(cfg)), cfg.localBanks)
+  val schedulerFinish = Bool()
+  val schedulerResult = Stream(MatrixResult(cfg))
+  val schedulerBusySignal = Bool()
+  val schedulerDoneSignal = Bool()
+  val schedulerOverflowSignal = Bool()
+  val schedulerUnsupportedModeSignal = Bool()
+  val schedulerFifoOccupancy = Vec(
+    UInt(tileCfg.fifoCountWidth bits), cfg.localBanks)
+  if (externalScheduler) {
+    io.schedulerALoad << schedulerALoad
+    io.schedulerStart << schedulerStart
+    for (subrow <- 0 until cfg.localBanks) {
+      io.schedulerBPush(subrow) << schedulerBPush(subrow)
+      schedulerFifoOccupancy(subrow) := io.schedulerFifoOccupancyIn(subrow)
+    }
+    io.schedulerFinish := schedulerFinish
+    schedulerResult << io.schedulerResult
+    schedulerBusySignal := io.schedulerBusyIn
+    schedulerDoneSignal := io.schedulerDoneIn
+    schedulerOverflowSignal := io.schedulerOverflowIn
+    schedulerUnsupportedModeSignal := io.schedulerUnsupportedModeIn
+  } else {
+    scheduler.io.aLoad << schedulerALoad
+    scheduler.io.start << schedulerStart
+    for (subrow <- 0 until cfg.localBanks) {
+      scheduler.io.bPush(subrow) << schedulerBPush(subrow)
+      schedulerFifoOccupancy(subrow) := scheduler.io.fifoOccupancy(subrow)
+    }
+    scheduler.io.finish := schedulerFinish
+    schedulerResult << scheduler.io.result
+    schedulerBusySignal := scheduler.io.busy
+    schedulerDoneSignal := scheduler.io.done
+    schedulerOverflowSignal := scheduler.io.overflow
+    schedulerUnsupportedModeSignal := scheduler.io.unsupportedMode
+  }
+  io.result <> schedulerResult
 
   val state = RegInit(CachedTrGtState.Collect)
+  val schedulerTileReset = state === CachedTrGtState.WaitDone &&
+    schedulerDoneSignal && !schedulerBusySignal
+  if (!externalScheduler) scheduler.io.clear := io.clear || schedulerTileReset
   val aValid = Vec((0 until cfg.macLanes).map(_ => RegInit(False)))
   val aStorage = Vec((0 until cfg.macLanes).map(_ => Reg(GustavsonA(cfg))))
   val bBaseStorage = Vec((0 until cfg.macLanes).map(_ =>
@@ -435,10 +493,13 @@ class CachedTrGtSubrowAdapter(
     Reg(UInt(gustCfg.lineCountWidth bits)) init 0))
   val currentIndex = Reg(UInt(scanIndexWidth bits)) init 0
   val requestIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
-  val lineData = Reg(Bits(cacheCfg.lineWidth bits)) init 0
-  val lineValid = RegInit(False)
+  val nextRequestIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
+  val prefetchOccupancy = Reg(UInt(tileCfg.bPrefetchCountWidth bits)) init 0
+  val requestOutstanding = Reg(UInt(tileCfg.bPrefetchCountWidth bits)) init 0
+  val prefetchValid = Vec((0 until prefetchDepth).map(_ => RegInit(False)))
+  val prefetchData = Vec((0 until prefetchDepth).map(_ =>
+    Reg(Bits(cacheCfg.lineWidth bits)) init 0))
   val elementCursor = Reg(UInt(elementIndexWidth bits)) init 0
-  val requestOutstanding = RegInit(False)
   val rowCollectOpen = RegInit(False)
   val doneReg = RegInit(False)
   val overflowReg = RegInit(False)
@@ -454,8 +515,8 @@ class CachedTrGtSubrowAdapter(
   io.addressError := addressErrorReg
   io.unsupportedMode := unsupportedModeReg
   io.phase := state.asBits.asUInt.resize(io.phase.getWidth)
-  io.schedulerBusy := scheduler.io.busy
-  io.fifoOccupancy := scheduler.io.fifoOccupancy
+  io.schedulerBusy := schedulerBusySignal
+  io.fifoOccupancy := schedulerFifoOccupancy
     .map(_.resize(16)).reduce(_ + _).resize(16)
 
   val currentAValid = Bool()
@@ -476,14 +537,17 @@ class CachedTrGtSubrowAdapter(
   }
 
   val lineElements = Vec(TrGsB(cfg), gustCfg.elementsPerLine)
+  val currentPrefetchSlot = requestIndex(tileCfg.bPrefetchSlotWidth - 1 downto 0)
+  val currentLineData = prefetchData(currentPrefetchSlot)
   for (element <- 0 until gustCfg.elementsPerLine) {
     val offset = element * gustCfg.elementWidth
-    lineElements(element).valid := lineData(offset)
+    lineElements(element).valid := prefetchValid(currentPrefetchSlot) &&
+      currentLineData(offset)
     lineElements(element).k := currentA.k
     lineElements(element).value :=
-      lineData(offset + cfg.dataWidth downto offset + 1).asSInt
+      currentLineData(offset + cfg.dataWidth downto offset + 1).asSInt
     lineElements(element).column :=
-      lineData(offset + gustCfg.elementWidth - 1 downto
+      currentLineData(offset + gustCfg.elementWidth - 1 downto
         offset + 1 + cfg.dataWidth).asUInt
   }
 
@@ -502,15 +566,15 @@ class CachedTrGtSubrowAdapter(
   val selectedElementValid = elementChoices.orR
   val selectedElement = lineElements(selectedElementIndex)
 
-  scheduler.io.aLoad.valid := state === CachedTrGtState.Collect &&
+  schedulerALoad.valid := state === CachedTrGtState.Collect &&
     io.rowCommand.valid && io.rowCommand.payload.a.valid
-  scheduler.io.aLoad.payload.index := io.rowCommand.payload.aIndex
-  scheduler.io.aLoad.payload.element := io.rowCommand.payload.a
-  scheduler.io.start.payload.mode := TrapezoidDataflow.TrGt
-  scheduler.io.finish := False
+  schedulerALoad.payload.index := io.rowCommand.payload.aIndex
+  schedulerALoad.payload.element := io.rowCommand.payload.a
+  schedulerStart.payload.mode := TrapezoidDataflow.TrGt
+  schedulerFinish := False
   for (subrow <- 0 until cfg.localBanks) {
-    scheduler.io.bPush(subrow).valid := False
-    scheduler.io.bPush(subrow).payload := GustavsonB(cfg).getZero
+    schedulerBPush(subrow).valid := False
+    schedulerBPush(subrow).payload := GustavsonB(cfg).getZero
   }
 
   val nextAChoices = Bits(cfg.macLanes bits)
@@ -532,22 +596,22 @@ class CachedTrGtSubrowAdapter(
   when(state === CachedTrGtState.EmitLine && selectedElementValid) {
     for (subrow <- 0 until cfg.localBanks) {
       when(currentSubrow === subrow) {
-        scheduler.io.bPush(subrow).valid := True
-        scheduler.io.bPush(subrow).payload.valid := True
-        scheduler.io.bPush(subrow).payload.aIndex := currentIndex.resized
-        scheduler.io.bPush(subrow).payload.k := selectedElement.k
-        scheduler.io.bPush(subrow).payload.column := selectedElement.column
-        scheduler.io.bPush(subrow).payload.value := selectedElement.value
+        schedulerBPush(subrow).valid := True
+        schedulerBPush(subrow).payload.valid := True
+        schedulerBPush(subrow).payload.aIndex := currentIndex.resized
+        schedulerBPush(subrow).payload.k := selectedElement.k
+        schedulerBPush(subrow).payload.column := selectedElement.column
+        schedulerBPush(subrow).payload.value := selectedElement.value
       }
     }
   }
 
   val startWithFirstElement = state === CachedTrGtState.EmitLine &&
     selectedElementValid && !schedulerStarted
-  scheduler.io.start.valid := state === CachedTrGtState.Start ||
+  schedulerStart.valid := state === CachedTrGtState.Start ||
     startWithFirstElement
   when(state === CachedTrGtState.Finish) {
-    scheduler.io.finish := True
+    schedulerFinish := True
   }
 
   val exclusiveEnd = currentBBase.resize(cacheCfg.addressWidth + 1) +
@@ -558,7 +622,7 @@ class CachedTrGtSubrowAdapter(
     (currentLineCount === 0 || exclusiveEnd > addressLimit)
 
   io.rowCommand.ready := !io.clear && state === CachedTrGtState.Collect &&
-    (!io.rowCommand.payload.a.valid || scheduler.io.aLoad.ready)
+    (!io.rowCommand.payload.a.valid || schedulerALoad.ready)
   when(io.rowCommand.fire) {
     doneReg := False
     when(!rowCollectOpen) {
@@ -591,11 +655,11 @@ class CachedTrGtSubrowAdapter(
       }
     }
   }
-  when(state === CachedTrGtState.Start && scheduler.io.start.fire) {
+  when(state === CachedTrGtState.Start && schedulerStart.fire) {
     schedulerStarted := True
     state := CachedTrGtState.Finish
   }
-  when(startWithFirstElement && scheduler.io.start.fire) {
+  when(startWithFirstElement && schedulerStart.fire) {
     schedulerStarted := True
   }
   when(state === CachedTrGtState.FindA) {
@@ -612,33 +676,54 @@ class CachedTrGtSubrowAdapter(
       state := CachedTrGtState.Finish
     } otherwise {
       requestIndex := 0
+      nextRequestIndex := 0
+      prefetchOccupancy := 0
+      requestOutstanding := 0
+      for (slot <- 0 until prefetchDepth) {
+        prefetchValid(slot) := False
+      }
       state := CachedTrGtState.RequestLine
     }
   }
 
-  io.cacheRequest.valid := !io.clear && state === CachedTrGtState.RequestLine &&
-    !requestOutstanding && requestIndex < currentLineCount
-  io.cacheRequest.payload.address := (currentBBase + requestIndex.resized).resized
-  io.cacheRequest.payload.requestId := requestIndex.resized
+  val prefetchHasCapacity = prefetchOccupancy < prefetchDepth
+  val canIssuePrefetch = (state === CachedTrGtState.RequestLine ||
+    state === CachedTrGtState.EmitLine) &&
+    nextRequestIndex < currentLineCount && prefetchHasCapacity
+  io.cacheRequest.valid := !io.clear && canIssuePrefetch
+  io.cacheRequest.payload.address :=
+    (currentBBase + nextRequestIndex.resized).resized
+  io.cacheRequest.payload.requestId := nextRequestIndex.resized
   when(io.cacheRequest.fire) {
-    requestOutstanding := True
-    state := CachedTrGtState.WaitLine
+    nextRequestIndex := nextRequestIndex + 1
   }
-  io.cacheResponse.ready := !io.clear && state === CachedTrGtState.WaitLine &&
-    requestOutstanding
+  io.cacheResponse.ready := !io.clear && state =/= CachedTrGtState.Collect &&
+    requestOutstanding =/= 0
+  val responseSlot = io.cacheResponse.payload.requestId(
+    tileCfg.bPrefetchSlotWidth - 1 downto 0)
   when(io.cacheResponse.fire) {
-    requestOutstanding := False
-    rowCollectOpen := False
     when(io.cacheResponse.payload.error ||
-        io.cacheResponse.payload.requestId =/= requestIndex.resized) {
+        io.cacheResponse.payload.requestId >= currentLineCount) {
       memoryErrorReg := True
       state := CachedTrGtState.Finish
     } otherwise {
-      lineData := io.cacheResponse.payload.data
-      lineValid := True
-      elementCursor := 0
-      state := CachedTrGtState.EmitLine
+      prefetchData(responseSlot) := io.cacheResponse.payload.data
+      prefetchValid(responseSlot) := True
+      when(state === CachedTrGtState.RequestLine &&
+          io.cacheResponse.payload.requestId === requestIndex) {
+        elementCursor := 0
+        state := CachedTrGtState.EmitLine
+      }
     }
+  }
+  switch(io.cacheRequest.fire ## io.cacheResponse.fire) {
+    is(B"10") { requestOutstanding := requestOutstanding + 1 }
+    is(B"01") { requestOutstanding := requestOutstanding - 1 }
+  }
+  when(state === CachedTrGtState.RequestLine &&
+      prefetchValid(currentPrefetchSlot)) {
+    elementCursor := 0
+    state := CachedTrGtState.EmitLine
   }
 
   val laterElement = Bool()
@@ -656,46 +741,50 @@ class CachedTrGtSubrowAdapter(
     selectedElementValid && !laterElement &&
     requestIndex + 1 >= currentLineCount && !laterAChoices.orR
   val terminalElementFire = terminalElement &&
-    scheduler.io.bPush.map(_.fire).reduce(_ || _)
+    schedulerBPush.map(_.fire).reduce(_ || _)
   when(terminalElementFire) {
-    scheduler.io.finish := True
+    schedulerFinish := True
   }
+  val bPushFire = schedulerBPush.map(_.fire).reduce(_ || _)
+  val consumeCurrentLine = state === CachedTrGtState.EmitLine &&
+    ((!selectedElementValid) || (selectedElementValid &&
+      !laterElement && bPushFire))
+  val nextLineIndex = (requestIndex + 1).resized
+  val nextLineSlot = nextLineIndex(
+    tileCfg.bPrefetchSlotWidth - 1 downto 0)
   when(state === CachedTrGtState.EmitLine && selectedElementValid &&
-      scheduler.io.bPush.map(_.fire).reduce(_ || _)) {
+      bPushFire && laterElement) {
+    elementCursor := selectedElementIndex + 1
+  }
+  when(consumeCurrentLine) {
+    prefetchValid(currentPrefetchSlot) := False
     when(terminalElement) {
-      lineValid := False
       currentIndex := (currentIndex + 1).resized
       state := CachedTrGtState.WaitDone
-    } elsewhen(laterElement) {
-      elementCursor := selectedElementIndex + 1
     } otherwise {
-      lineValid := False
       when(requestIndex + 1 < currentLineCount) {
         requestIndex := requestIndex + 1
-        state := CachedTrGtState.RequestLine
+        elementCursor := 0
+        state := Mux(prefetchValid(nextLineSlot),
+          CachedTrGtState.EmitLine, CachedTrGtState.RequestLine)
       } otherwise {
         currentIndex := (currentIndex + 1).resized
         state := CachedTrGtState.FindA
       }
     }
   }
-  when(state === CachedTrGtState.EmitLine && !selectedElementValid) {
-    lineValid := False
-    when(requestIndex + 1 < currentLineCount) {
-      requestIndex := requestIndex + 1
-      state := CachedTrGtState.RequestLine
-    } otherwise {
-      currentIndex := (currentIndex + 1).resized
-      state := CachedTrGtState.FindA
-    }
+  switch(io.cacheRequest.fire ## consumeCurrentLine) {
+    is(B"10") { prefetchOccupancy := prefetchOccupancy + 1 }
+    is(B"01") { prefetchOccupancy := prefetchOccupancy - 1 }
   }
 
   when(state === CachedTrGtState.Finish) {
     state := CachedTrGtState.WaitDone
   }
-  when(state === CachedTrGtState.WaitDone && scheduler.io.done &&
-      !scheduler.io.busy) {
-    overflowReg := scheduler.io.overflow
+  when(state === CachedTrGtState.WaitDone && schedulerDoneSignal &&
+      !schedulerBusySignal) {
+    overflowReg := schedulerOverflowSignal
+    unsupportedModeReg := schedulerUnsupportedModeSignal
     doneReg := True
     state := CachedTrGtState.Collect
   }
@@ -704,8 +793,12 @@ class CachedTrGtSubrowAdapter(
     state := CachedTrGtState.Collect
     currentIndex := 0
     requestIndex := 0
-    lineValid := False
-    requestOutstanding := False
+    nextRequestIndex := 0
+    prefetchOccupancy := 0
+    requestOutstanding := 0
+    for (slot <- 0 until prefetchDepth) {
+      prefetchValid(slot) := False
+    }
     doneReg := False
     overflowReg := False
     memoryErrorReg := False
@@ -720,7 +813,8 @@ class CachedTrGtSubrowAdapter(
 class CachedTrGtRowScheduler(
     systemCfg: EndToEndSystemConfig,
     peFactory: TrapezoidConfig => TrapezoidPERowComponent =
-      cfg => new TrapezoidPERow(cfg)
+      cfg => new TrapezoidPERow(cfg),
+    externalSchedulers: Boolean = false
 ) extends Component {
   private val cfg = systemCfg.core
   private val gustCfg = systemCfg.gustavson
@@ -744,11 +838,40 @@ class CachedTrGtRowScheduler(
     val phase = out UInt(4 bits)
     val schedulerBusy = out Bool()
     val fifoOccupancy = out UInt(16 bits)
+    val schedulerALoad = if (externalSchedulers)
+      Vec(master(Stream(IndexedGustavsonA(cfg))), cfg.peRows) else null
+    val schedulerStart = if (externalSchedulers)
+      Vec(master(Stream(GustavsonStart())), cfg.peRows) else null
+    val schedulerBPush = if (externalSchedulers)
+      Vec(Vec(master(Stream(GustavsonB(cfg))), cfg.localBanks), cfg.peRows)
+      else null
+    val schedulerFinish = if (externalSchedulers) out Bits(cfg.peRows bits)
+      else null
+    val schedulerResult = if (externalSchedulers)
+      Vec(slave(Stream(MatrixResult(cfg))), cfg.peRows) else null
+    val schedulerBusyIn = if (externalSchedulers) in Bits(cfg.peRows bits)
+      else null
+    val schedulerDoneIn = if (externalSchedulers) in Bits(cfg.peRows bits)
+      else null
+    val schedulerOverflowIn = if (externalSchedulers) in Bits(cfg.peRows bits)
+      else null
+    val schedulerUnsupportedModeIn = if (externalSchedulers)
+      in Bits(cfg.peRows bits) else null
+    val schedulerFifoOccupancyIn = if (externalSchedulers)
+      in Vec(Vec(UInt(gustCfg.tile.fifoCountWidth bits), cfg.localBanks),
+        cfg.peRows) else null
   }
 
   val adapters = Array.fill(cfg.peRows)(
-    new CachedTrGtSubrowAdapter(systemCfg, peFactory))
+    new CachedTrGtSubrowAdapter(systemCfg, peFactory, externalSchedulers))
+  // Keep one complete packed group behind the group currently executing.
+  // This is the control-side half of the paper's double-buffered temporal
+  // schedule; B-line data remains in the adapter's reorder window.
+  private val groupFifoDepth = 2 * cfg.localBanks
+  val commandFifos = Array.fill(cfg.peRows)(
+    StreamFifo(CachedGustavsonBRowCommand(gustCfg), groupFifoDepth))
   val allocated = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
+  val groupStarted = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
   val inputActive = RegInit(False)
   val inputRow = Reg(UInt(rowIndexWidth bits)) init 0
   val usedSubrows = Reg(UInt(log2Up(cfg.localBanks + 1) bits)) init 0
@@ -757,8 +880,27 @@ class CachedTrGtRowScheduler(
 
   for (row <- 0 until cfg.peRows) {
     adapters(row).io.clear := io.clear
+    commandFifos(row).io.flush := io.clear
+    adapters(row).io.rowCommand << commandFifos(row).io.pop
     io.cacheRequests(row) <> adapters(row).io.cacheRequest
     adapters(row).io.cacheResponse <> io.cacheResponses(row)
+    if (externalSchedulers) {
+      io.schedulerALoad(row) << adapters(row).io.schedulerALoad
+      io.schedulerStart(row) << adapters(row).io.schedulerStart
+      for (subrow <- 0 until cfg.localBanks) {
+        io.schedulerBPush(row)(subrow) <<
+          adapters(row).io.schedulerBPush(subrow)
+        adapters(row).io.schedulerFifoOccupancyIn(subrow) :=
+          io.schedulerFifoOccupancyIn(row)(subrow)
+      }
+      io.schedulerFinish(row) := adapters(row).io.schedulerFinish
+      adapters(row).io.schedulerResult <> io.schedulerResult(row)
+      adapters(row).io.schedulerBusyIn := io.schedulerBusyIn(row)
+      adapters(row).io.schedulerDoneIn := io.schedulerDoneIn(row)
+      adapters(row).io.schedulerOverflowIn := io.schedulerOverflowIn(row)
+      adapters(row).io.schedulerUnsupportedModeIn :=
+        io.schedulerUnsupportedModeIn(row)
+    }
   }
 
   val freeChoices = Vec(Bool(), cfg.peRows)
@@ -815,15 +957,15 @@ class CachedTrGtRowScheduler(
   routedPayload := Mux(flushGroup, flushCommand, packedCommand)
   io.rowCommand.ready := False
   for (row <- 0 until cfg.peRows) {
-    adapters(row).io.rowCommand.valid := routedValid && selectedInputRow === row
-    adapters(row).io.rowCommand.payload := routedPayload
+    commandFifos(row).io.push.valid := routedValid && selectedInputRow === row
+    commandFifos(row).io.push.payload := routedPayload
     when(inputRouteValid && selectedInputRow === row) {
-      io.rowCommand.ready := adapters(row).io.rowCommand.ready && !flushGroup
+      io.rowCommand.ready := commandFifos(row).io.push.ready && !flushGroup
     }
   }
 
-  val routedFire = adapters.zipWithIndex.map { case (adapter, row) =>
-    adapter.io.rowCommand.fire && selectedInputRow === row
+  val routedFire = commandFifos.zipWithIndex.map { case (fifo, row) =>
+    fifo.io.push.fire && selectedInputRow === row
   }.reduce(_ || _)
   when(routedFire && flushGroup) {
     inputActive := False
@@ -833,7 +975,10 @@ class CachedTrGtRowScheduler(
   when(io.rowCommand.fire && !flushGroup) {
     when(!inputActive) {
       for (row <- 0 until cfg.peRows) {
-        when(selectedInputRow === row) { allocated(row) := True }
+        when(selectedInputRow === row) {
+          allocated(row) := True
+          groupStarted(row) := False
+        }
       }
       inputRow := selectedInputRow
     }
@@ -851,9 +996,16 @@ class CachedTrGtRowScheduler(
 
   val completionBits = Bits(cfg.peRows bits)
   for (row <- 0 until cfg.peRows) {
-    completionBits(row) := allocated(row) && adapters(row).io.done &&
-      !adapters(row).io.busy
-    when(completionBits(row)) { allocated(row) := False }
+    when(allocated(row) && adapters(row).io.busy) {
+      groupStarted(row) := True
+    }
+    completionBits(row) := allocated(row) && groupStarted(row) &&
+      adapters(row).io.done && !adapters(row).io.busy &&
+      !commandFifos(row).io.pop.valid
+    when(completionBits(row)) {
+      allocated(row) := False
+      groupStarted(row) := False
+    }
   }
   val completionsThisCycle = CountOne(completionBits).resize(32)
   when(completionsThisCycle =/= 0) {
@@ -911,7 +1063,10 @@ class CachedTrGtRowScheduler(
   }
 
   when(io.clear) {
-    for (row <- 0 until cfg.peRows) allocated(row) := False
+    for (row <- 0 until cfg.peRows) {
+      allocated(row) := False
+      groupStarted(row) := False
+    }
     inputActive := False
     outputLocked := False
     usedSubrows := 0
@@ -1081,6 +1236,7 @@ class UnifiedEndToEndSystem(
   private val includeTrGt = hardwareProfile.includeTrGt
   private val includeTrGs = hardwareProfile.includeTrGs
   private val includeGustavson = includeTrGt || includeTrGs
+  private val useSharedArray = hardwareProfile == EndToEndHardwareProfile.Unified
   private val requiredCacheClients =
     (if (includeIp) 2 * ipReaderLanes else 0) +
       (if (includeGustavson) 1 else 0) +
@@ -1089,16 +1245,21 @@ class UnifiedEndToEndSystem(
   require(cacheCfg.clientCount >= requiredCacheClients,
     s"$hardwareProfile needs at least $requiredCacheClients cache clients")
 
+  val sharedTile = if (useSharedArray) new ModeSharedTileController(
+    matrixCfg.tile, gustCfg.tile, wideTrGsOutput = false) else null
   val ip = if (includeIp) new TrIpCachedMatrixController(
-    matrixCfg, cacheCfg, ipReaderLanes, peFactory) else null
+    matrixCfg, cacheCfg, ipReaderLanes, peFactory,
+    externalTileController = useSharedArray) else null
   val csr = if (includeGustavson)
     new CsrGustavsonDescriptorFrontend(systemCfg) else null
   val trgtScheduler = if (includeTrGt)
-    new CachedTrGtRowScheduler(systemCfg, peFactory) else null
+    new CachedTrGtRowScheduler(systemCfg, peFactory,
+      externalSchedulers = useSharedArray) else null
   val trgsAdapter = if (includeTrGs) new GustavsonBRowCacheAdapter(gustCfg,
     allowTrGt = false, allowTrGs = true, emitSpatialCommand = true) else null
   val trgsScheduler = if (includeTrGs) new TrGsSpatialRowScheduler(
-    gustCfg.tile, peFactory, wideOutput = false) else null
+    gustCfg.tile, peFactory, wideOutput = false,
+    externalArray = useSharedArray) else null
   val cache = new ClusteredReadCache(systemCfg.clusters)
   val writeback = new ResultWritebackDma(systemCfg)
 
@@ -1114,6 +1275,47 @@ class UnifiedEndToEndSystem(
   }
   cache.io.clear := io.clear
   writeback.io.clear := io.clear
+  if (useSharedArray) {
+    sharedTile.io.clear := io.clear
+    sharedTile.io.tripALoad <> ip.io.tileALoad
+    sharedTile.io.tripBLoad <> ip.io.tileBLoad
+    sharedTile.io.tripStart <> ip.io.tileStart
+    ip.io.tileResult <> sharedTile.io.tripResult
+    ip.io.tileDone := sharedTile.io.tripDone
+    ip.io.tileUnsupportedMode := sharedTile.io.tripUnsupportedMode
+
+    for (row <- 0 until cfg.peRows) {
+      sharedTile.io.trgtALoad(row) <> trgtScheduler.io.schedulerALoad(row)
+      sharedTile.io.trgtStart(row) <> trgtScheduler.io.schedulerStart(row)
+      for (subrow <- 0 until cfg.localBanks) {
+        sharedTile.io.trgtBPush(row)(subrow) <>
+          trgtScheduler.io.schedulerBPush(row)(subrow)
+        trgtScheduler.io.schedulerFifoOccupancyIn(row)(subrow) :=
+          sharedTile.io.trgtFifoOccupancy(row)(subrow)
+      }
+      sharedTile.io.trgtFinish(row) := trgtScheduler.io.schedulerFinish(row)
+      trgtScheduler.io.schedulerResult(row) <>
+        sharedTile.io.trgtResult(row)
+      trgtScheduler.io.schedulerBusyIn(row) := sharedTile.io.trgtBusy(row)
+      trgtScheduler.io.schedulerDoneIn(row) := sharedTile.io.trgtDone(row)
+      trgtScheduler.io.schedulerOverflowIn(row) :=
+        sharedTile.io.trgtOverflow(row)
+      trgtScheduler.io.schedulerUnsupportedModeIn(row) :=
+        sharedTile.io.trgtUnsupportedMode(row)
+
+      sharedTile.io.trgsCommand(row) <>
+        trgsScheduler.io.rowCommands(row)
+      trgsScheduler.io.rowResults(row) <>
+        sharedTile.io.trgsResult(row)
+      trgsScheduler.io.rowResultLines(row) <>
+        sharedTile.io.trgsResultLine(row)
+    }
+    trgsScheduler.io.rowBusy := sharedTile.io.trgsBusy
+    trgsScheduler.io.rowDone := sharedTile.io.trgsDone
+    trgsScheduler.io.rowOverflow := sharedTile.io.trgsOverflow
+    trgsScheduler.io.rowUnsupportedMode :=
+      sharedTile.io.trgsUnsupportedMode
+  }
 
   io.busy := state =/= UnifiedEndToEndState.Idle
   io.done := doneReg

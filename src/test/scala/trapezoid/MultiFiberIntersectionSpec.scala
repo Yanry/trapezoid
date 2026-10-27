@@ -28,6 +28,11 @@ class MultiFiberIntersectionSpec extends AnyFunSuite {
       aSourceIndex: Int,
       bSourceIndex: Int)
 
+  private def spreadSourceIndex(index: Int): Int = {
+    val width = cfg.macLaneIndexWidth
+    ((index << 1) & ((1 << width) - 1)) | (index >> (width - 1))
+  }
+
   test("hierarchical compactor preserves pair-major routes and overflow count") {
     SimConfig.withVerilator
       .addSimulatorFlag("-CFLAGS -std=c++14")
@@ -100,10 +105,16 @@ class MultiFiberIntersectionSpec extends AnyFunSuite {
             coordinate,
             Integer.bitCount(aMasks(a) & ((1 << coordinate) - 1)),
             Integer.bitCount(bMasks(b) & ((1 << coordinate) - 1)),
-            aSourceBase(a) + Integer.bitCount(activeACoordinates(a) &
-              ((1 << coordinate) - 1)),
-            bSourceBase(b) + Integer.bitCount(activeBCoordinates(b) &
-              ((1 << coordinate) - 1)))
+            {
+              val rank = aSourceBase(a) + Integer.bitCount(activeACoordinates(a) &
+                ((1 << coordinate) - 1))
+              spreadSourceIndex(rank)
+            },
+            {
+              val rank = bSourceBase(b) + Integer.bitCount(activeBCoordinates(b) &
+                ((1 << coordinate) - 1))
+              spreadSourceIndex(rank)
+            })
 
           assert(dut.io.count.toInt == expected.length)
           assert(dut.io.overflow.toBoolean == (expected.length > cfg.macLanes))
@@ -126,15 +137,16 @@ class MultiFiberIntersectionSpec extends AnyFunSuite {
           val observedAValid = dut.io.aSourceValid.toBigInt
           val observedBValid = dut.io.bSourceValid.toBigInt
           for (lane <- 0 until cfg.macLanes) {
-            if (lane < expectedASources.length) {
+            val compactedIndex = (lane % 2) * (cfg.macLanes / 2) + lane / 2
+            if (compactedIndex < expectedASources.length) {
               assert(observedAValid.testBit(lane))
-              assert(dut.io.aSources(lane).toInt == expectedASources(lane))
+              assert(dut.io.aSources(lane).toInt == expectedASources(compactedIndex))
             } else {
               assert(!observedAValid.testBit(lane))
             }
-            if (lane < expectedBSources.length) {
+            if (compactedIndex < expectedBSources.length) {
               assert(observedBValid.testBit(lane))
-              assert(dut.io.bSources(lane).toInt == expectedBSources(lane))
+              assert(dut.io.bSources(lane).toInt == expectedBSources(compactedIndex))
             } else {
               assert(!observedBValid.testBit(lane))
             }

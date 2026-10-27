@@ -1154,7 +1154,8 @@ class TrGsSpatialRowScheduler(
     tileCfg: GustavsonTileConfig,
     peFactory: TrapezoidConfig => TrapezoidPERowComponent =
       cfg => new TrapezoidPERow(cfg),
-    wideOutput: Boolean = false
+    wideOutput: Boolean = false,
+    externalArray: Boolean = false
 ) extends Component {
   private val cfg = tileCfg.core
   private val rowIndexWidth = scala.math.max(1, log2Up(cfg.peRows))
@@ -1170,13 +1171,53 @@ class TrGsSpatialRowScheduler(
     val unsupportedMode = out Bits(cfg.peRows bits)
     val assignedTiles = out UInt(32 bits)
     val completedTiles = out UInt(32 bits)
+    val rowCommands = if (externalArray)
+      Vec(master(Stream(TrGsCommand(cfg))), cfg.peRows) else null
+    val rowResults = if (externalArray)
+      Vec(slave(Stream(MatrixResult(cfg))), cfg.peRows) else null
+    val rowResultLines = if (externalArray)
+      Vec(slave(Stream(MatrixResultLine(cfg))), cfg.peRows) else null
+    val rowBusy = if (externalArray) in Bits(cfg.peRows bits) else null
+    val rowDone = if (externalArray) in Bits(cfg.peRows bits) else null
+    val rowOverflow = if (externalArray) in Bits(cfg.peRows bits) else null
+    val rowUnsupportedMode = if (externalArray)
+      in Bits(cfg.peRows bits) else null
   }
 
-  val array = new TrGsSpatialArray(tileCfg, peFactory, wideOutput)
-  array.io.clear := io.clear
-  io.busy := array.io.busy
-  io.overflow := array.io.overflow
-  io.unsupportedMode := array.io.unsupportedMode
+  val array = if (externalArray) null
+    else new TrGsSpatialArray(tileCfg, peFactory, wideOutput)
+  val rowCommands = Vec(Stream(TrGsCommand(cfg)), cfg.peRows)
+  val rowResults = Vec(Stream(MatrixResult(cfg)), cfg.peRows)
+  val rowResultLines = Vec(Stream(MatrixResultLine(cfg)), cfg.peRows)
+  val rowBusy = Bits(cfg.peRows bits)
+  val rowDone = Bits(cfg.peRows bits)
+  val rowOverflow = Bits(cfg.peRows bits)
+  val rowUnsupportedMode = Bits(cfg.peRows bits)
+  if (externalArray) {
+    for (row <- 0 until cfg.peRows) {
+      io.rowCommands(row) << rowCommands(row)
+      rowResults(row) << io.rowResults(row)
+      rowResultLines(row) << io.rowResultLines(row)
+    }
+    rowBusy := io.rowBusy
+    rowDone := io.rowDone
+    rowOverflow := io.rowOverflow
+    rowUnsupportedMode := io.rowUnsupportedMode
+  } else {
+    array.io.clear := io.clear
+    for (row <- 0 until cfg.peRows) {
+      array.io.commands(row) << rowCommands(row)
+      rowResults(row) << array.io.results(row)
+      rowResultLines(row) << array.io.resultLines(row)
+    }
+    rowBusy := array.io.busy
+    rowDone := array.io.done
+    rowOverflow := array.io.overflow
+    rowUnsupportedMode := array.io.unsupportedMode
+  }
+  io.busy := rowBusy
+  io.overflow := rowOverflow
+  io.unsupportedMode := rowUnsupportedMode
 
   val allocated = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
   val closing = Vec((0 until cfg.peRows).map(_ => RegInit(False)))
@@ -1206,11 +1247,11 @@ class TrGsSpatialRowScheduler(
   val inputRouteValid = inputActive || freeFound
   io.command.ready := False
   for (row <- 0 until cfg.peRows) {
-    array.io.commands(row).valid := io.command.valid && inputRouteValid &&
+    rowCommands(row).valid := io.command.valid && inputRouteValid &&
       selectedInputRow === row
-    array.io.commands(row).payload := io.command.payload
+    rowCommands(row).payload := io.command.payload
     when(inputRouteValid && selectedInputRow === row) {
-      io.command.ready := array.io.commands(row).ready
+      io.command.ready := rowCommands(row).ready
     }
   }
 
@@ -1235,7 +1276,7 @@ class TrGsSpatialRowScheduler(
 
   val completionBits = Bits(cfg.peRows bits)
   for (row <- 0 until cfg.peRows) {
-    completionBits(row) := allocated(row) && closing(row) && array.io.done(row)
+    completionBits(row) := allocated(row) && closing(row) && rowDone(row)
     when(completionBits(row)) {
       allocated(row) := False
       closing(row) := False
@@ -1249,8 +1290,8 @@ class TrGsSpatialRowScheduler(
   val outputChoices = Vec(Bool(), cfg.peRows)
   var earlierOutput: Bool = False
   for (row <- 0 until cfg.peRows) {
-    val rowValid = if (wideOutput) array.io.resultLines(row).valid
-      else array.io.results(row).valid
+    val rowValid = if (wideOutput) rowResultLines(row).valid
+      else rowResults(row).valid
     outputChoices(row) := rowValid && !earlierOutput
     earlierOutput = earlierOutput || rowValid
   }
@@ -1272,20 +1313,20 @@ class TrGsSpatialRowScheduler(
   io.resultLine.payload := MatrixResultLine(cfg).getZero
   for (row <- 0 until cfg.peRows) {
     if (wideOutput) {
-      array.io.results(row).ready := False
-      array.io.resultLines(row).ready := io.resultLine.ready &&
+      rowResults(row).ready := False
+      rowResultLines(row).ready := io.resultLine.ready &&
         outputRouteValid && selectedOutputRow === row
       when(outputRouteValid && selectedOutputRow === row) {
-        io.resultLine.valid := array.io.resultLines(row).valid
-        io.resultLine.payload := array.io.resultLines(row).payload
+        io.resultLine.valid := rowResultLines(row).valid
+        io.resultLine.payload := rowResultLines(row).payload
       }
     } else {
-      array.io.resultLines(row).ready := False
-      array.io.results(row).ready := io.result.ready && outputRouteValid &&
+      rowResultLines(row).ready := False
+      rowResults(row).ready := io.result.ready && outputRouteValid &&
         selectedOutputRow === row
       when(outputRouteValid && selectedOutputRow === row) {
-        io.result.valid := array.io.results(row).valid
-        io.result.payload := array.io.results(row).payload
+        io.result.valid := rowResults(row).valid
+        io.result.payload := rowResults(row).payload
       }
     }
   }

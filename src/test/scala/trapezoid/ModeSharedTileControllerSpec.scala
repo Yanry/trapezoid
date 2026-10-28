@@ -106,6 +106,7 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
       assert(ownerPosition == LocalBufferOwner.TrIp.position)
 
       dut.io.trgtALoad(0).payload.index #= 0
+      dut.io.trgtALoad(0).payload.groupId #= false
       dut.io.trgtALoad(0).payload.element.valid #= true
       dut.io.trgtALoad(0).payload.element.row #= 6
       dut.io.trgtALoad(0).payload.element.k #= 0
@@ -118,6 +119,7 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
       dut.io.trgtALoad(0).valid #= false
 
       dut.io.trgtStart(0).payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.trgtStart(0).payload.groupId #= false
       dut.io.trgtStart(0).valid #= true
       while (!dut.io.trgtStart(0).ready.toBoolean) {
         dut.clockDomain.waitSampling()

@@ -274,9 +274,9 @@ TrGt 的 B 输入通过四个独立 subrow FIFO temporally gather。最终 B 元
 
 当前 cached TrGT scheduler 已按 A-row occupancy 做 subrow packing。CSR command 携带 `aRowLength`，一行需要的 subrow 数为 `ceil(aRowLength / macLanesPerSubrow)`；短行可与后续行共享同一个 PE row 的四个 subrow，长行可连续占用多个 subrow。四个 subrow 填满、下一行放不下或 CSR 输入结束时关闭 packed tile。完成判断使用 packed tile 的 `assignedTiles/completedTiles`，不再把 CSR 非空行数误当成 TrGT tile 数。
 
-TrGT adapter 现在有两个 group descriptor/context 和两套独立 B reorder window。当前 group 执行时可以继续接收下一 group 的 A metadata，并为下一 ready group 的第一个有效 A 提前发出 B-line request。共享 cache 端口优先服务 execute group，当前 group 暂时没有 request 时才服务 background group。每组独立保存 `prefetchAIndex`、line count、next request、outstanding、occupancy、valid/data slots；request ID 编码 `groupId + lineId`，response 可在两个 group 之间乱序返回。group 仍按 `Fill -> Ready -> LoadA/Execute -> Drain` 顺序交接。
+TrGT adapter 现在有两个 group descriptor/context、两套 A load cursor 和两套独立 B reorder window。`IndexedGustavsonA` 与 `GustavsonStart` 都携带 `groupId`；`TrGtSubrowScheduler` 内部保存两套按 subrow 划分的 A context，并允许当前 context 运行时写入 inactive context。当前 group 执行时，adapter 可以同时把下一 ready group 的全部有效 A 写入另一套 context，并为它的第一个有效 A 提前发出 B-line request。共享 cache 端口优先服务 execute group，当前 group 暂时没有 request 时才服务 background group。每组独立保存 A load completion、`prefetchAIndex`、line count、next request、outstanding、occupancy、valid/data slots；request ID 编码 `groupId + lineId`，response 可在两个 group 之间乱序返回。group 按 `Fill -> Ready/A-load -> Execute -> Drain` 交接，获得 ownership 时若 A context 已准备好，不再重新串行加载 A。
 
-这比上一版进一步形成了真实跨 group miss overlap，但仍不是完整论文 ping-pong：background 目前只预取下一 group 第一个 A 对应的有限深度 B window，下一 group 的 A 尚未并行写入另一套 scheduler-local A SRAM，后续 A/B windows 也要等该 group 获得 execute ownership。完整 steady-state 仍需要两套可切换的 A/B local context 或等价的 bank ownership。
+这比上一版进一步形成了 A load 与 B miss 的跨 group overlap，但仍不是完整论文 ping-pong：两套 A context 目前是 scheduler-local register banks，还没有映射为共享物理 SRAM 的两个 context；background 只预取下一 group 第一个 A 对应的有限深度 B window，后续 A/B windows 仍要等该 group 获得 execute ownership。完整 steady-state 还需要 SRAM bank/context ownership 和整组连续 B refill。
 
 ### 5.4 `TrGs`
 
@@ -378,7 +378,7 @@ final C write response consumed
 - 论文原始 FPGA/ASIC 的频率、NoC 和功耗；
 - 128-row full paper array 的已完成周期结果，除非确实完成对应仿真。
 
-默认小规模 RTL 仿真于 2026-10-28 使用上述命令重新验证，72 个 case 的结果、write 数和 checksum 全部通过。统一系统 Verilator 编译约 501 秒，72-case 仿真约 217 秒；这些主机时间不计入硬件周期。汇总周期如下，单元为 cycle，数值是每类 3 个 sample 的平均值：
+默认小规模 RTL 仿真于 2026-10-28 使用上述命令重新验证，72 个 case 的结果、write 数和 checksum 全部通过。统一系统 Verilator 编译约 497 秒，72-case 仿真约 225 秒；这些主机时间不计入硬件周期。汇总周期如下，单元为 cycle，数值是每类 3 个 sample 的平均值：
 
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
@@ -391,7 +391,7 @@ final C write response consumed
 
 这些数字来自同一个共享 `ModeSharedTileController`、同一套 PE row/local storage、cluster ROB 和 cold-cache 模型。`HS x MS/D` 下 TrGS 最快，`MS x MS/D` 下 TrIP 最快，`D x D` 下 DenseIp 最快；这三组推荐方向与论文一致。`HS x HS` 仍是 TrGS 的 350 cycle 小于 TrGT 的 401 cycle，原因是 16x16、0.39% A 只有一个非零，TrGT 的 subrow packing 没有第二条短 row 可合并，却仍要完成 CSR 扫描和 packed-group close。其 first C write 为 392 cycle，而 TrGS 为 110 cycle。
 
-本轮加入双 group 独立 B reorder window 后，7.1 周期与上一版一致。定向 RTL 测试已经证明下一 group 的首个 B window 可以在当前 group 停留于 execute/drain 阶段时完成 request/refill，但当前 16x16 benchmark 的 packed-group 长度和调度没有形成可观察的额外重叠收益。TrGT 在 `MS x D` 和 `D x D` 中仍分别为 24087.7 和 58353 cycle，主要瓶颈仍是单 node ordered merge、按 column/local-bank 的大量命令，以及后续 A/B window 未跨 group 全重叠。
+本轮加入双 group A context、独立 A load cursor 和双 B reorder window 后，7.1 周期仍与上一版一致。定向 RTL 测试已经证明：当前 group 尚未完成时，下一 group 的全部有效 A 已写入 inactive context，首个 B window 也可完成 request/refill；两组连续执行的数值结果不会串组。但当前 16x16 benchmark 的 packed-group 长度和调度没有形成可观察的额外重叠收益。TrGT 在 `MS x D` 和 `D x D` 中仍分别为 24087.7 和 58353 cycle，主要瓶颈仍是单 node ordered merge、按 column/local-bank 的大量命令，以及 background 只覆盖首个 B window。
 
 ### 7.2 `PaperSinglePERowCycleSimulation`
 
@@ -440,7 +440,7 @@ scripts/run-paper-single-perow.sh
 
 测试还输出 `controlPrepareCycles`、`route`、`MAC`、`MRN`、`response` 五个 counter，以及 `commandCount`、`responseCount`、`usefulMacs`、`laneSlots` 和 checksum。`controlPrepareCycles` 表示 cold route 阻塞；其余四个是各 stage 持有 valid payload 的 occupancy delta，不是互斥阶段延迟，也不包含 CSR/DMA/cache/C write。完整端到端周期仍以 7.1 的最终 C write response 为准。
 
-本次成功的全量层次化构建中，paper kernel 生成约 252 秒，Verilator 编译约 664 秒，24-case RTL 仿真约 61 秒。运行时间不属于表中的硬件 cycle。
+本次成功的全量层次化构建中，paper kernel 生成约 257 秒，Verilator 编译约 672 秒，24-case RTL 仿真约 61 秒。运行时间不属于表中的硬件 cycle。本轮修改位于 TrGT frontend/group scheduler，不在 7.2 的独立 `TrapezoidPERow` command-to-response 边界内，因此 7.2 数值保持不变；重新运行用于确认接口和 paper-width RTL 没有回归。
 
 ### 7.3 Full paper array 的状态
 
@@ -476,7 +476,7 @@ paper profile 已配置为论文的 4 clusters、128 banks、16-way、64 B line 
 
 TrIP 主路径已对当前 MFIU 合法 pattern 生成完整 A/B Benes controls，`routable` 失败会断言，旧 fallback 选择树已删除。4-entry route-control cache 让重复 pattern 不再逐命令阻塞约 263 cycle，并新增 `controlPrepareCycles`。仍有差距：冷 pattern 仍由工程自定义的多周期递归 solver 生成；paper 宽度还没有 metadata-only 多 entry FIFO、约 7-stage/II=1 的冷 control pipeline，也未用论文版门级结构、布线约束和目标频率综合验证。
 
-论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows。当前 scheduler 已实现 occupancy-aware 多行 packing、长行多 subrow 占用、两个 group descriptor/A context，以及每组独立 B reorder window。background group 可以在当前 group 执行期间预取第一个 A 的有限 B window；仍缺少下一 group A 的并行 local-SRAM load、后续 B windows 连续 refill，以及与 streaming merge 的整组 steady-state 重叠。
+论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows。当前 scheduler 已实现 occupancy-aware 多行 packing、长行多 subrow 占用、两个 group descriptor/A context，以及每组独立 B reorder window。background group 可以在当前 group 执行期间把全部有效 A 写入 inactive register context，并预取第一个 A 的有限 B window；仍缺少把两个 A context 映射到共享物理 SRAM、后续 B windows 连续 refill，以及与 streaming merge 的整组 steady-state 重叠。
 
 `StreamingGustavsonTileEngine` 已使用双 buffer、banked storage 和单个 ready/valid 双模式 MRN node 做 ordered merge，旧全关联插入 accumulator 不再位于 streaming 主路径。`BankedLocalBuffer` 和 cache data/tag 已绑定可仿真的同步 SRAM BlackBox。剩余差距是 PE 内 segmented tree 和 TrGS spatial path 还未统一到同一组双模式 MRN nodes；SRAM BlackBox 也尚未映射目标工艺 macro 并验证真实端口、读延迟和功耗。
 
@@ -511,7 +511,7 @@ utilization = usefulMacs / laneSlots
 
 按优先级建议：
 
-1. 在现有双 B reorder window 基础上，为下一 group 增加独立 A local-SRAM context，并让 background refill 从首个 A window 扩展到整组连续 A/B windows；group 获得 execute ownership 时应直接进入 ready state，而不是重新执行 A load/refill。
+1. 将现有双 A register context 映射为共享物理 SRAM 的双 context/bank ownership，并让 background refill 从首个 A window 扩展到整组连续 B windows；保持 group 获得 execute ownership 时直接进入 ready state，不重新执行 A load/refill。
 2. 将冷 Benes control generation 改为真正的受限-pattern metadata pipeline：MFIU compaction 同时生成各级 switch metadata，约 7 stage、II=1；增加 metadata FIFO/control FIFO，并保留 `routable` assertion 和 `controlPrepareCycles`，最终删除冷路径上的通用图着色 solver。
 3. 将 PE 内 segmented reduction、TrGS spatial accumulation 和 Gustavson ordered merge 统一到可配置的双模式 MRN node/tree，测量 backpressure 下的 II、面积和关键路径，并避免当前单 node merge 对 dense Gustavson workload 的串行化。
 4. 将每 bank 一个 miss context 扩展为真正的多 MSHR，增加 cluster-level refill channel arbitration/reorder 与多个外部 refill streams；为相同 set/bank 冲突加入 replay。

@@ -220,7 +220,9 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
   }
 
   private def loadA(dut: TrGtSubrowScheduler, index: Int,
-                    row: Int, k: Int, value: Int): Unit = {
+                    row: Int, k: Int, value: Int,
+                    groupId: Boolean = false): Unit = {
+    dut.io.aLoad.payload.groupId #= groupId
     dut.io.aLoad.payload.index #= index
     dut.io.aLoad.payload.element.valid #= true
     dut.io.aLoad.payload.element.row #= row
@@ -261,6 +263,7 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
       loadA(dut, 3, row = 4, k = 3, value = 5)
 
       dut.io.start.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.start.payload.groupId #= false
       dut.io.start.valid #= true
       sleep(1)
       while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
@@ -317,6 +320,7 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
       loadA(dut, 0, row = 1, k = 2, value = 3)
 
       dut.io.start.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.start.payload.groupId #= false
       dut.io.start.valid #= true
       dut.io.bPush(0).payload.valid #= true
       dut.io.bPush(0).payload.aIndex #= 0
@@ -356,6 +360,59 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     }
   }
 
+  test("TrGT loads the inactive A context while the active group runs") {
+    simConfig.compile(new TrGtSubrowScheduler(tileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      initializeTrGt(dut)
+      dut.io.result.ready #= true
+
+      def startGroup(groupId: Boolean): Unit = {
+        dut.io.start.payload.mode #= TrapezoidDataflow.TrGt
+        dut.io.start.payload.groupId #= groupId
+        dut.io.start.valid #= true
+        sleep(1)
+        while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        sleep(1)
+        dut.io.start.valid #= false
+      }
+
+      def finishAndCollect(): Seq[(Int, Int, Long)] = {
+        dut.io.finish #= true
+        dut.clockDomain.waitSampling()
+        dut.io.finish #= false
+        val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+        var timeout = 0
+        while (!dut.io.done.toBoolean && timeout < 300) {
+          sleep(1)
+          if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+            observed += ((dut.io.result.payload.row.toInt,
+              dut.io.result.payload.column.toInt,
+              dut.io.result.payload.value.toLong))
+          }
+          dut.clockDomain.waitSampling()
+          timeout += 1
+        }
+        assert(timeout < 300)
+        observed.toSeq
+      }
+
+      loadA(dut, 0, row = 1, k = 0, value = 3, groupId = false)
+      startGroup(groupId = false)
+      loadA(dut, 0, row = 2, k = 0, value = 7, groupId = true)
+      assert(dut.io.busy.toBoolean,
+        "the inactive A context must be writable while group 0 is active")
+      pushB(dut, 0, aIndex = 0, k = 0, column = 4, value = 5)
+      assert(finishAndCollect() == Seq((1, 4, 15L)))
+
+      startGroup(groupId = true)
+      pushB(dut, 0, aIndex = 0, k = 0, column = 6, value = 5)
+      assert(finishAndCollect() == Seq((2, 6, 35L)))
+      assert(!dut.io.overflow.toBoolean)
+      assert(!dut.io.unsupportedMode.toBoolean)
+    }
+  }
+
   test("TrGT scheduler runs through an externally supplied synchronous SRAM") {
     simConfig.compile(new ExternalBufferedTrGtHarness(tileCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
@@ -369,6 +426,7 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
       }
 
       dut.io.aLoad.payload.index #= 0
+      dut.io.aLoad.payload.groupId #= false
       dut.io.aLoad.payload.element.valid #= true
       dut.io.aLoad.payload.element.row #= 5
       dut.io.aLoad.payload.element.k #= 0
@@ -380,6 +438,7 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
       dut.io.aLoad.valid #= false
 
       dut.io.start.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.start.payload.groupId #= false
       dut.io.start.valid #= true
       sleep(1)
       while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()

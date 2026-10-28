@@ -435,6 +435,7 @@ class CachedTrGtSubrowAdapter(
     val schedulerBusy = out Bool()
     val fifoOccupancy = out UInt(16 bits)
     val groupReadyState = out Bits(2 bits)
+    val aLoadCompleteState = out Bits(2 bits)
     val prefetchActiveState = out Bits(2 bits)
     val executeGroupState = out Bool()
     val fillGroupState = out Bool()
@@ -517,7 +518,9 @@ class CachedTrGtSubrowAdapter(
     Vec((0 until cfg.macLanes).map(_ =>
       Reg(UInt(gustCfg.lineCountWidth bits)) init 0))))
   val currentIndex = Reg(UInt(scanIndexWidth bits)) init 0
-  val loadIndex = Reg(UInt(scanIndexWidth bits)) init 0
+  val aLoadIndex = Vec((0 until groupCount).map(_ =>
+    Reg(UInt(scanIndexWidth bits)) init 0))
+  val aLoadComplete = Vec((0 until groupCount).map(_ => RegInit(False)))
   val requestIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
   val prefetchActive = Vec((0 until groupCount).map(_ => RegInit(False)))
   val prefetchAIndex = Vec((0 until groupCount).map(_ =>
@@ -555,6 +558,7 @@ class CachedTrGtSubrowAdapter(
   io.fifoOccupancy := schedulerFifoOccupancy
     .map(_.resize(16)).reduce(_ + _).resize(16)
   io.groupReadyState := groupReady.asBits
+  io.aLoadCompleteState := aLoadComplete.asBits
   io.prefetchActiveState := prefetchActive.asBits
   io.executeGroupState := executeGroup
   io.fillGroupState := fillGroup
@@ -613,10 +617,18 @@ class CachedTrGtSubrowAdapter(
   val selectedElementValid = elementChoices.orR
   val selectedElement = lineElements(selectedElementIndex)
 
+  val backgroundGroup = !executeGroup
+  val executeNeedsALoad = groupReady(executeGroup.asUInt) &&
+    !aLoadComplete(executeGroup.asUInt)
+  val backgroundNeedsALoad = groupReady(backgroundGroup.asUInt) &&
+    !aLoadComplete(backgroundGroup.asUInt)
+  val aLoadGroup = Mux(executeNeedsALoad, executeGroup, backgroundGroup)
+  val aLoadContext = aLoadGroup.asUInt
   val loadAChoices = Bits(cfg.macLanes bits)
   for (index <- 0 until cfg.macLanes) {
-    loadAChoices(index) := U(index, scanIndexWidth bits) >= loadIndex &&
-      Mux(executeGroup, aValid(1)(index), aValid(0)(index))
+    loadAChoices(index) := U(index, scanIndexWidth bits) >=
+      aLoadIndex(aLoadContext) &&
+      Mux(aLoadGroup, aValid(1)(index), aValid(0)(index))
   }
   val loadAIndex = UInt(addressIndexWidth bits)
   loadAIndex := 0
@@ -628,14 +640,17 @@ class CachedTrGtSubrowAdapter(
   loadAElement := GustavsonA(cfg).getZero
   for (index <- 0 until cfg.macLanes) {
     when(loadAIndex === index) {
-      loadAElement := Mux(executeGroup,
+      loadAElement := Mux(aLoadGroup,
         aStorage(1)(index), aStorage(0)(index))
     }
   }
-  schedulerALoad.valid := state === CachedTrGtState.LoadA && loadAFound
+  schedulerALoad.valid := !io.clear &&
+    (executeNeedsALoad || backgroundNeedsALoad) && loadAFound
+  schedulerALoad.payload.groupId := aLoadGroup
   schedulerALoad.payload.index := loadAIndex
   schedulerALoad.payload.element := loadAElement
   schedulerStart.payload.mode := TrapezoidDataflow.TrGt
+  schedulerStart.payload.groupId := executeGroup
   schedulerFinish := False
   for (subrow <- 0 until cfg.localBanks) {
     schedulerBPush(subrow).valid := False
@@ -656,7 +671,6 @@ class CachedTrGtSubrowAdapter(
   }
   val nextAFound = nextAChoices.orR
 
-  val backgroundGroup = !executeGroup
   val backgroundAChoices = Bits(cfg.macLanes bits)
   for (index <- 0 until cfg.macLanes) {
     backgroundAChoices(index) := Mux(backgroundGroup,
@@ -735,6 +749,8 @@ class CachedTrGtSubrowAdapter(
         }
       }
       groupCollectOpen(fillGroup.asUInt) := True
+      aLoadIndex(fillGroup.asUInt) := U(0, scanIndexWidth bits)
+      aLoadComplete(fillGroup.asUInt) := False
     }
     when(io.rowCommand.payload.mode =/= TrapezoidDataflow.TrGt) {
       unsupportedModeReg := True
@@ -770,16 +786,19 @@ class CachedTrGtSubrowAdapter(
     executeGroup := Mux(groupReady(nextExecuteGroup.asUInt),
       nextExecuteGroup, !nextExecuteGroup)
     currentIndex := 0
-    loadIndex := 0
     schedulerStarted := False
     state := CachedTrGtState.LoadA
   }
+  when((executeNeedsALoad || backgroundNeedsALoad) && !loadAFound) {
+    aLoadComplete(aLoadContext) := True
+  }
+  when(schedulerALoad.fire) {
+    aLoadIndex(aLoadContext) := loadAIndex.resize(scanIndexWidth) + 1
+  }
   when(state === CachedTrGtState.LoadA) {
-    when(!loadAFound) {
+    when(aLoadComplete(executeGroup.asUInt)) {
       currentIndex := 0
       state := CachedTrGtState.FindA
-    } elsewhen(schedulerALoad.fire) {
-      loadIndex := loadAIndex.resize(scanIndexWidth) + 1
     }
   }
   when(state === CachedTrGtState.Start && schedulerStart.fire) {
@@ -994,7 +1013,6 @@ class CachedTrGtSubrowAdapter(
   when(io.clear) {
     state := CachedTrGtState.Collect
     currentIndex := 0
-    loadIndex := 0
     requestIndex := 0
     doneReg := False
     overflowReg := False
@@ -1008,6 +1026,8 @@ class CachedTrGtSubrowAdapter(
     for (group <- 0 until groupCount) {
       groupReady(group) := False
       groupCollectOpen(group) := False
+      aLoadIndex(group) := 0
+      aLoadComplete(group) := False
       prefetchActive(group) := False
       prefetchAIndex(group) := 0
       prefetchLineCount(group) := 0

@@ -182,13 +182,18 @@ class TrGtSubrowScheduler(
   // TrGT.  The flattened PERowCommand interface is retained at the PE-row
   // boundary, but the generated storage now follows the paper's temporal
   // organization instead of one monolithic register file.
-  val aStorage = Array.fill(subrows)(
-    Vec((0 until cfg.macLanesPerSubrow).map(_ => Reg(GustavsonA(cfg)))))
-  val aLoaded = Array.fill(subrows)(
-    Vec((0 until cfg.macLanesPerSubrow).map(_ => RegInit(False))))
+  private val groupCount = 2
+  val aStorage = Vec((0 until groupCount).map(_ =>
+    Vec((0 until subrows).map(_ =>
+      Vec((0 until cfg.macLanesPerSubrow).map(_ =>
+        Reg(GustavsonA(cfg))))))))
+  val aLoaded = Vec((0 until groupCount).map(_ =>
+    Vec((0 until subrows).map(_ =>
+      Vec((0 until cfg.macLanesPerSubrow).map(_ => RegInit(False)))))))
+  val aContextPrepared = Vec((0 until groupCount).map(_ => RegInit(False)))
+  val runningContext = Reg(Bool()) init False
   val running = RegInit(False)
   val finishSeen = RegInit(False)
-  val aLoadRequiresReset = RegInit(True)
   val modeError = RegInit(False)
   val controlDone = RegInit(False)
   val acceptedBElements = Reg(UInt(32 bits)) init 0
@@ -216,7 +221,7 @@ class TrGtSubrowScheduler(
         localStorage.io.bus.readResponses(bank)
     }
   }
-  val preloadActive = !aLoadRequiresReset && !finishSeen
+  val preloadActive = aContextPrepared.asBits.orR && !finishSeen
   val acceptingPushes = running || preloadActive
   for (subrow <- 0 until subrows) {
     fifos.io.pushes(subrow).valid := io.bPush(subrow).valid && acceptingPushes
@@ -242,23 +247,29 @@ class TrGtSubrowScheduler(
   io.overflow := engine.io.overflow
   io.unsupportedMode := modeError || engine.io.unsupportedMode
 
-  io.aLoad.ready := !io.clear && !running && !engine.io.busy && !io.start.valid
+  val aLoadTargetsInactiveContext =
+    io.aLoad.payload.groupId =/= runningContext
+  io.aLoad.ready := !io.clear && !io.start.valid &&
+    ((!running && !engine.io.busy) || aLoadTargetsInactiveContext)
   when(io.aLoad.fire) {
-    when(aLoadRequiresReset) {
-      acceptedBElements := 0
-      issuedBElements := 0
-      for (subrow <- 0 until subrows;
+    when(!aContextPrepared(io.aLoad.payload.groupId.asUInt)) {
+      for (group <- 0 until groupCount;
+           subrow <- 0 until subrows;
            offset <- 0 until cfg.macLanesPerSubrow) {
-        aLoaded(subrow)(offset) := False
+        when(io.aLoad.payload.groupId === (if (group == 1) True else False)) {
+          aLoaded(group)(subrow)(offset) := False
+        }
       }
-      aLoadRequiresReset := False
+      aContextPrepared(io.aLoad.payload.groupId.asUInt) := True
     }
-    for (subrow <- 0 until subrows;
+    for (group <- 0 until groupCount;
+         subrow <- 0 until subrows;
          offset <- 0 until cfg.macLanesPerSubrow) {
       val index = subrow * cfg.macLanesPerSubrow + offset
-      when(io.aLoad.payload.index === index) {
-        aStorage(subrow)(offset) := io.aLoad.payload.element
-        aLoaded(subrow)(offset) := True
+      when(io.aLoad.payload.groupId === (if (group == 1) True else False) &&
+          io.aLoad.payload.index === index) {
+        aStorage(group)(subrow)(offset) := io.aLoad.payload.element
+        aLoaded(group)(subrow)(offset) := True
       }
     }
   }
@@ -266,9 +277,18 @@ class TrGtSubrowScheduler(
   io.start.ready := !io.clear && !running && !engine.io.busy && !io.aLoad.valid
   when(io.start.fire) {
     controlDone := False
-    when(aLoadRequiresReset) {
-      acceptedBElements := 0
-      issuedBElements := 0
+    acceptedBElements := 0
+    issuedBElements := 0
+    runningContext := io.start.payload.groupId
+    when(!aContextPrepared(io.start.payload.groupId.asUInt)) {
+      for (group <- 0 until groupCount;
+           subrow <- 0 until subrows;
+           offset <- 0 until cfg.macLanesPerSubrow) {
+        when(io.start.payload.groupId === (if (group == 1) True else False)) {
+          aLoaded(group)(subrow)(offset) := False
+        }
+      }
+      aContextPrepared(io.start.payload.groupId.asUInt) := True
     }
     modeError := io.start.payload.mode =/= TrapezoidDataflow.TrGt
     when(io.start.payload.mode === TrapezoidDataflow.TrGt) {
@@ -308,11 +328,14 @@ class TrGtSubrowScheduler(
        offset <- 0 until cfg.macLanesPerSubrow) {
     val index = subrow * cfg.macLanesPerSubrow + offset
     scheduledCommand.gustavson.a(index).valid :=
-      aLoaded(subrow)(offset) && aStorage(subrow)(offset).valid
-    scheduledCommand.gustavson.a(index).row := aStorage(subrow)(offset).row
-    scheduledCommand.gustavson.a(index).k := aStorage(subrow)(offset).k
+      aLoaded(runningContext.asUInt)(subrow)(offset) &&
+        aStorage(runningContext.asUInt)(subrow)(offset).valid
+    scheduledCommand.gustavson.a(index).row :=
+      aStorage(runningContext.asUInt)(subrow)(offset).row
+    scheduledCommand.gustavson.a(index).k :=
+      aStorage(runningContext.asUInt)(subrow)(offset).k
     scheduledCommand.gustavson.a(index).value :=
-      aStorage(subrow)(offset).value
+      aStorage(runningContext.asUInt)(subrow)(offset).value
   }
   for (lane <- 0 until cfg.cacheLineWords) {
     if (lane < subrows) {
@@ -338,19 +361,19 @@ class TrGtSubrowScheduler(
   when(engine.io.command.fire && issueFinal) {
     running := False
     finishSeen := False
-    // A remains stationary during the tile.  The next A load starts a new
-    // temporal tile and invalidates the previous register contents.
-    aLoadRequiresReset := True
+    aContextPrepared(runningContext.asUInt) := False
   }
 
   when(io.clear) {
-    for (subrow <- 0 until subrows;
+    for (group <- 0 until groupCount;
+         subrow <- 0 until subrows;
          offset <- 0 until cfg.macLanesPerSubrow) {
-      aLoaded(subrow)(offset) := False
+      aLoaded(group)(subrow)(offset) := False
     }
+    aContextPrepared.foreach(_ := False)
+    runningContext := False
     running := False
     finishSeen := False
-    aLoadRequiresReset := True
     modeError := False
     controlDone := False
     acceptedBElements := 0

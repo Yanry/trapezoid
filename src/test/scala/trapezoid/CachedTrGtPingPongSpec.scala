@@ -3,8 +3,6 @@ package trapezoid
 import org.scalatest.funsuite.AnyFunSuite
 import spinal.core.sim._
 
-import scala.collection.mutable
-
 class CachedTrGtPingPongSpec extends AnyFunSuite {
   private val cfg = TrapezoidConfig(
     dataWidth = 8,
@@ -49,7 +47,7 @@ class CachedTrGtPingPongSpec extends AnyFunSuite {
       dut.clockDomain.forkStimulus(10)
       dut.io.clear #= false
       dut.io.rowCommand.valid #= false
-      dut.io.cacheRequest.ready #= true
+      dut.io.cacheRequest.ready #= false
       dut.io.cacheResponse.valid #= false
       dut.io.result.ready #= true
       dut.io.schedulerALoad.ready #= true
@@ -69,54 +67,31 @@ class CachedTrGtPingPongSpec extends AnyFunSuite {
       dut.io.schedulerOverflowIn #= false
       dut.io.schedulerUnsupportedModeIn #= false
 
-      val requestIds = mutable.ArrayBuffer.empty[Int]
-      val pendingResponses = mutable.Queue.empty[Int]
-      fork {
-        while (requestIds.length < 2) {
-          if (dut.io.cacheRequest.valid.toBoolean &&
-              dut.io.cacheRequest.ready.toBoolean) {
-            val requestId = dut.io.cacheRequest.payload.requestId.toInt
-            requestIds += requestId
-            pendingResponses.enqueue(requestId)
-          }
+      def acceptRequest(): Int = {
+        while (!dut.io.cacheRequest.valid.toBoolean) {
           dut.clockDomain.waitSampling()
-          sleep(1)
         }
-      }
-      fork {
-        var responses = 0
-        while (responses < 2) {
-          if (pendingResponses.nonEmpty) {
-            val requestId = pendingResponses.dequeue()
-            dut.io.cacheResponse.payload.requestId #= requestId
-            dut.io.cacheResponse.payload.data #= 0
-            dut.io.cacheResponse.payload.wasHit #= false
-            dut.io.cacheResponse.payload.error #= false
-            dut.io.cacheResponse.valid #= true
-            while (!dut.io.cacheResponse.ready.toBoolean) {
-              dut.clockDomain.waitSampling()
-            }
-            dut.clockDomain.waitSampling()
-            dut.io.cacheResponse.valid #= false
-            responses += 1
-          } else {
-            dut.clockDomain.waitSampling()
-          }
-        }
+        val requestId = dut.io.cacheRequest.payload.requestId.toInt
+        dut.io.cacheRequest.ready #= true
+        dut.clockDomain.waitSampling()
+        sleep(1)
+        dut.io.cacheRequest.ready #= false
+        requestId
       }
 
-      val loadedValues = mutable.ArrayBuffer.empty[Int]
-      fork {
-        while (loadedValues.length < 2) {
-          if (dut.io.schedulerALoad.valid.toBoolean &&
-              dut.io.schedulerALoad.ready.toBoolean) {
-            val value = dut.io.schedulerALoad.payload.element.value.toInt
-            if (loadedValues.lastOption.forall(_ != value)) {
-              loadedValues += value
-            }
-          }
+      def respond(requestId: Int): Unit = {
+        dut.io.cacheResponse.payload.requestId #= requestId
+        dut.io.cacheResponse.payload.data #= 0
+        dut.io.cacheResponse.payload.wasHit #= false
+        dut.io.cacheResponse.payload.error #= false
+        dut.io.cacheResponse.valid #= true
+        sleep(1)
+        while (!dut.io.cacheResponse.ready.toBoolean) {
           dut.clockDomain.waitSampling()
         }
+        dut.clockDomain.waitSampling()
+        sleep(1)
+        dut.io.cacheResponse.valid #= false
       }
 
       def issue(row: Int, value: Int, base: Int): Unit = {
@@ -138,36 +113,41 @@ class CachedTrGtPingPongSpec extends AnyFunSuite {
 
       issue(row = 1, value = 3, base = 16)
       issue(row = 2, value = 5, base = 32)
+      val requestIds = Seq(acceptRequest(), acceptRequest())
+      respond(requestIds.head)
+      respond(requestIds.last)
 
       var timeout = 0
-      while ((loadedValues.length < 1 || requestIds.length < 2 ||
+      while ((dut.io.aLoadCompleteState.toBigInt != 3 ||
           dut.io.phase.toInt != CachedTrGtState.WaitDone.position) &&
           timeout < 500) {
         dut.clockDomain.waitSampling()
         timeout += 1
       }
       assert(timeout < 500,
-        s"timed out: loadedValues=$loadedValues requestIds=$requestIds")
-      assert(loadedValues == Seq(3),
-        "the second group must not load A before the first group drains")
+        s"timed out: aLoadComplete=${dut.io.aLoadCompleteState.toBigInt} " +
+          s"requestIds=$requestIds")
+      assert(dut.io.aLoadCompleteState.toBigInt == 3,
+        "the next group's A context must load while the first group executes")
       assert(requestIds == Seq(0, 2),
         "the next group's B window must refill while the first group executes")
 
       dut.io.schedulerDoneIn #= true
       timeout = 0
-      while (loadedValues.length < 2 && timeout < 500) {
+      while (dut.io.executeGroupState.toBoolean == false && timeout < 500) {
         dut.clockDomain.waitSampling()
         timeout += 1
       }
       assert(timeout < 500,
-        s"second group did not execute: loaded=$loadedValues " +
+        s"second group did not become executable: " +
           s"phase=${dut.io.phase.toInt} busy=${dut.io.busy.toBoolean} " +
           s"done=${dut.io.done.toBoolean} memoryError=${dut.io.memoryError.toBoolean} " +
           s"ready=${dut.io.groupReadyState.toBigInt} " +
+          s"aLoadComplete=${dut.io.aLoadCompleteState.toBigInt} " +
           s"prefetch=${dut.io.prefetchActiveState.toBigInt} " +
           s"execute=${dut.io.executeGroupState.toBoolean} " +
           s"fill=${dut.io.fillGroupState.toBoolean}")
-      assert(loadedValues == Seq(3, 5))
+      assert(dut.io.aLoadCompleteState.toBigInt == 3)
     }
   }
 }

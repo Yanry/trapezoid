@@ -201,6 +201,7 @@ case class CachedTrIpMatrixDescriptor(
 }
 
 case class IndexedGustavsonA(cfg: TrapezoidConfig) extends Bundle {
+  val groupId = Bool()
   val index = UInt(cfg.aRegisterIndexWidth bits)
   val element = GustavsonA(cfg)
 }
@@ -208,6 +209,7 @@ case class IndexedGustavsonA(cfg: TrapezoidConfig) extends Bundle {
 case class GustavsonStart() extends Bundle {
   /** The caller selects the execution policy explicitly. */
   val mode = TrapezoidDataflow()
+  val groupId = Bool()
 }
 
 case class TrGsB(cfg: TrapezoidConfig) extends Bundle {

@@ -244,8 +244,9 @@ class TrapezoidPERowSpec extends AnyFunSuite {
 
       issue(dut)
       val firstPrepareCycles = dut.io.controlPrepareCycles.toLong
-      assert(firstPrepareCycles > 0,
-        "the first unseen route pattern must run the exact Benes solver")
+      assert(firstPrepareCycles > 0 &&
+        firstPrepareCycles <= routedCfg.mrnReductionLevels + 1,
+        "the first spread route must use the bounded metadata pipeline")
       dut.clockDomain.waitSampling()
 
       issue(dut)
@@ -261,8 +262,21 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       issue(dut)
       val nextTilePrepareCycles =
         dut.io.controlPrepareCycles.toLong - tileEndPrepareCycles
-      assert(nextTilePrepareCycles > 0,
-        "the first route pattern of a new tile must start from a cold cache")
+      assert(nextTilePrepareCycles > 0 &&
+        nextTilePrepareCycles <= routedCfg.mrnReductionLevels + 1,
+        "the first spread route of a new tile must refill the control cache")
+
+      dut.io.command.payload.trip.a(1).valid #= true
+      dut.io.command.payload.trip.a(1).tag #= 3
+      dut.io.command.payload.trip.a(1).mask #= 0xff
+      for (entry <- 0 until routedCfg.fiberWidth) {
+        dut.io.command.payload.trip.a(1).values(entry) #= entry + 3
+      }
+      val fallbackStart = dut.io.controlPrepareCycles.toLong
+      issue(dut)
+      val fallbackCycles = dut.io.controlPrepareCycles.toLong - fallbackStart
+      assert(fallbackCycles > routedCfg.mrnReductionLevels + 1,
+        "a repeated multi-source pattern must retain the exact solver fallback")
     }
   }
 

@@ -73,6 +73,26 @@ class BenesDistributionFabricSpec extends AnyFunSuite {
     io.outputs := fabric.io.outputs
   }
 
+  private class RestrictedPipelinedRoutedBenes extends Component {
+    val io = new Bundle {
+      val start = slave(Stream(BenesRouteMetadata(cfg)))
+      val startSupported = out Bool()
+      val sources = in Vec(Bits((cfg.dataWidth + 1) bits), cfg.macLanes)
+      val result = master(Stream(BenesRouteControlResult(cfg)))
+      val outputs = out Vec(Bits((cfg.dataWidth + 1) bits), cfg.macLanes)
+    }
+    val control = new PipelinedRestrictedBenesRouteControlGenerator(cfg)
+    val fabric = new BenesDistributionFabric(cfg)
+    control.io.start <> io.start
+    io.startSupported := control.io.startSupported
+    io.result.valid := control.io.result.valid
+    io.result.payload := control.io.result.payload
+    control.io.result.ready := io.result.ready
+    fabric.io.sources := io.sources
+    fabric.io.controls := control.io.result.payload.controls
+    io.outputs := fabric.io.outputs
+  }
+
   test("Benes fabric routes identity and multicast controls") {
     SimConfig.withVerilator
       .addSimulatorFlag("-CFLAGS -std=c++14")
@@ -182,6 +202,67 @@ class BenesDistributionFabricSpec extends AnyFunSuite {
           dut.clockDomain.waitSampling()
           dut.io.result.ready #= false
         }
+      }
+  }
+
+  test("restricted Benes metadata pipeline accepts one route per cycle") {
+    SimConfig.withVerilator
+      .addSimulatorFlag("-CFLAGS -std=c++14")
+      .addSimulatorFlag("-LDFLAGS -std=c++14")
+      .compile(new RestrictedPipelinedRoutedBenes)
+      .doSim { dut =>
+        dut.clockDomain.forkStimulus(10)
+        dut.io.start.valid #= false
+        dut.io.result.ready #= true
+        for (index <- 0 until cfg.macLanes) {
+          dut.io.sources(index) #= payload(80 + index)
+        }
+        val spread = (0 until cfg.macLanes).map(index =>
+          StaticBenesControls.spreadSourceIndex(cfg.macLanes, index))
+        val mappings = Seq(
+          Seq.fill(cfg.macLanes)(1),
+          spread,
+          Seq.fill(cfg.macLanes)(3))
+        var nextInput = 0
+        var nextOutput = 0
+        var cycle = 0
+        val acceptedCycles = scala.collection.mutable.ArrayBuffer.empty[Int]
+        val resultCycles = scala.collection.mutable.ArrayBuffer.empty[Int]
+
+        while (nextOutput < mappings.size && cycle < 32) {
+          if (nextInput < mappings.size) {
+            dut.io.start.valid #= true
+            dut.io.start.payload.routeValid #= (1 << cfg.macLanes) - 1
+            for (output <- 0 until cfg.macLanes) {
+              dut.io.start.payload.sourceIndices(output) #=
+                mappings(nextInput)(output)
+            }
+          } else {
+            dut.io.start.valid #= false
+          }
+          sleep(1)
+          if (dut.io.start.valid.toBoolean && dut.io.start.ready.toBoolean) {
+            assert(dut.io.startSupported.toBoolean)
+            acceptedCycles += cycle
+            nextInput += 1
+          }
+          if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+            assert(dut.io.result.payload.routable.toBoolean)
+            for (output <- 0 until cfg.macLanes) {
+              val expected = payload(80 + mappings(nextOutput)(output))
+              assert(dut.io.outputs(output).toInt == expected,
+                s"restricted mapping $nextOutput output $output")
+            }
+            resultCycles += cycle
+            nextOutput += 1
+          }
+          dut.clockDomain.waitSampling()
+          cycle += 1
+        }
+        assert(nextOutput == mappings.size)
+        assert(acceptedCycles.sliding(2).forall(pair => pair(1) - pair(0) == 1))
+        assert(resultCycles.sliding(2).forall(pair => pair(1) - pair(0) == 1))
+        assert(resultCycles.head - acceptedCycles.head == cfg.mrnReductionLevels)
       }
   }
 

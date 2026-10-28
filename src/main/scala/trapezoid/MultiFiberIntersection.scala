@@ -714,6 +714,155 @@ case class BenesRouteControlResult(cfg: TrapezoidConfig) extends Bundle {
   val routable = Bool()
 }
 
+private[trapezoid] object StaticBenesControls {
+  private def solvePermutation(mapping: Vector[Int]): Vector[Boolean] = {
+    val width = mapping.length
+    require(width >= 1 && (width & (width - 1)) == 0)
+    require(mapping.sorted == (0 until width).toVector)
+    if (width == 1) {
+      Vector.empty
+    } else if (width == 2) {
+      Vector(mapping(0) == 1, mapping(1) == 1)
+    } else {
+      val neighbours = Array.fill(width)(
+        scala.collection.mutable.ArrayBuffer.empty[Int])
+      def connect(left: Int, right: Int): Unit = {
+        neighbours(left) += right
+        neighbours(right) += left
+      }
+      for (output <- 0 until width by 2) connect(output, output + 1)
+      val sourceOutput = Array.ofDim[Int](width)
+      for (output <- 0 until width) sourceOutput(mapping(output)) = output
+      for (source <- 0 until width by 2) {
+        connect(sourceOutput(source), sourceOutput(source + 1))
+      }
+
+      val colors = Array.fill[Option[Boolean]](width)(None)
+      for (seed <- 0 until width if colors(seed).isEmpty) {
+        val queue = scala.collection.mutable.Queue(seed)
+        colors(seed) = Some(false)
+        while (queue.nonEmpty) {
+          val current = queue.dequeue()
+          val nextColor = !colors(current).get
+          neighbours(current).foreach { neighbour =>
+            colors(neighbour) match {
+              case Some(existing) => require(existing == nextColor)
+              case None =>
+                colors(neighbour) = Some(nextColor)
+                queue.enqueue(neighbour)
+            }
+          }
+        }
+      }
+      val routeColors = colors.map(_.get)
+      val half = width / 2
+      val firstControls = Vector.tabulate(width) { control =>
+        val inputPair = control / 2
+        val branch = control % 2 == 1
+        val selected = mapping.indices.find { output =>
+          mapping(output) / 2 == inputPair && routeColors(output) == branch
+        }.get
+        mapping(selected) % 2 == 1
+      }
+      val upperMapping = Vector.tabulate(half) { outputPair =>
+        val outputs = Vector(outputPair * 2, outputPair * 2 + 1)
+        mapping(outputs.find(output => !routeColors(output)).get) / 2
+      }
+      val lowerMapping = Vector.tabulate(half) { outputPair =>
+        val outputs = Vector(outputPair * 2, outputPair * 2 + 1)
+        mapping(outputs.find(output => routeColors(output)).get) / 2
+      }
+      firstControls ++ solvePermutation(upperMapping) ++
+        solvePermutation(lowerMapping) ++ routeColors
+    }
+  }
+
+  def spreadSourceIndex(width: Int, logicalIndex: Int): Int = {
+    val indexWidth = log2Up(width)
+    if (indexWidth == 7) {
+      val low = logicalIndex & 0x7
+      val middle = (logicalIndex >> 3) & 0x3
+      val high = (logicalIndex >> 5) & 0x3
+      low | (high << 3) | (middle << 5)
+    } else {
+      val mask = width - 1
+      ((logicalIndex << 1) & mask) | (logicalIndex >> (indexWidth - 1))
+    }
+  }
+
+  def spreadControls(width: Int): BigInt = {
+    solvePermutation(Vector.tabulate(width)(spreadSourceIndex(width, _)))
+      .zipWithIndex.foldLeft(BigInt(0)) { case (value, (enabled, index)) =>
+        if (enabled) value | (BigInt(1) << index) else value
+      }
+  }
+}
+
+case class RestrictedBenesRouteToken(cfg: TrapezoidConfig) extends Bundle {
+  val supported = Bool()
+  val broadcast = Bool()
+  val sourceIndex = UInt(cfg.macLaneIndexWidth bits)
+}
+
+/** Metadata-only control pipeline for the common MFIU route patterns.
+  * Broadcast and compacted spread-permutation routes cover the regular sparse
+  * cases without carrying the full lane metadata through every stage.
+  */
+class PipelinedRestrictedBenesRouteControlGenerator(cfg: TrapezoidConfig)
+    extends Component {
+  addAttribute("verilator hier_block")
+  private val width = cfg.distributionWidth
+  private val pipelineStages = log2Up(width)
+  private val spreadControls = B(
+    StaticBenesControls.spreadControls(width), cfg.benesControlWidth bits)
+
+  val io = new Bundle {
+    val start = slave(Stream(BenesRouteMetadata(cfg)))
+    val startSupported = out Bool()
+    val result = master(Stream(BenesRouteControlResult(cfg)))
+  }
+
+  val firstValid = OHMasking.first(io.start.payload.routeValid)
+  val broadcastSource = UInt(cfg.macLaneIndexWidth bits)
+  broadcastSource := 0
+  for (lane <- 0 until cfg.macLanes) {
+    when(firstValid(lane)) {
+      broadcastSource := io.start.payload.sourceIndices(lane)
+    }
+  }
+  val broadcastMismatch = (0 until cfg.macLanes).map { lane =>
+    io.start.payload.routeValid(lane) &&
+      io.start.payload.sourceIndices(lane) =/= broadcastSource
+  }.reduce(_ || _)
+  val spreadMismatch = (0 until cfg.macLanes).map { lane =>
+    io.start.payload.routeValid(lane) &&
+      io.start.payload.sourceIndices(lane) =/=
+        StaticBenesControls.spreadSourceIndex(width, lane)
+  }.reduce(_ || _)
+  val nonEmpty = io.start.payload.routeValid.orR
+  val broadcastSupported = nonEmpty && !broadcastMismatch
+  val spreadSupported = nonEmpty && !spreadMismatch
+  io.startSupported := broadcastSupported || spreadSupported
+
+  val tokenInput = Stream(RestrictedBenesRouteToken(cfg))
+  tokenInput.valid := io.start.valid
+  tokenInput.payload.supported := io.startSupported
+  tokenInput.payload.broadcast := broadcastSupported
+  tokenInput.payload.sourceIndex := broadcastSource
+  io.start.ready := tokenInput.ready
+
+  var tokenStage = tokenInput.m2sPipe()
+  for (_ <- 1 until pipelineStages) tokenStage = tokenStage.m2sPipe()
+
+  val broadcastControls = new BenesBroadcastControlGenerator(cfg)
+  broadcastControls.io.sourceIndex := tokenStage.payload.sourceIndex
+  io.result.valid := tokenStage.valid
+  io.result.payload.controls := Mux(tokenStage.payload.broadcast,
+    broadcastControls.io.controls, spreadControls)
+  io.result.payload.routable := tokenStage.payload.supported
+  tokenStage.ready := io.result.ready
+}
+
 object PipelinedBenesControlState extends SpinalEnum {
   val Idle, Color, Commit, Done = newElement()
 }

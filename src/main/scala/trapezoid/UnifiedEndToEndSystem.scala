@@ -434,6 +434,10 @@ class CachedTrGtSubrowAdapter(
     val phase = out UInt(4 bits)
     val schedulerBusy = out Bool()
     val fifoOccupancy = out UInt(16 bits)
+    val groupReadyState = out Bits(2 bits)
+    val prefetchActiveState = out Bits(2 bits)
+    val executeGroupState = out Bool()
+    val fillGroupState = out Bool()
     val schedulerALoad = if (externalScheduler)
       master(Stream(IndexedGustavsonA(cfg))) else null
     val schedulerStart = if (externalScheduler)
@@ -515,12 +519,22 @@ class CachedTrGtSubrowAdapter(
   val currentIndex = Reg(UInt(scanIndexWidth bits)) init 0
   val loadIndex = Reg(UInt(scanIndexWidth bits)) init 0
   val requestIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
-  val nextRequestIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
-  val prefetchOccupancy = Reg(UInt(tileCfg.bPrefetchCountWidth bits)) init 0
-  val requestOutstanding = Reg(UInt(tileCfg.bPrefetchCountWidth bits)) init 0
-  val prefetchValid = Vec((0 until prefetchDepth).map(_ => RegInit(False)))
-  val prefetchData = Vec((0 until prefetchDepth).map(_ =>
-    Reg(Bits(cacheCfg.lineWidth bits)) init 0))
+  val prefetchActive = Vec((0 until groupCount).map(_ => RegInit(False)))
+  val prefetchAIndex = Vec((0 until groupCount).map(_ =>
+    Reg(UInt(addressIndexWidth bits)) init 0))
+  val prefetchLineCount = Vec((0 until groupCount).map(_ =>
+    Reg(UInt(gustCfg.lineCountWidth bits)) init 0))
+  val nextRequestIndex = Vec((0 until groupCount).map(_ =>
+    Reg(UInt(gustCfg.lineCountWidth bits)) init 0))
+  val prefetchOccupancy = Vec((0 until groupCount).map(_ =>
+    Reg(UInt(tileCfg.bPrefetchCountWidth bits)) init 0))
+  val requestOutstanding = Vec((0 until groupCount).map(_ =>
+    Reg(UInt(tileCfg.bPrefetchCountWidth bits)) init 0))
+  val prefetchValid = Vec((0 until groupCount).map(_ =>
+    Vec((0 until prefetchDepth).map(_ => RegInit(False)))))
+  val prefetchData = Vec((0 until groupCount).map(_ =>
+    Vec((0 until prefetchDepth).map(_ =>
+      Reg(Bits(cacheCfg.lineWidth bits)) init 0))))
   val elementCursor = Reg(UInt(elementIndexWidth bits)) init 0
   val doneReg = RegInit(False)
   val overflowReg = RegInit(False)
@@ -540,6 +554,10 @@ class CachedTrGtSubrowAdapter(
   io.schedulerBusy := schedulerBusySignal
   io.fifoOccupancy := schedulerFifoOccupancy
     .map(_.resize(16)).reduce(_ + _).resize(16)
+  io.groupReadyState := groupReady.asBits
+  io.prefetchActiveState := prefetchActive.asBits
+  io.executeGroupState := executeGroup
+  io.fillGroupState := fillGroup
 
   val currentAValid = Bool()
   val currentA = GustavsonA(cfg)
@@ -566,10 +584,11 @@ class CachedTrGtSubrowAdapter(
 
   val lineElements = Vec(TrGsB(cfg), gustCfg.elementsPerLine)
   val currentPrefetchSlot = requestIndex(tileCfg.bPrefetchSlotWidth - 1 downto 0)
-  val currentLineData = prefetchData(currentPrefetchSlot)
+  val currentLineValid = prefetchValid(executeGroup.asUInt)(currentPrefetchSlot)
+  val currentLineData = prefetchData(executeGroup.asUInt)(currentPrefetchSlot)
   for (element <- 0 until gustCfg.elementsPerLine) {
     val offset = element * gustCfg.elementWidth
-    lineElements(element).valid := prefetchValid(currentPrefetchSlot) &&
+    lineElements(element).valid := currentLineValid &&
       currentLineData(offset)
     lineElements(element).k := currentA.k
     lineElements(element).value :=
@@ -636,6 +655,45 @@ class CachedTrGtSubrowAdapter(
     }
   }
   val nextAFound = nextAChoices.orR
+
+  val backgroundGroup = !executeGroup
+  val backgroundAChoices = Bits(cfg.macLanes bits)
+  for (index <- 0 until cfg.macLanes) {
+    backgroundAChoices(index) := Mux(backgroundGroup,
+      aValid(1)(index), aValid(0)(index))
+  }
+  val backgroundAIndex = UInt(addressIndexWidth bits)
+  backgroundAIndex := 0
+  for (index <- (0 until cfg.macLanes).reverse) {
+    when(backgroundAChoices(index)) { backgroundAIndex := index }
+  }
+  val backgroundAFound = backgroundAChoices.orR
+  val backgroundLineCount = UInt(gustCfg.lineCountWidth bits)
+  backgroundLineCount := 0
+  for (index <- 0 until cfg.macLanes) {
+    when(backgroundAIndex === index) {
+      backgroundLineCount := Mux(backgroundGroup,
+        lineCountStorage(1)(index), lineCountStorage(0)(index))
+    }
+  }
+  val backgroundPrefetchInitialize = state =/= CachedTrGtState.Collect &&
+    groupReady(backgroundGroup.asUInt) && backgroundAFound &&
+    !prefetchActive(backgroundGroup.asUInt)
+
+  when(backgroundPrefetchInitialize) {
+    prefetchActive(backgroundGroup.asUInt) := True
+    prefetchAIndex(backgroundGroup.asUInt) := backgroundAIndex
+    prefetchLineCount(backgroundGroup.asUInt) := backgroundLineCount
+    nextRequestIndex(backgroundGroup.asUInt) :=
+      U(0, gustCfg.lineCountWidth bits)
+    prefetchOccupancy(backgroundGroup.asUInt) :=
+      U(0, tileCfg.bPrefetchCountWidth bits)
+    requestOutstanding(backgroundGroup.asUInt) :=
+      U(0, tileCfg.bPrefetchCountWidth bits)
+    for (slot <- 0 until prefetchDepth) {
+      prefetchValid(backgroundGroup.asUInt)(slot) := False
+    }
+  }
 
   val currentSubrow = UInt(subrowIndexWidth bits)
   currentSubrow := (currentIndex / cfg.macLanesPerSubrow).resized
@@ -745,57 +803,107 @@ class CachedTrGtSubrowAdapter(
       state := CachedTrGtState.Finish
     } otherwise {
       requestIndex := 0
-      nextRequestIndex := 0
-      prefetchOccupancy := 0
-      requestOutstanding := 0
-      for (slot <- 0 until prefetchDepth) {
-        prefetchValid(slot) := False
+      val executeWindowMatches = prefetchActive(executeGroup.asUInt) &&
+        prefetchAIndex(executeGroup.asUInt) === currentIndex.resized
+      when(!executeWindowMatches) {
+        prefetchActive(executeGroup.asUInt) := True
+        prefetchAIndex(executeGroup.asUInt) := currentIndex.resized
+        prefetchLineCount(executeGroup.asUInt) := currentLineCount
+        nextRequestIndex(executeGroup.asUInt) :=
+          U(0, gustCfg.lineCountWidth bits)
+        prefetchOccupancy(executeGroup.asUInt) :=
+          U(0, tileCfg.bPrefetchCountWidth bits)
+        requestOutstanding(executeGroup.asUInt) :=
+          U(0, tileCfg.bPrefetchCountWidth bits)
+        for (slot <- 0 until prefetchDepth) {
+          prefetchValid(executeGroup.asUInt)(slot) := False
+        }
       }
-      state := CachedTrGtState.RequestLine
+      state := Mux(executeWindowMatches &&
+        prefetchValid(executeGroup.asUInt)(0),
+        CachedTrGtState.EmitLine, CachedTrGtState.RequestLine)
     }
   }
 
-  val prefetchHasCapacity = prefetchOccupancy < prefetchDepth
-  val canIssuePrefetch = (state === CachedTrGtState.RequestLine ||
-    state === CachedTrGtState.EmitLine) &&
-    nextRequestIndex < currentLineCount && prefetchHasCapacity
-  io.cacheRequest.valid := !io.clear && canIssuePrefetch
+  val executeContext = executeGroup.asUInt
+  val backgroundContext = backgroundGroup.asUInt
+  val executePrefetchHasCapacity =
+    prefetchOccupancy(executeContext) < prefetchDepth
+  val backgroundPrefetchHasCapacity =
+    prefetchOccupancy(backgroundContext) < prefetchDepth
+  val executeWindowMatches = prefetchActive(executeContext) &&
+    prefetchAIndex(executeContext) === currentIndex.resized
+  val foregroundCanIssue = (state === CachedTrGtState.RequestLine ||
+    state === CachedTrGtState.EmitLine) && executeWindowMatches &&
+    nextRequestIndex(executeContext) < prefetchLineCount(executeContext) &&
+    executePrefetchHasCapacity
+  val backgroundCanIssue = groupReady(backgroundContext) &&
+    prefetchActive(backgroundContext) &&
+    prefetchActive(executeContext) &&
+    state =/= CachedTrGtState.LoadA &&
+    nextRequestIndex(backgroundContext) < prefetchLineCount(backgroundContext) &&
+    backgroundPrefetchHasCapacity
+  val requestGroup = Mux(foregroundCanIssue, executeGroup, backgroundGroup)
+  val requestContext = requestGroup.asUInt
+  val requestLineIndex = nextRequestIndex(requestContext)
+  val requestAIndex = prefetchAIndex(requestContext)
+  val requestBaseAddress = UInt(cacheCfg.addressWidth bits)
+  requestBaseAddress := 0
+  for (index <- 0 until cfg.macLanes) {
+    when(requestAIndex === index) {
+      requestBaseAddress := Mux(requestGroup,
+        bBaseStorage(1)(index), bBaseStorage(0)(index))
+    }
+  }
+  io.cacheRequest.valid := !io.clear &&
+    (foregroundCanIssue || backgroundCanIssue)
   io.cacheRequest.payload.address :=
-    (currentBBase + nextRequestIndex.resized).resized
+    (requestBaseAddress + requestLineIndex.resized).resized
   io.cacheRequest.payload.requestId :=
-    (executeGroup.asBits ## nextRequestIndex(lineIdWidth - 1 downto 0)
+    (requestGroup.asBits ## requestLineIndex(lineIdWidth - 1 downto 0)
       .asBits).asUInt.resized
   when(io.cacheRequest.fire) {
-    nextRequestIndex := nextRequestIndex + 1
+    nextRequestIndex(requestContext) := requestLineIndex + 1
   }
-  io.cacheResponse.ready := !io.clear && state =/= CachedTrGtState.Collect &&
-    requestOutstanding =/= 0
   val responseLineIndex = io.cacheResponse.payload.requestId(
     lineIdWidth - 1 downto 0).resize(gustCfg.lineCountWidth)
   val responseGroup = io.cacheResponse.payload.requestId(lineIdWidth)
+  val responseContext = responseGroup.asUInt
   val responseSlot = responseLineIndex(
     tileCfg.bPrefetchSlotWidth - 1 downto 0)
+  io.cacheResponse.ready := !io.clear && requestOutstanding.asBits.orR
   when(io.cacheResponse.fire) {
     when(io.cacheResponse.payload.error ||
-        responseGroup =/= executeGroup || responseLineIndex >= currentLineCount) {
+        !prefetchActive(responseContext) ||
+        responseLineIndex >= prefetchLineCount(responseContext)) {
       memoryErrorReg := True
       state := CachedTrGtState.Finish
     } otherwise {
-      prefetchData(responseSlot) := io.cacheResponse.payload.data
-      prefetchValid(responseSlot) := True
-      when(state === CachedTrGtState.RequestLine &&
+      prefetchData(responseContext)(responseSlot) := io.cacheResponse.payload.data
+      prefetchValid(responseContext)(responseSlot) := True
+      when(responseGroup === executeGroup &&
+          state === CachedTrGtState.RequestLine &&
           responseLineIndex === requestIndex) {
         elementCursor := 0
         state := CachedTrGtState.EmitLine
       }
     }
   }
-  switch(io.cacheRequest.fire ## io.cacheResponse.fire) {
-    is(B"10") { requestOutstanding := requestOutstanding + 1 }
-    is(B"01") { requestOutstanding := requestOutstanding - 1 }
+  for (group <- 0 until groupCount) {
+    val groupValue = if (group == 1) True else False
+    val requestFire = io.cacheRequest.fire && requestGroup === groupValue
+    val responseFire = io.cacheResponse.fire && responseGroup === groupValue
+    switch(requestFire ## responseFire) {
+      is(B"10") {
+        requestOutstanding(group) := requestOutstanding(group) + 1
+      }
+      is(B"01") {
+        requestOutstanding(group) := requestOutstanding(group) - 1
+      }
+    }
   }
   when(state === CachedTrGtState.RequestLine &&
-      prefetchValid(currentPrefetchSlot)) {
+      currentLineValid) {
     elementCursor := 0
     state := CachedTrGtState.EmitLine
   }
@@ -831,7 +939,10 @@ class CachedTrGtSubrowAdapter(
     elementCursor := selectedElementIndex + 1
   }
   when(consumeCurrentLine) {
-    prefetchValid(currentPrefetchSlot) := False
+    prefetchValid(executeContext)(currentPrefetchSlot) := False
+    when(requestIndex + 1 >= currentLineCount) {
+      prefetchActive(executeContext) := False
+    }
     when(terminalElement) {
       currentIndex := (currentIndex + 1).resized
       state := CachedTrGtState.WaitDone
@@ -839,7 +950,7 @@ class CachedTrGtSubrowAdapter(
       when(requestIndex + 1 < currentLineCount) {
         requestIndex := requestIndex + 1
         elementCursor := 0
-        state := Mux(prefetchValid(nextLineSlot),
+        state := Mux(prefetchValid(executeContext)(nextLineSlot),
           CachedTrGtState.EmitLine, CachedTrGtState.RequestLine)
       } otherwise {
         currentIndex := (currentIndex + 1).resized
@@ -847,9 +958,18 @@ class CachedTrGtSubrowAdapter(
       }
     }
   }
-  switch(io.cacheRequest.fire ## consumeCurrentLine) {
-    is(B"10") { prefetchOccupancy := prefetchOccupancy + 1 }
-    is(B"01") { prefetchOccupancy := prefetchOccupancy - 1 }
+  for (group <- 0 until groupCount) {
+    val groupValue = if (group == 1) True else False
+    val requestFire = io.cacheRequest.fire && requestGroup === groupValue
+    val consumeFire = consumeCurrentLine && executeGroup === groupValue
+    switch(requestFire ## consumeFire) {
+      is(B"10") {
+        prefetchOccupancy(group) := prefetchOccupancy(group) + 1
+      }
+      is(B"01") {
+        prefetchOccupancy(group) := prefetchOccupancy(group) - 1
+      }
+    }
   }
 
   when(state === CachedTrGtState.Finish) {
@@ -861,6 +981,12 @@ class CachedTrGtSubrowAdapter(
     unsupportedModeReg := schedulerUnsupportedModeSignal
     doneReg := True
     groupReady(executeGroup.asUInt) := False
+    prefetchActive(executeGroup.asUInt) := False
+    prefetchOccupancy(executeGroup.asUInt) :=
+      U(0, tileCfg.bPrefetchCountWidth bits)
+    for (slot <- 0 until prefetchDepth) {
+      prefetchValid(executeGroup.asUInt)(slot) := False
+    }
     nextExecuteGroup := !executeGroup
     state := CachedTrGtState.Collect
   }
@@ -870,12 +996,6 @@ class CachedTrGtSubrowAdapter(
     currentIndex := 0
     loadIndex := 0
     requestIndex := 0
-    nextRequestIndex := 0
-    prefetchOccupancy := 0
-    requestOutstanding := 0
-    for (slot <- 0 until prefetchDepth) {
-      prefetchValid(slot) := False
-    }
     doneReg := False
     overflowReg := False
     memoryErrorReg := False
@@ -888,6 +1008,15 @@ class CachedTrGtSubrowAdapter(
     for (group <- 0 until groupCount) {
       groupReady(group) := False
       groupCollectOpen(group) := False
+      prefetchActive(group) := False
+      prefetchAIndex(group) := 0
+      prefetchLineCount(group) := 0
+      nextRequestIndex(group) := 0
+      prefetchOccupancy(group) := 0
+      requestOutstanding(group) := 0
+      for (slot <- 0 until prefetchDepth) {
+        prefetchValid(group)(slot) := False
+      }
       for (index <- 0 until cfg.macLanes) aValid(group)(index) := False
     }
   }

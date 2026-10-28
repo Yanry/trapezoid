@@ -233,6 +233,16 @@ class TrapezoidPERowSpec extends AnyFunSuite {
         dut.io.controlPrepareCycles.toLong - firstPrepareCycles
       assert(repeatedPrepareCycles <= 1,
         "a cached route pattern must bypass the multi-cycle Benes solver")
+
+      dut.io.command.payload.endOfTile #= true
+      issue(dut)
+      val tileEndPrepareCycles = dut.io.controlPrepareCycles.toLong
+      dut.io.command.payload.endOfTile #= false
+      issue(dut)
+      val nextTilePrepareCycles =
+        dut.io.controlPrepareCycles.toLong - tileEndPrepareCycles
+      assert(nextTilePrepareCycles > 0,
+        "the first route pattern of a new tile must start from a cold cache")
     }
   }
 

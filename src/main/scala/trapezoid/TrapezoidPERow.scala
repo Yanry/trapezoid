@@ -472,6 +472,12 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       controlCacheReplace := controlCacheReplace + 1
       controlsStarted := False
     }
+    when(routeInput.fire && inputStage.payload.endOfTile) {
+      for (entry <- 0 until controlCacheEntries) {
+        controlCacheValid(entry) := False
+      }
+      controlCacheReplace := 0
+    }
   }
   when(routeInput.valid && useSparseTripRoute && mfiu.io.count =/= 0) {
     assert(aRouteRoutable && bRouteRoutable,

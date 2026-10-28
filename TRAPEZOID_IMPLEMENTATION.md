@@ -170,7 +170,7 @@ MFIU 面向最多 4 个 A fiber 和 4 个 B fiber：
 
 PE row 中有独立的 A、B 两个 `OperandDistributionNetwork`。MFIU 输出的是“哪个 source 参与哪个乘法”的索引；distribution network 把 source value 多播到对应 MAC lane。
 
-TrIP 主路径使用独立的 A/B Benes fabric。MFIU 输出 `routeValid + sourceIndex` metadata；控制生成器对合法多源 multicast pattern 做递归二分着色并产生每一级 2x2 switch controls。16 lane 及以下使用组合控制生成；paper 的 128 lane 使用带 ready/valid 的多周期精确求解器，并在 PE row 内增加 4-entry route-control cache。第一次出现的 route pattern 仍执行冷启动求解，重复 pattern 直接复用已生成的 A/B switch controls，因此 steady-state 不再支付 `263 x commandCount`。最后一条 `endOfTile` command 完成 route 后清空 cache，使下一 tile 从 cold route state 开始，同时保留 tile 内复用。`controlPrepareCycles` 只统计冷 route 阻塞周期。控制结果带 `routable`，PE row 对所有有效 TrIP route 执行断言；旧 radix-2 fallback 选择树已删除。
+TrIP 主路径使用独立的 A/B Benes fabric。MFIU 输出 `routeValid + sourceIndex` metadata；控制生成器对合法多源 multicast pattern 做递归二分着色并产生每一级 2x2 switch controls。16 lane 及以下使用组合控制生成；paper 的 128 lane 使用带 ready/valid 的多周期精确求解器，并在 PE row 内增加 4-entry route-control cache。paper-width 路径现在先检查所有有效 lane 的 A source 和 B source 是否分别唯一；若是单一 A/B 源广播，直接使用专用递归 broadcast controls，不启动通用图着色器。其它第一次出现的多源 route pattern 仍执行冷启动求解，重复 pattern 直接复用已生成的 A/B switch controls，因此 steady-state 不再支付 `263 x commandCount`。最后一条 `endOfTile` command 完成 route 后清空 cache，使下一 tile 从 cold route state 开始，同时保留 tile 内复用。`controlPrepareCycles` 只统计通用冷 route 的阻塞周期。控制结果带 `routable`，PE row 对所有有效 TrIP route 执行断言；旧 radix-2 fallback 选择树已删除。
 
 小/中规模配置使用低延迟 command/control FIFO；128-lane payload 太宽，当前受 SpinalHDL 1.7 超宽 FIFO elaboration 限制，只使用一个 elastic holding stage。它已经把重复 route 的吞吐改善到接近 command stream，但还不是论文目标的“metadata-only FIFO + 约 7 级、II=1 冷 route control pipeline”。冷 pattern 的准备时间、缓存替换和宽 command holding 仍会影响周期与面积。
 
@@ -378,7 +378,7 @@ final C write response consumed
 - 论文原始 FPGA/ASIC 的频率、NoC 和功耗；
 - 128-row full paper array 的已完成周期结果，除非确实完成对应仿真。
 
-默认小规模 RTL 仿真于 2026-10-28 使用上述命令重新验证，72 个 case 的结果、write 数和 checksum 全部通过。统一系统 Verilator 编译约 497 秒，72-case 仿真约 225 秒；这些主机时间不计入硬件周期。汇总周期如下，单元为 cycle，数值是每类 3 个 sample 的平均值：
+默认小规模 RTL 仿真于 2026-10-28 使用上述命令重新验证，72 个 case 的结果、write 数和 checksum 全部通过。统一系统 Verilator 编译约 501 秒，72-case 仿真约 215 秒；这些主机时间不计入硬件周期。汇总周期如下，单元为 cycle，数值是每类 3 个 sample 的平均值：
 
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
@@ -391,7 +391,7 @@ final C write response consumed
 
 这些数字来自同一个共享 `ModeSharedTileController`、同一套 PE row/local storage、cluster ROB 和 cold-cache 模型。`HS x MS/D` 下 TrGS 最快，`MS x MS/D` 下 TrIP 最快，`D x D` 下 DenseIp 最快；这三组推荐方向与论文一致。`HS x HS` 仍是 TrGS 的 350 cycle 小于 TrGT 的 401 cycle，原因是 16x16、0.39% A 只有一个非零，TrGT 的 subrow packing 没有第二条短 row 可合并，却仍要完成 CSR 扫描和 packed-group close。其 first C write 为 392 cycle，而 TrGS 为 110 cycle。
 
-本轮加入双 group A context、独立 A load cursor 和双 B reorder window 后，7.1 周期仍与上一版一致。定向 RTL 测试已经证明：当前 group 尚未完成时，下一 group 的全部有效 A 已写入 inactive context，首个 B window 也可完成 request/refill；两组连续执行的数值结果不会串组。但当前 16x16 benchmark 的 packed-group 长度和调度没有形成可观察的额外重叠收益。TrGT 在 `MS x D` 和 `D x D` 中仍分别为 24087.7 和 58353 cycle，主要瓶颈仍是单 node ordered merge、按 column/local-bank 的大量命令，以及 background 只覆盖首个 B window。
+现有双 group A context、独立 A load cursor 和双 B reorder window 在 7.1 中继续通过验证：当前 group 尚未完成时，下一 group 的全部有效 A 已写入 inactive context，首个 B window 也可完成 request/refill；两组连续执行的数值结果不会串组。但当前 16x16 benchmark 的 packed-group 长度和调度没有形成可观察的额外重叠收益。TrGT 在 `MS x D` 和 `D x D` 中仍分别为 24087.7 和 58353 cycle，主要瓶颈仍是单 node ordered merge、按 column/local-bank 的大量命令，以及 background 只覆盖首个 B window。本轮新增的 Benes 单源广播快速路径只用于 `macLanes > 16` 的 paper-width 控制分支，因此小规模 7.1 数值按预期保持不变。
 
 ### 7.2 `PaperSinglePERowCycleSimulation`
 
@@ -427,20 +427,22 @@ scripts/run-paper-single-perow.sh
 
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
-| HS x HS | 141 | 276 | 14 | 14 |
+| HS x HS | 141 | 14 | 14 | 14 |
 | HS x MS | 141 | 544 | 39 | 15 |
 | HS x D | 141 | 307 | 141 | 21 |
 | MS x MS | 141 | 544 | 195 | 65 |
 | MS x D | 141 | 307 | 909 | 221 |
 | D x D | 141 | 403 | 4109 | 1037 |
 
-这里的 DenseIp 141 cycle 主要由 128 个逐列 command 加 PE row pipeline/drain 构成。TrGT/TrGS 仍主要由当前命令拆分数量决定。TrIP 的 4-entry route-control cache 改变了原先 `263 x commandCount` 的趋势：冷 route pattern 先执行一次精确求解，后续相同 pattern 直接复用 controls。例如 `HS x HS` 的 1 条命令产生 262 个 `controlPrepareCycles`；`HS x MS` 的 7 条命令产生 524 个 prepare cycle，而不是约 1841 个。
+这里的 DenseIp 141 cycle 主要由 128 个逐列 command 加 PE row pipeline/drain 构成。TrGT/TrGS 仍主要由当前命令拆分数量决定。TrIP 的 4-entry route-control cache 改变了原先 `263 x commandCount` 的趋势；本轮又为单一 A/B source multicast 增加了专用 broadcast control 快速路径。`HS x HS` 只有一个 effectual MAC，A/B 两侧都属于单源广播，因此其 TrIP 从 276 cycle、262 个 `controlPrepareCycles` 降为 14 cycle、0 个 prepare cycle，数值结果和 checksum 不变。
 
-现在每个 workload 的最后一条 `endOfTile` command 会清空 route-control cache，因此下一 workload 不需要对 SRAM BlackBox 或整个 PE row 执行中途 reset，也能得到独立 cold-tile 结果。`HS x D` 和 `MS x D` 都由旧的 warm-cache 45 cycle 变为 307 cycle，其中 262 cycle 是冷 control prepare，32 cycle 是 route/MAC/MRN command stream 加 pipeline drain。`D x D` 为 403 cycle，即 262 cycle prepare 加 128-command stream 和 drain。
+这个快速路径不会把任意稀疏 pattern 误当成广播。`HS x MS` 的 7 条命令仍出现两个不同的多源 route pattern，产生 524 个 prepare cycle；`HS x D`、`MS x D` 和 `D x D` 仍各有一个通用冷 pattern，分别保持 262 个 prepare cycle。每个 workload 的最后一条 `endOfTile` command 会清空 route-control cache，因此下一 workload 仍是独立 cold-tile。`HS x D` 和 `MS x D` 均为 307 cycle，其中 262 cycle 是通用 control prepare，32 cycle 是 route/MAC/MRN command stream 加 pipeline drain；`D x D` 为 403 cycle。
+
+`HS x HS` 中 TrIP、TrGT、TrGS 都是 14 cycle，并不表示论文的 mode selector 应把该类别改选 TrIP。这个 single-row workload 只有一个有效乘法，三个 sparse mode 都退化成一条 command 加相同 PE pipeline；阵列级 subrow packing、cache traffic 和跨 row load balance 仍不在 7.2 边界内。
 
 测试还输出 `controlPrepareCycles`、`route`、`MAC`、`MRN`、`response` 五个 counter，以及 `commandCount`、`responseCount`、`usefulMacs`、`laneSlots` 和 checksum。`controlPrepareCycles` 表示 cold route 阻塞；其余四个是各 stage 持有 valid payload 的 occupancy delta，不是互斥阶段延迟，也不包含 CSR/DMA/cache/C write。完整端到端周期仍以 7.1 的最终 C write response 为准。
 
-本次成功的全量层次化构建中，paper kernel 生成约 257 秒，Verilator 编译约 672 秒，24-case RTL 仿真约 61 秒。运行时间不属于表中的硬件 cycle。本轮修改位于 TrGT frontend/group scheduler，不在 7.2 的独立 `TrapezoidPERow` command-to-response 边界内，因此 7.2 数值保持不变；重新运行用于确认接口和 paper-width RTL 没有回归。
+本次成功的全量层次化构建中，paper kernel 生成约 253 秒，Verilator 编译约 677 秒，24-case RTL 仿真约 59 秒。运行时间不属于表中的硬件 cycle。完整日志保存在 `/tmp/trapezoid-paper-single-perow-20261028-fast-benes.log`；7.1 日志保存在 `/tmp/trapezoid-e2e-small-20261028-fast-benes.log`。
 
 ### 7.3 Full paper array 的状态
 
@@ -460,7 +462,7 @@ scripts/run-paper-single-perow.sh
 
 ### 8.3 mode 的命令拆分还不是论文完整 scheduler
 
-当前测试为了覆盖全部组合，使用明确的、可验证的 command grouping：DenseIp 一列一命令，TrGt 按 B column 和 A bank 分组，TrGs 按 A nonzero 和 B line 分组，TrIp 使用当前动态 packing。论文中的 scheduler 还会联合考虑 subrow、buffer occupancy、跨 row 负载和 memory availability。paper 单-row TrIP 已能在 tile 内缓存并复用 route controls，tile 边界会恢复 cold state；但冷 pattern 仍执行多周期 solver。命令拆分和控制准备方式与论文不同时，周期排序仍会不同。
+当前测试为了覆盖全部组合，使用明确的、可验证的 command grouping：DenseIp 一列一命令，TrGt 按 B column 和 A bank 分组，TrGs 按 A nonzero 和 B line 分组，TrIp 使用当前动态 packing。论文中的 scheduler 还会联合考虑 subrow、buffer occupancy、跨 row 负载和 memory availability。paper 单-row TrIP 已能在 tile 内缓存并复用 route controls，单源广播可直接生成 controls，tile 边界会恢复 cold state；但其它冷多源 pattern 仍执行多周期 solver。命令拆分和控制准备方式与论文不同时，周期排序仍会不同。
 
 ### 8.4 计时边界不同
 
@@ -474,7 +476,7 @@ paper profile 已配置为论文的 4 clusters、128 banks、16-way、64 B line 
 
 ### 8.6 hardware implementation 仍有结构差异
 
-TrIP 主路径已对当前 MFIU 合法 pattern 生成完整 A/B Benes controls，`routable` 失败会断言，旧 fallback 选择树已删除。4-entry route-control cache 让重复 pattern 不再逐命令阻塞约 263 cycle，并新增 `controlPrepareCycles`。仍有差距：冷 pattern 仍由工程自定义的多周期递归 solver 生成；paper 宽度还没有 metadata-only 多 entry FIFO、约 7-stage/II=1 的冷 control pipeline，也未用论文版门级结构、布线约束和目标频率综合验证。
+TrIP 主路径已对当前 MFIU 合法 pattern 生成完整 A/B Benes controls，`routable` 失败会断言，旧 fallback 选择树已删除。4-entry route-control cache 让重复 pattern 不再逐命令阻塞约 263 cycle；单一 A/B source multicast 还可直接走 broadcast controls，并由 `controlPrepareCycles` 证实为零等待。仍有差距：其它冷多源 pattern 仍由工程自定义的多周期递归 solver 生成；paper 宽度还没有 metadata-only 多 entry FIFO、约 7-stage/II=1 的冷 control pipeline，也未用论文版门级结构、布线约束和目标频率综合验证。
 
 论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows。当前 scheduler 已实现 occupancy-aware 多行 packing、长行多 subrow 占用、两个 group descriptor/A context，以及每组独立 B reorder window。background group 可以在当前 group 执行期间把全部有效 A 写入 inactive register context，并预取第一个 A 的有限 B window；仍缺少把两个 A context 映射到共享物理 SRAM、后续 B windows 连续 refill，以及与 streaming merge 的整组 steady-state 重叠。
 
@@ -512,7 +514,7 @@ utilization = usefulMacs / laneSlots
 按优先级建议：
 
 1. 将现有双 A register context 映射为共享物理 SRAM 的双 context/bank ownership，并让 background refill 从首个 A window 扩展到整组连续 B windows；保持 group 获得 execute ownership 时直接进入 ready state，不重新执行 A load/refill。
-2. 将冷 Benes control generation 改为真正的受限-pattern metadata pipeline：MFIU compaction 同时生成各级 switch metadata，约 7 stage、II=1；增加 metadata FIFO/control FIFO，并保留 `routable` assertion 和 `controlPrepareCycles`，最终删除冷路径上的通用图着色 solver。
+2. 将当前只覆盖单源广播的 Benes 快速路径扩展为真正的受限-pattern metadata pipeline：MFIU compaction 同时生成各级 switch metadata，约 7 stage、II=1；增加 metadata FIFO/control FIFO，并保留 `routable` assertion 和 `controlPrepareCycles`，最终删除冷路径上的通用图着色 solver。
 3. 将 PE 内 segmented reduction、TrGS spatial accumulation 和 Gustavson ordered merge 统一到可配置的双模式 MRN node/tree，测量 backpressure 下的 II、面积和关键路径，并避免当前单 node merge 对 dense Gustavson workload 的串行化。
 4. 将每 bank 一个 miss context 扩展为真正的多 MSHR，增加 cluster-level refill channel arbitration/reorder 与多个外部 refill streams；为相同 set/bank 冲突加入 replay。
 5. 将 cache replacement、Gustavson partial buffers 等剩余 inferred memory 也绑定为目标工艺/FPGA memory macro，验证端口数、读延迟、write mask、冲突与初始化语义。

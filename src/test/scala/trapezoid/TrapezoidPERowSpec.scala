@@ -211,6 +211,26 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       dut.clockDomain.forkStimulus(10)
       clearInputs(dut, routedCfg)
       dut.io.command.payload.mode #= TrapezoidDataflow.TrIp
+
+      dut.io.command.payload.trip.a(0).valid #= true
+      dut.io.command.payload.trip.a(0).tag #= 1
+      dut.io.command.payload.trip.a(0).mask #= 0x1
+      dut.io.command.payload.trip.a(0).values(0) #= 3
+      dut.io.command.payload.trip.b(0).valid #= true
+      dut.io.command.payload.trip.b(0).tag #= 2
+      dut.io.command.payload.trip.b(0).mask #= 0x1
+      dut.io.command.payload.trip.b(0).values(0) #= 5
+
+      val broadcastPrepareStart = dut.io.controlPrepareCycles.toLong
+      issue(dut)
+      val broadcastPrepareCycles =
+        dut.io.controlPrepareCycles.toLong - broadcastPrepareStart
+      assert(broadcastPrepareCycles <= 1,
+        "a single-source multicast route must bypass the generic Benes solver")
+      assert(dut.io.response.payload.count.toInt == 1)
+      assert(dut.io.response.payload.results(0).value.toInt == 15)
+      dut.clockDomain.waitSampling()
+
       dut.io.command.payload.trip.a(0).valid #= true
       dut.io.command.payload.trip.a(0).tag #= 1
       dut.io.command.payload.trip.a(0).mask #= 0xff

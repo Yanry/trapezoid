@@ -184,6 +184,10 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     new PipelinedBenesRouteControlGenerator(cfg) else null
   val bPipelinedBenesControls = if (pipelinedBenesControls)
     new PipelinedBenesRouteControlGenerator(cfg) else null
+  val aBroadcastBenesControls = if (pipelinedBenesControls)
+    new BenesBroadcastControlGenerator(cfg) else null
+  val bBroadcastBenesControls = if (pipelinedBenesControls)
+    new BenesBroadcastControlGenerator(cfg) else null
   val aBenesFabric = new BenesDistributionFabric(cfg)
   val bBenesFabric = new BenesDistributionFabric(cfg)
   val input = inputStage.payload
@@ -255,8 +259,30 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val controlCacheHit = Bool()
   val cachedAControls = Bits(cfg.benesControlWidth bits)
   val cachedBControls = Bits(cfg.benesControlWidth bits)
+  val aBroadcastSource = UInt(cfg.macLaneIndexWidth bits)
+  val bBroadcastSource = UInt(cfg.macLaneIndexWidth bits)
   cachedAControls := 0
   cachedBControls := 0
+  aBroadcastSource := 0
+  bBroadcastSource := 0
+  val routeValidBits = mfiu.io.routes.map(_.valid).asBits
+  val firstValidRoute = OHMasking.first(routeValidBits)
+  for (lane <- 0 until cfg.macLanes) {
+    when(firstValidRoute(lane)) {
+      aBroadcastSource := mfiu.io.routes(lane).aSourceIndex
+      bBroadcastSource := mfiu.io.routes(lane).bSourceIndex
+    }
+  }
+  val aBroadcastMismatch = (0 until cfg.macLanes).map { lane =>
+    mfiu.io.routes(lane).valid &&
+      mfiu.io.routes(lane).aSourceIndex =/= aBroadcastSource
+  }.reduce(_ || _)
+  val bBroadcastMismatch = (0 until cfg.macLanes).map { lane =>
+    mfiu.io.routes(lane).valid &&
+      mfiu.io.routes(lane).bSourceIndex =/= bBroadcastSource
+  }.reduce(_ || _)
+  val broadcastRouteFastPath = sparseRouteNeedsControl &&
+    !aBroadcastMismatch && !bBroadcastMismatch
   for (lane <- 0 until cfg.macLanes) {
     aBenesFabric.io.sources(lane)(0) := mfiu.io.aSourceValid(lane)
     aBenesFabric.io.sources(lane)(cfg.dataWidth downto 1) :=
@@ -266,6 +292,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       mfiu.io.bSources(lane).asBits
   }
   if (pipelinedBenesControls) {
+    aBroadcastBenesControls.io.sourceIndex := aBroadcastSource
+    bBroadcastBenesControls.io.sourceIndex := bBroadcastSource
     val cacheHits = Bits(controlCacheEntries bits)
     for (entry <- 0 until controlCacheEntries) {
       var metadataMatches: Bool =
@@ -291,7 +319,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       }
     }
     val startBoth = inputStage.valid && sparseRouteNeedsControl &&
-      !controlCacheHit && !controlsStarted &&
+      !broadcastRouteFastPath && !controlCacheHit && !controlsStarted &&
       aPipelinedBenesControls.io.start.ready &&
       bPipelinedBenesControls.io.start.ready
     aPipelinedBenesControls.io.start.valid := startBoth
@@ -311,21 +339,28 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       controlsStarted := True
     }
     routeControlsReady := !sparseRouteNeedsControl ||
+      broadcastRouteFastPath ||
       controlCacheHit ||
       (aPipelinedBenesControls.io.result.valid &&
         bPipelinedBenesControls.io.result.valid)
     aRouteRoutable := !sparseRouteNeedsControl ||
+      broadcastRouteFastPath ||
       controlCacheHit ||
       (aPipelinedBenesControls.io.result.valid &&
         aPipelinedBenesControls.io.result.payload.routable)
     bRouteRoutable := !sparseRouteNeedsControl ||
+      broadcastRouteFastPath ||
       controlCacheHit ||
       (bPipelinedBenesControls.io.result.valid &&
         bPipelinedBenesControls.io.result.payload.routable)
-    aBenesFabric.io.controls := Mux(controlCacheHit, cachedAControls,
-      aPipelinedBenesControls.io.result.payload.controls)
-    bBenesFabric.io.controls := Mux(controlCacheHit, cachedBControls,
-      bPipelinedBenesControls.io.result.payload.controls)
+    aBenesFabric.io.controls := Mux(broadcastRouteFastPath,
+      aBroadcastBenesControls.io.controls,
+      Mux(controlCacheHit, cachedAControls,
+        aPipelinedBenesControls.io.result.payload.controls))
+    bBenesFabric.io.controls := Mux(broadcastRouteFastPath,
+      bBroadcastBenesControls.io.controls,
+      Mux(controlCacheHit, cachedBControls,
+        bPipelinedBenesControls.io.result.payload.controls))
     when(inputStage.valid && sparseRouteNeedsControl && !controlCacheHit &&
         !routeControlsReady) {
       controlPrepareCycleCounter := controlPrepareCycleCounter + 1

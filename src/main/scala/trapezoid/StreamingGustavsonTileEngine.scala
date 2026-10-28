@@ -11,7 +11,7 @@ case class GustavsonAccumulatorEntry(cfg: TrapezoidConfig) extends Bundle {
 
 object StreamingGustavsonState extends SpinalEnum {
   val Accept, WaitResponse, MergePrepare, MergeLoadOld, MergeCompare,
-      OutputLoad, OutputEmit, AbortDrain = newElement()
+      MergeNodeWait, OutputLoad, OutputEmit, AbortDrain = newElement()
 }
 
 /** Ordered streaming accumulator for TrGT/TrGS PE responses.
@@ -177,10 +177,20 @@ class GustavsonTileEngine(
   newEntry.row := responseReg.results(selectedNewIndex).row
   newEntry.column := responseReg.results(selectedNewIndex).column
   newEntry.value := responseReg.results(selectedNewIndex).value
-  val oldBeforeNew = oldEntry.row < newEntry.row ||
-    (oldEntry.row === newEntry.row && oldEntry.column < newEntry.column)
-  val sameCoordinate = oldEntry.row === newEntry.row &&
-    oldEntry.column === newEntry.column
+  val mergeNode = new DualModeMrnNode(cfg)
+  val oldAvailable = oldEntryValid && oldIndex < oldCount
+  mergeNode.io.input.valid := state === StreamingGustavsonState.MergeCompare &&
+    (oldAvailable || newAvailable)
+  mergeNode.io.input.payload.mode := MrnNodeMode.GustavsonMerge
+  mergeNode.io.input.payload.left.valid := oldAvailable
+  mergeNode.io.input.payload.left.row := oldEntry.row
+  mergeNode.io.input.payload.left.column := oldEntry.column
+  mergeNode.io.input.payload.left.value := oldEntry.value
+  mergeNode.io.input.payload.right.valid := newAvailable
+  mergeNode.io.input.payload.right.row := newEntry.row
+  mergeNode.io.input.payload.right.column := newEntry.column
+  mergeNode.io.input.payload.right.value := newEntry.value
+  mergeNode.io.output.ready := state === StreamingGustavsonState.MergeNodeWait
 
   switch(state) {
     is(StreamingGustavsonState.Accept) {
@@ -236,46 +246,7 @@ class GustavsonTileEngine(
     }
 
     is(StreamingGustavsonState.MergeCompare) {
-      val oldAvailable = oldEntryValid && oldIndex < oldCount
-      val chooseOld = oldAvailable && (!newAvailable || oldBeforeNew)
-      val chooseBoth = oldAvailable && newAvailable && sameCoordinate
-      val chooseNew = newAvailable && (!oldAvailable ||
-        (!oldBeforeNew && !sameCoordinate))
-      val hasWrite = chooseOld || chooseBoth || chooseNew
-      val canStore = writeIndex < tileCfg.accumulatorEntries
-
-      writeEnable := hasWrite && canStore
-      when(chooseBoth) {
-        writeEntry.row := oldEntry.row
-        writeEntry.column := oldEntry.column
-        writeEntry.value := (oldEntry.value + newEntry.value).resized
-      } elsewhen(chooseOld) {
-        writeEntry := oldEntry
-      } otherwise {
-        writeEntry := newEntry
-      }
-
-      when(hasWrite) {
-        when(canStore) {
-          writeIndex := writeIndex + 1
-        } otherwise {
-          overflowReg := True
-        }
-        when(chooseBoth || chooseNew) {
-          newIndex := newIndex + 1
-        }
-        when(chooseBoth || chooseOld) {
-          oldEntryValid := False
-          when(oldIndex + 1 < oldCount) {
-            oldIndex := oldIndex + 1
-            readEnable := True
-            readIndex := (oldIndex + 1).resized
-            state := StreamingGustavsonState.MergeLoadOld
-          } otherwise {
-            oldIndex := oldCount
-          }
-        }
-      } otherwise {
+      when(!oldAvailable && !newAvailable) {
         entryCount := writeIndex
         activeBuffer := !activeBuffer
         when(finalCommand) {
@@ -289,6 +260,40 @@ class GustavsonTileEngine(
           }
         } otherwise {
           state := StreamingGustavsonState.Accept
+        }
+      } elsewhen(mergeNode.io.input.fire) {
+        state := StreamingGustavsonState.MergeNodeWait
+      }
+    }
+
+    is(StreamingGustavsonState.MergeNodeWait) {
+      when(mergeNode.io.output.fire) {
+        val canStore = writeIndex < tileCfg.accumulatorEntries
+        writeEnable := canStore && mergeNode.io.output.payload.first.valid
+        writeEntry.row := mergeNode.io.output.payload.first.row
+        writeEntry.column := mergeNode.io.output.payload.first.column
+        writeEntry.value := mergeNode.io.output.payload.first.value
+        when(canStore) {
+          writeIndex := writeIndex + 1
+        } otherwise {
+          overflowReg := True
+        }
+        when(mergeNode.io.output.payload.consumeRight) {
+          newIndex := newIndex + 1
+        }
+        when(mergeNode.io.output.payload.consumeLeft) {
+          oldEntryValid := False
+          when(oldIndex + 1 < oldCount) {
+            oldIndex := oldIndex + 1
+            readEnable := True
+            readIndex := (oldIndex + 1).resized
+            state := StreamingGustavsonState.MergeLoadOld
+          } otherwise {
+            oldIndex := oldCount
+            state := StreamingGustavsonState.MergeCompare
+          }
+        } otherwise {
+          state := StreamingGustavsonState.MergeCompare
         }
       }
     }

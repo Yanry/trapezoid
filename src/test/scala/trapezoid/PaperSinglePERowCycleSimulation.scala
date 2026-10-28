@@ -63,6 +63,7 @@ object PaperSinglePERowCycleSimulation extends App {
                                  commandCount: Int, responseCount: Int,
                                  outputCount: Int, usefulMacs: Long,
                                  laneSlots: Long, checksum: Long,
+                                 controlPrepareCycles: Long,
                                  routeCycles: Long, macCycles: Long,
                                  mrnCycles: Long, responseCycles: Long)
 
@@ -193,6 +194,7 @@ object PaperSinglePERowCycleSimulation extends App {
     io.response.valid := core.io.response.valid
     io.response.payload := core.io.response.payload
     core.io.response.ready := io.response.ready
+    io.controlPrepareCycles := core.io.controlPrepareCycles
     io.routeCycles := core.io.routeCycles
     io.macCycles := core.io.macCycles
     io.mrnCycles := core.io.mrnCycles
@@ -320,9 +322,8 @@ object PaperSinglePERowCycleSimulation extends App {
 
   private def runSimulation(): Unit = {
     val simConfig = SimConfig.withVerilator
-      .workspaceName(s"PaperSinglePERowCycleSimulation-${
-        modeFilter.getOrElse("all")}")
       .disableCache
+      .workspaceName("PaperSinglePERowCycleSimulation-all")
       .addSimulatorFlag("-CFLAGS -std=c++14")
       .addSimulatorFlag("-LDFLAGS -std=c++14")
       .addSimulatorFlag("--hierarchical")
@@ -407,6 +408,8 @@ object PaperSinglePERowCycleSimulation extends App {
       def run(workload: Workload, mode: String): Measurement = {
         val commands = commandsFor(workload, mode)
         val expectedValues = expected(workload)
+        println(s"Starting ${workload.category.name} $mode " +
+          s"sample=${workload.sample} commands=${commands.size}")
         val observed = mutable.Map.empty[(Int, Int), Long]
         var nextCommand = 0
         var acceptedCommands = 0
@@ -414,10 +417,10 @@ object PaperSinglePERowCycleSimulation extends App {
         var cycles = 0L
         var firstAccepted = -1L
         var lastResponse = -1L
-        // Let initialized RTL registers settle before taking per-case deltas.
         dut.io.command.valid #= false
         dut.io.response.ready #= true
         step()
+        val controlPrepareStart = dut.io.controlPrepareCycles.toLong
         val routeStart = dut.io.routeCycles.toLong
         val macStart = dut.io.macCycles.toLong
         val mrnStart = dut.io.mrnCycles.toLong
@@ -425,7 +428,8 @@ object PaperSinglePERowCycleSimulation extends App {
 
         dut.io.command.valid #= false
         dut.io.response.ready #= true
-        while (responses < commands.size) {
+        val cycleLimit = 100000L
+        while (responses < commands.size && cycles < cycleLimit) {
           if (nextCommand < commands.size) {
             driveCommand(workload, commands(nextCommand))
             dut.io.command.valid #= true
@@ -462,6 +466,9 @@ object PaperSinglePERowCycleSimulation extends App {
         }
         dut.io.command.valid #= false
 
+        require(cycles < cycleLimit,
+          s"$mode ${workload.category.name} timed out after $cycleLimit cycles: " +
+            s"accepted=$acceptedCommands responses=$responses commands=${commands.size}")
         require(acceptedCommands == commands.size,
           s"$mode accepted $acceptedCommands/${commands.size} commands")
         require(observed.toMap == expectedValues,
@@ -473,13 +480,18 @@ object PaperSinglePERowCycleSimulation extends App {
           k <- 0 until dimension if workload.a(row, k) != 0
           column <- 0 until dimension if workload.b(k, column) != 0
         } yield 1L).sum
-        Measurement(workload.category, workload.sample, mode,
+        val measurement = Measurement(workload.category, workload.sample, mode,
           lastResponse - firstAccepted + 1, commands.size, responses,
           observed.size, usefulMacs, commands.size.toLong * cfg.macLanes,
-          checksum(observed), dut.io.routeCycles.toLong - routeStart,
+          checksum(observed),
+          dut.io.controlPrepareCycles.toLong - controlPrepareStart,
+          dut.io.routeCycles.toLong - routeStart,
           dut.io.macCycles.toLong - macStart,
           dut.io.mrnCycles.toLong - mrnStart,
           dut.io.responseCycles.toLong - responseStart)
+        println(s"Completed ${workload.category.name} $mode: " +
+          s"cycles=${measurement.cycles} control=${measurement.controlPrepareCycles}")
+        measurement
       }
 
       for (workload <- workloads; mode <- modes) {
@@ -511,15 +523,18 @@ object PaperSinglePERowCycleSimulation extends App {
         s"${values.mkString(" | ")} |")
     }
     println("\nDetailed streamed measurements")
-    println("| Category | Mode | E2E cycles | Route | MAC | MRN | Response | " +
+    println("| Category | Mode | E2E cycles | Control prepare | Route | " +
+      "MAC | MRN | Response | " +
       "Commands | Responses | Output coordinates | Useful MACs | Lane slots | " +
       "Utilization | Checksum |")
-    println("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | " +
-      "---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    println("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | " +
+      "---: | ---: | " +
+      "---: | ---: | ---: | ---: | ---: |")
     measurements.foreach { measurement =>
       val utilization = 100.0 * measurement.usefulMacs / measurement.laneSlots
       println(s"| ${measurement.category.name} | ${measurement.mode} | " +
-        s"${measurement.cycles} | ${measurement.routeCycles} | " +
+        s"${measurement.cycles} | ${measurement.controlPrepareCycles} | " +
+        s"${measurement.routeCycles} | " +
         s"${measurement.macCycles} | ${measurement.mrnCycles} | " +
         s"${measurement.responseCycles} | ${measurement.commandCount} | " +
         s"${measurement.responseCount} | ${measurement.outputCount} | " +

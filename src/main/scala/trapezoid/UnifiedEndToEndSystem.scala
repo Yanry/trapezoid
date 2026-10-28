@@ -50,39 +50,46 @@ class ClusteredReadCache(clusterCfg: CacheClusterConfig) extends Component {
   }
 
   val clusters = Array.fill(clusterCount)(new BankedReadCache(localCfg))
+  val clientClusterOrder = Array.fill(cacheCfg.clientCount)(
+    StreamFifo(UInt(clusterCfg.clusterIndexWidth bits),
+      cacheCfg.maxOutstandingPerClient))
   for (cluster <- 0 until clusterCount) {
     clusters(cluster).io.clear := io.clear
   }
 
   for (client <- 0 until cacheCfg.clientCount) {
+    clientClusterOrder(client).io.flush := io.clear
+    clientClusterOrder(client).io.push.payload :=
+      clusterOf(io.requests(client).payload.address)
     io.requests(client).ready := False
     for (cluster <- 0 until clusterCount) {
       val selected = clusterOf(io.requests(client).payload.address) === cluster
       clusters(cluster).io.requests(client).valid :=
-        io.requests(client).valid && selected
+        io.requests(client).valid && selected &&
+          clientClusterOrder(client).io.push.ready
       clusters(cluster).io.requests(client).payload.address :=
         localAddressOf(io.requests(client).payload.address)
       clusters(cluster).io.requests(client).payload.requestId :=
         io.requests(client).payload.requestId
       when(selected) {
-        io.requests(client).ready := clusters(cluster).io.requests(client).ready
+        io.requests(client).ready := clusters(cluster).io.requests(client).ready &&
+          clientClusterOrder(client).io.push.ready
       }
     }
+    clientClusterOrder(client).io.push.valid := io.requests(client).fire
 
-    val responseChoices = Bits(clusterCount bits)
-    var earlierResponse: Bool = False
+    val expectedCluster = clientClusterOrder(client).io.pop.payload
     for (cluster <- 0 until clusterCount) {
-      responseChoices(cluster) := clusters(cluster).io.responses(client).valid &&
-        !earlierResponse
-      earlierResponse = earlierResponse ||
-        clusters(cluster).io.responses(client).valid
+      clusters(cluster).io.responses(client).ready := False
     }
-    io.responses(client).valid := responseChoices.orR
+    io.responses(client).valid := False
     io.responses(client).payload := CacheReadResponse(cacheCfg).getZero
     for (cluster <- 0 until clusterCount) {
-      clusters(cluster).io.responses(client).ready :=
-        io.responses(client).ready && responseChoices(cluster)
-      when(responseChoices(cluster)) {
+      val selected = clientClusterOrder(client).io.pop.valid &&
+        expectedCluster === cluster
+      when(selected) {
+        clusters(cluster).io.responses(client).ready := io.responses(client).ready
+        io.responses(client).valid := clusters(cluster).io.responses(client).valid
         io.responses(client).payload.requestId :=
           clusters(cluster).io.responses(client).payload.requestId
         io.responses(client).payload.data :=
@@ -93,6 +100,7 @@ class ClusteredReadCache(clusterCfg: CacheClusterConfig) extends Component {
           clusters(cluster).io.responses(client).payload.error
       }
     }
+    clientClusterOrder(client).io.pop.ready := io.responses(client).fire
   }
 
   val refillChoices = Bits(clusterCount bits)
@@ -151,8 +159,7 @@ class ClusteredReadCache(clusterCfg: CacheClusterConfig) extends Component {
       clusters(cluster).io.bankBusy(bank)
   }
   for (client <- 0 until cacheCfg.clientCount) {
-    io.clientOutstanding(client) := clusters
-      .map(_.io.clientOutstanding(client)).reduce(_ || _)
+    io.clientOutstanding(client) := clientClusterOrder(client).io.pop.valid
   }
   io.hitCount := clusters.map(_.io.hitCount).reduce(_ + _).resize(32)
   io.missCount := clusters.map(_.io.missCount).reduce(_ + _).resize(32)
@@ -381,15 +388,16 @@ class CsrGustavsonDescriptorFrontend(systemCfg: EndToEndSystemConfig)
 }
 
 object CachedTrGtState extends SpinalEnum {
-  val Collect, Start, FindA, RequestLine, WaitLine, EmitLine,
+  val Collect, LoadA, Start, FindA, RequestLine, WaitLine, EmitLine,
       Finish, WaitDone = newElement()
 }
 
 /** Aggregates one packed group of CSR A rows for the four temporal TrGT subrows.
   *
   * The row scheduler maps short A rows into disjoint subrows. This adapter
-  * loads each stationary A entry as its descriptor arrives, then streams each
-  * referenced B line into the FIFO selected by the packed A index.
+  * stores each stationary A entry in one of two group contexts. The selected
+  * group loads A into the scheduler before its referenced B lines are streamed
+  * into the FIFO selected by the packed A index.
   */
 class CachedTrGtSubrowAdapter(
     systemCfg: EndToEndSystemConfig,
@@ -406,6 +414,10 @@ class CachedTrGtSubrowAdapter(
   private val elementIndexWidth = scala.math.max(1, log2Up(gustCfg.elementsPerLine))
   private val subrowIndexWidth = scala.math.max(1, log2Up(cfg.localBanks))
   private val prefetchDepth = tileCfg.bPrefetchDepth
+  private val groupCount = 2
+  private val lineIdWidth = scala.math.max(1, log2Up(gustCfg.maxLinesPerRow))
+  require(cacheCfg.requestIdWidth >= lineIdWidth + 1,
+    "TrGT request IDs must carry groupId and lineId")
 
   val io = new Bundle {
     val clear = in Bool()
@@ -485,13 +497,23 @@ class CachedTrGtSubrowAdapter(
   val schedulerTileReset = state === CachedTrGtState.WaitDone &&
     schedulerDoneSignal && !schedulerBusySignal
   if (!externalScheduler) scheduler.io.clear := io.clear || schedulerTileReset
-  val aValid = Vec((0 until cfg.macLanes).map(_ => RegInit(False)))
-  val aStorage = Vec((0 until cfg.macLanes).map(_ => Reg(GustavsonA(cfg))))
-  val bBaseStorage = Vec((0 until cfg.macLanes).map(_ =>
-    Reg(UInt(cacheCfg.addressWidth bits)) init 0))
-  val lineCountStorage = Vec((0 until cfg.macLanes).map(_ =>
-    Reg(UInt(gustCfg.lineCountWidth bits)) init 0))
+  val groupReady = Vec((0 until groupCount).map(_ => RegInit(False)))
+  val groupCollectOpen = Vec((0 until groupCount).map(_ => RegInit(False)))
+  val fillGroup = Reg(Bool()) init False
+  val executeGroup = Reg(Bool()) init False
+  val nextExecuteGroup = Reg(Bool()) init False
+  val aValid = Vec((0 until groupCount).map(_ =>
+    Vec((0 until cfg.macLanes).map(_ => RegInit(False)))))
+  val aStorage = Vec((0 until groupCount).map(_ =>
+    Vec((0 until cfg.macLanes).map(_ => Reg(GustavsonA(cfg))))))
+  val bBaseStorage = Vec((0 until groupCount).map(_ =>
+    Vec((0 until cfg.macLanes).map(_ =>
+      Reg(UInt(cacheCfg.addressWidth bits)) init 0))))
+  val lineCountStorage = Vec((0 until groupCount).map(_ =>
+    Vec((0 until cfg.macLanes).map(_ =>
+      Reg(UInt(gustCfg.lineCountWidth bits)) init 0))))
   val currentIndex = Reg(UInt(scanIndexWidth bits)) init 0
+  val loadIndex = Reg(UInt(scanIndexWidth bits)) init 0
   val requestIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
   val nextRequestIndex = Reg(UInt(gustCfg.lineCountWidth bits)) init 0
   val prefetchOccupancy = Reg(UInt(tileCfg.bPrefetchCountWidth bits)) init 0
@@ -500,7 +522,6 @@ class CachedTrGtSubrowAdapter(
   val prefetchData = Vec((0 until prefetchDepth).map(_ =>
     Reg(Bits(cacheCfg.lineWidth bits)) init 0))
   val elementCursor = Reg(UInt(elementIndexWidth bits)) init 0
-  val rowCollectOpen = RegInit(False)
   val doneReg = RegInit(False)
   val overflowReg = RegInit(False)
   val memoryErrorReg = RegInit(False)
@@ -508,7 +529,8 @@ class CachedTrGtSubrowAdapter(
   val unsupportedModeReg = RegInit(False)
   val schedulerStarted = RegInit(False)
 
-  io.busy := state =/= CachedTrGtState.Collect
+  io.busy := state =/= CachedTrGtState.Collect || groupReady.asBits.orR ||
+    groupCollectOpen.asBits.orR
   io.done := doneReg
   io.overflow := overflowReg
   io.memoryError := memoryErrorReg
@@ -528,11 +550,17 @@ class CachedTrGtSubrowAdapter(
   currentBBase := 0
   currentLineCount := 0
   for (index <- 0 until cfg.macLanes) {
-    when(currentIndex === index) {
-      currentAValid := aValid(index)
-      currentA := aStorage(index)
-      currentBBase := bBaseStorage(index)
-      currentLineCount := lineCountStorage(index)
+    when(executeGroup === False && currentIndex === index) {
+      currentAValid := aValid(0)(index)
+      currentA := aStorage(0)(index)
+      currentBBase := bBaseStorage(0)(index)
+      currentLineCount := lineCountStorage(0)(index)
+    }
+    when(executeGroup === True && currentIndex === index) {
+      currentAValid := aValid(1)(index)
+      currentA := aStorage(1)(index)
+      currentBBase := bBaseStorage(1)(index)
+      currentLineCount := lineCountStorage(1)(index)
     }
   }
 
@@ -566,10 +594,28 @@ class CachedTrGtSubrowAdapter(
   val selectedElementValid = elementChoices.orR
   val selectedElement = lineElements(selectedElementIndex)
 
-  schedulerALoad.valid := state === CachedTrGtState.Collect &&
-    io.rowCommand.valid && io.rowCommand.payload.a.valid
-  schedulerALoad.payload.index := io.rowCommand.payload.aIndex
-  schedulerALoad.payload.element := io.rowCommand.payload.a
+  val loadAChoices = Bits(cfg.macLanes bits)
+  for (index <- 0 until cfg.macLanes) {
+    loadAChoices(index) := U(index, scanIndexWidth bits) >= loadIndex &&
+      Mux(executeGroup, aValid(1)(index), aValid(0)(index))
+  }
+  val loadAIndex = UInt(addressIndexWidth bits)
+  loadAIndex := 0
+  for (index <- (0 until cfg.macLanes).reverse) {
+    when(loadAChoices(index)) { loadAIndex := index }
+  }
+  val loadAFound = loadAChoices.orR
+  val loadAElement = GustavsonA(cfg)
+  loadAElement := GustavsonA(cfg).getZero
+  for (index <- 0 until cfg.macLanes) {
+    when(loadAIndex === index) {
+      loadAElement := Mux(executeGroup,
+        aStorage(1)(index), aStorage(0)(index))
+    }
+  }
+  schedulerALoad.valid := state === CachedTrGtState.LoadA && loadAFound
+  schedulerALoad.payload.index := loadAIndex
+  schedulerALoad.payload.element := loadAElement
   schedulerStart.payload.mode := TrapezoidDataflow.TrGt
   schedulerFinish := False
   for (subrow <- 0 until cfg.localBanks) {
@@ -580,7 +626,7 @@ class CachedTrGtSubrowAdapter(
   val nextAChoices = Bits(cfg.macLanes bits)
   for (index <- 0 until cfg.macLanes) {
     nextAChoices(index) := U(index, scanIndexWidth bits) >= currentIndex &&
-      aValid(index)
+      Mux(executeGroup, aValid(1)(index), aValid(0)(index))
   }
   val nextAIndex = UInt(addressIndexWidth bits)
   nextAIndex := 0
@@ -621,13 +667,16 @@ class CachedTrGtSubrowAdapter(
   val currentAddressError = currentAValid &&
     (currentLineCount === 0 || exclusiveEnd > addressLimit)
 
-  io.rowCommand.ready := !io.clear && state === CachedTrGtState.Collect &&
-    (!io.rowCommand.payload.a.valid || schedulerALoad.ready)
+  io.rowCommand.ready := !io.clear && !groupReady(fillGroup.asUInt)
   when(io.rowCommand.fire) {
     doneReg := False
-    when(!rowCollectOpen) {
-      for (index <- 0 until cfg.macLanes) aValid(index) := False
-      rowCollectOpen := True
+    when(!groupCollectOpen(fillGroup.asUInt)) {
+      for (group <- 0 until groupCount; index <- 0 until cfg.macLanes) {
+        when(fillGroup === (if (group == 1) True else False)) {
+          aValid(group)(index) := False
+        }
+      }
+      groupCollectOpen(fillGroup.asUInt) := True
     }
     when(io.rowCommand.payload.mode =/= TrapezoidDataflow.TrGt) {
       unsupportedModeReg := True
@@ -640,19 +689,39 @@ class CachedTrGtSubrowAdapter(
       doneReg := True
     } otherwise {
       when(io.rowCommand.payload.a.valid) {
-        aValid(io.rowCommand.payload.aIndex) := True
-        aStorage(io.rowCommand.payload.aIndex) := io.rowCommand.payload.a
-        bBaseStorage(io.rowCommand.payload.aIndex) :=
-          io.rowCommand.payload.bBaseAddress
-        lineCountStorage(io.rowCommand.payload.aIndex) :=
-          io.rowCommand.payload.lineCount
+        for (group <- 0 until groupCount) {
+          when(fillGroup === (if (group == 1) True else False)) {
+            aValid(group)(io.rowCommand.payload.aIndex) := True
+            aStorage(group)(io.rowCommand.payload.aIndex) :=
+              io.rowCommand.payload.a
+            bBaseStorage(group)(io.rowCommand.payload.aIndex) :=
+              io.rowCommand.payload.bBaseAddress
+            lineCountStorage(group)(io.rowCommand.payload.aIndex) :=
+              io.rowCommand.payload.lineCount
+          }
+        }
       }
       when(io.rowCommand.payload.endOfTile) {
-        currentIndex := 0
-        rowCollectOpen := False
-        schedulerStarted := False
-        state := CachedTrGtState.FindA
+        groupReady(fillGroup.asUInt) := True
+        groupCollectOpen(fillGroup.asUInt) := False
+        fillGroup := !fillGroup
       }
+    }
+  }
+  when(state === CachedTrGtState.Collect && groupReady.asBits.orR) {
+    executeGroup := Mux(groupReady(nextExecuteGroup.asUInt),
+      nextExecuteGroup, !nextExecuteGroup)
+    currentIndex := 0
+    loadIndex := 0
+    schedulerStarted := False
+    state := CachedTrGtState.LoadA
+  }
+  when(state === CachedTrGtState.LoadA) {
+    when(!loadAFound) {
+      currentIndex := 0
+      state := CachedTrGtState.FindA
+    } elsewhen(schedulerALoad.fire) {
+      loadIndex := loadAIndex.resize(scanIndexWidth) + 1
     }
   }
   when(state === CachedTrGtState.Start && schedulerStart.fire) {
@@ -693,24 +762,29 @@ class CachedTrGtSubrowAdapter(
   io.cacheRequest.valid := !io.clear && canIssuePrefetch
   io.cacheRequest.payload.address :=
     (currentBBase + nextRequestIndex.resized).resized
-  io.cacheRequest.payload.requestId := nextRequestIndex.resized
+  io.cacheRequest.payload.requestId :=
+    (executeGroup.asBits ## nextRequestIndex(lineIdWidth - 1 downto 0)
+      .asBits).asUInt.resized
   when(io.cacheRequest.fire) {
     nextRequestIndex := nextRequestIndex + 1
   }
   io.cacheResponse.ready := !io.clear && state =/= CachedTrGtState.Collect &&
     requestOutstanding =/= 0
-  val responseSlot = io.cacheResponse.payload.requestId(
+  val responseLineIndex = io.cacheResponse.payload.requestId(
+    lineIdWidth - 1 downto 0).resize(gustCfg.lineCountWidth)
+  val responseGroup = io.cacheResponse.payload.requestId(lineIdWidth)
+  val responseSlot = responseLineIndex(
     tileCfg.bPrefetchSlotWidth - 1 downto 0)
   when(io.cacheResponse.fire) {
     when(io.cacheResponse.payload.error ||
-        io.cacheResponse.payload.requestId >= currentLineCount) {
+        responseGroup =/= executeGroup || responseLineIndex >= currentLineCount) {
       memoryErrorReg := True
       state := CachedTrGtState.Finish
     } otherwise {
       prefetchData(responseSlot) := io.cacheResponse.payload.data
       prefetchValid(responseSlot) := True
       when(state === CachedTrGtState.RequestLine &&
-          io.cacheResponse.payload.requestId === requestIndex) {
+          responseLineIndex === requestIndex) {
         elementCursor := 0
         state := CachedTrGtState.EmitLine
       }
@@ -735,7 +809,7 @@ class CachedTrGtSubrowAdapter(
   val laterAChoices = Bits(cfg.macLanes bits)
   for (index <- 0 until cfg.macLanes) {
     laterAChoices(index) := U(index, scanIndexWidth bits) > currentIndex &&
-      aValid(index)
+      Mux(executeGroup, aValid(1)(index), aValid(0)(index))
   }
   val terminalElement = state === CachedTrGtState.EmitLine &&
     selectedElementValid && !laterElement &&
@@ -786,12 +860,15 @@ class CachedTrGtSubrowAdapter(
     overflowReg := schedulerOverflowSignal
     unsupportedModeReg := schedulerUnsupportedModeSignal
     doneReg := True
+    groupReady(executeGroup.asUInt) := False
+    nextExecuteGroup := !executeGroup
     state := CachedTrGtState.Collect
   }
 
   when(io.clear) {
     state := CachedTrGtState.Collect
     currentIndex := 0
+    loadIndex := 0
     requestIndex := 0
     nextRequestIndex := 0
     prefetchOccupancy := 0
@@ -805,7 +882,14 @@ class CachedTrGtSubrowAdapter(
     addressErrorReg := False
     unsupportedModeReg := False
     schedulerStarted := False
-    for (index <- 0 until cfg.macLanes) aValid(index) := False
+    fillGroup := False
+    executeGroup := False
+    nextExecuteGroup := False
+    for (group <- 0 until groupCount) {
+      groupReady(group) := False
+      groupCollectOpen(group) := False
+      for (index <- 0 until cfg.macLanes) aValid(group)(index) := False
+    }
   }
 }
 

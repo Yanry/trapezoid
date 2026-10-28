@@ -54,9 +54,9 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
   val validBits = Vec((0 until cacheCfg.bankCount).map(_ =>
     Reg(Bits(validBitCount bits)) init 0))
   val dataMemories = Array.fill(cacheCfg.bankCount, cacheCfg.ways)(
-    Mem(Bits(cacheCfg.lineWidth bits), cacheCfg.setsPerBank))
+    new TrapezoidSyncSram(cacheCfg.lineWidth, cacheCfg.setsPerBank))
   val tagMemories = Array.fill(cacheCfg.bankCount, cacheCfg.ways)(
-    Mem(UInt(cacheCfg.tagWidth bits), cacheCfg.setsPerBank))
+    new TrapezoidSyncSram(cacheCfg.tagWidth, cacheCfg.setsPerBank))
   val replacementMemories = Array.fill(cacheCfg.bankCount)(
     Mem(UInt(cacheCfg.wayIndexWidth bits), cacheCfg.setsPerBank))
 
@@ -150,10 +150,21 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
     val accept = bankAccepts(bank) && !io.clear
     val requestSet = setOf(selectedRequest.address)
     for (way <- 0 until cacheCfg.ways) {
-      readWayData(bank)(way) :=
-        dataMemories(bank)(way).readSync(requestSet, accept)
-      readWayTags(bank)(way) :=
-        tagMemories(bank)(way).readSync(requestSet, accept)
+      val refillWrite = io.refillResponse.fire &&
+        io.refillResponse.payload.bank === bank &&
+        !io.refillResponse.payload.error && victimWayRegs(bank) === way
+      dataMemories(bank)(way).io.read_enable := accept
+      dataMemories(bank)(way).io.read_address := requestSet
+      dataMemories(bank)(way).io.write_enable := refillWrite
+      dataMemories(bank)(way).io.write_address := setRegs(bank)
+      dataMemories(bank)(way).io.write_data := io.refillResponse.payload.data
+      tagMemories(bank)(way).io.read_enable := accept
+      tagMemories(bank)(way).io.read_address := requestSet
+      tagMemories(bank)(way).io.write_enable := refillWrite
+      tagMemories(bank)(way).io.write_address := setRegs(bank)
+      tagMemories(bank)(way).io.write_data := tagOf(addressRegs(bank)).asBits
+      readWayData(bank)(way) := dataMemories(bank)(way).io.read_data
+      readWayTags(bank)(way) := tagMemories(bank)(way).io.read_data.asUInt
     }
     readReplacement(bank) := replacementMemories(bank).readSync(requestSet, accept)
 
@@ -245,14 +256,6 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
       responseData(bank) := io.refillResponse.payload.data
       responseError(bank) := io.refillResponse.payload.error
       when(!io.refillResponse.payload.error) {
-        for (way <- 0 until cacheCfg.ways) {
-          when(victimWayRegs(bank) === way) {
-            dataMemories(bank)(way).write(setRegs(bank),
-              io.refillResponse.payload.data)
-            tagMemories(bank)(way).write(setRegs(bank),
-              tagOf(addressRegs(bank)))
-          }
-        }
         val validIndex = if (cacheCfg.ways == 1) {
           setRegs(bank)
         } else {

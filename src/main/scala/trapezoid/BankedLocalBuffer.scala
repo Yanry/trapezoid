@@ -19,18 +19,15 @@ class BankedLocalBuffer(cfg: TrapezoidConfig) extends Component {
   }
 
   for (bank <- 0 until cfg.localBanks) {
-    val memory = Mem(Bits(cfg.localLineWidth bits), cfg.localDepthPerBank)
-    when(io.bus.writes(bank).valid) {
-      memory.write(
-        address = io.bus.writes(bank).payload.address,
-        data = io.bus.writes(bank).payload.data,
-        mask = io.bus.writes(bank).payload.mask
-      )
-    }
-    io.bus.readResponses(bank).payload := memory.readSync(
-      address = io.bus.readCommands(bank).payload,
-      enable = io.bus.readCommands(bank).valid
-    )
+    val memory = new TrapezoidMaskedSyncSram(
+      cfg.localLineWidth, cfg.localDepthPerBank)
+    memory.io.write_enable := io.bus.writes(bank).valid
+    memory.io.write_address := io.bus.writes(bank).payload.address
+    memory.io.write_data := io.bus.writes(bank).payload.data
+    memory.io.write_mask := io.bus.writes(bank).payload.mask
+    memory.io.read_enable := io.bus.readCommands(bank).valid
+    memory.io.read_address := io.bus.readCommands(bank).payload
+    io.bus.readResponses(bank).payload := memory.io.read_data
     io.bus.readResponses(bank).valid := RegNext(io.bus.readCommands(bank).valid) init False
   }
 }

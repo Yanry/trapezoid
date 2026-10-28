@@ -64,6 +64,7 @@ case class PERowReductionPayload(cfg: TrapezoidConfig) extends Bundle {
 case class TrapezoidPERowIo(cfg: TrapezoidConfig) extends Bundle {
   val command = slave(Stream(PERowCommand(cfg)))
   val response = master(Stream(PERowResponse(cfg)))
+  val controlPrepareCycles = out UInt(32 bits)
   val routeCycles = out UInt(32 bits)
   val macCycles = out UInt(32 bits)
   val mrnCycles = out UInt(32 bits)
@@ -83,6 +84,8 @@ trait TrapezoidPERowComponent {
 class TrapezoidPERow(cfg: TrapezoidConfig)
     extends Component with TrapezoidPERowComponent {
   val io = TrapezoidPERowIo(cfg)
+  val controlPrepareCycleCounter = Reg(UInt(32 bits)) init 0
+  controlPrepareCycleCounter := controlPrepareCycleCounter
   val routeCycleCounter = Reg(UInt(32 bits)) init 0
   val macCycleCounter = Reg(UInt(32 bits)) init 0
   val mrnCycleCounter = Reg(UInt(32 bits)) init 0
@@ -158,8 +161,17 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     level
   }
 
-  // Stage 0: capture one complete command and decouple the scheduler from MFIU.
-  val inputStage = io.command.m2sPipe()
+  // Stage 0: hold route metadata independently from prepared route payloads.
+  // Paper-width commands use one elastic slot to avoid duplicating the very
+  // wide operand payload; smaller configurations use a deeper metadata FIFO.
+  val inputStage = if (cfg.macLanes > 64) {
+    io.command.m2sPipe()
+  } else {
+    val fifo = new StreamFifoLowLatency(
+      PERowCommand(cfg), depth = 4, latency = 1, useVec = false)
+    fifo.io.push <> io.command
+    fifo.io.pop
+  }
 
   // Stage 1: the MFIU/shift equivalent distributes operands to fixed lanes.
   val mfiu = new MultiFiberIntersection(cfg)
@@ -218,6 +230,33 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val bRouteRoutable = Bool()
   val sparseRouteNeedsControl = useSparseTripRoute && mfiu.io.count =/= 0
   val controlsStarted = if (pipelinedBenesControls) RegInit(False) else null
+  private val controlCacheEntries = 4
+  val controlCacheValid = if (pipelinedBenesControls)
+    Vec((0 until controlCacheEntries).map(_ => RegInit(False))) else null
+  val controlCacheRouteValid = if (pipelinedBenesControls)
+    Vec((0 until controlCacheEntries).map(_ =>
+      Reg(Bits(cfg.macLanes bits)) init 0)) else null
+  val controlCacheASources = if (pipelinedBenesControls)
+    Vec((0 until controlCacheEntries).map(_ =>
+      Vec((0 until cfg.macLanes).map(_ =>
+        Reg(UInt(cfg.macLaneIndexWidth bits)) init 0)))) else null
+  val controlCacheBSources = if (pipelinedBenesControls)
+    Vec((0 until controlCacheEntries).map(_ =>
+      Vec((0 until cfg.macLanes).map(_ =>
+        Reg(UInt(cfg.macLaneIndexWidth bits)) init 0)))) else null
+  val controlCacheAControls = if (pipelinedBenesControls)
+    Vec((0 until controlCacheEntries).map(_ =>
+      Reg(Bits(cfg.benesControlWidth bits)) init 0)) else null
+  val controlCacheBControls = if (pipelinedBenesControls)
+    Vec((0 until controlCacheEntries).map(_ =>
+      Reg(Bits(cfg.benesControlWidth bits)) init 0)) else null
+  val controlCacheReplace = if (pipelinedBenesControls)
+    Reg(UInt(log2Up(controlCacheEntries) bits)) init 0 else null
+  val controlCacheHit = Bool()
+  val cachedAControls = Bits(cfg.benesControlWidth bits)
+  val cachedBControls = Bits(cfg.benesControlWidth bits)
+  cachedAControls := 0
+  cachedBControls := 0
   for (lane <- 0 until cfg.macLanes) {
     aBenesFabric.io.sources(lane)(0) := mfiu.io.aSourceValid(lane)
     aBenesFabric.io.sources(lane)(cfg.dataWidth downto 1) :=
@@ -227,8 +266,33 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       mfiu.io.bSources(lane).asBits
   }
   if (pipelinedBenesControls) {
+    val cacheHits = Bits(controlCacheEntries bits)
+    for (entry <- 0 until controlCacheEntries) {
+      var metadataMatches: Bool =
+        controlCacheRouteValid(entry) === mfiu.io.routes.map(_.valid).asBits
+      for (lane <- 0 until cfg.macLanes) {
+        metadataMatches = metadataMatches &&
+          (!mfiu.io.routes(lane).valid ||
+            (controlCacheASources(entry)(lane) ===
+              mfiu.io.routes(lane).aSourceIndex &&
+              controlCacheBSources(entry)(lane) ===
+                mfiu.io.routes(lane).bSourceIndex))
+      }
+      cacheHits(entry) := controlCacheValid(entry) && metadataMatches
+    }
+    controlCacheHit := cacheHits.orR
+    val cacheHitIndex = UInt(log2Up(controlCacheEntries) bits)
+    cacheHitIndex := 0
+    for (entry <- 0 until controlCacheEntries) {
+      when(cacheHits(entry)) { cacheHitIndex := entry }
+      when(cacheHitIndex === entry) {
+        cachedAControls := controlCacheAControls(entry)
+        cachedBControls := controlCacheBControls(entry)
+      }
+    }
     val startBoth = inputStage.valid && sparseRouteNeedsControl &&
-      !controlsStarted && aPipelinedBenesControls.io.start.ready &&
+      !controlCacheHit && !controlsStarted &&
+      aPipelinedBenesControls.io.start.ready &&
       bPipelinedBenesControls.io.start.ready
     aPipelinedBenesControls.io.start.valid := startBoth
     bPipelinedBenesControls.io.start.valid := startBoth
@@ -247,19 +311,27 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       controlsStarted := True
     }
     routeControlsReady := !sparseRouteNeedsControl ||
+      controlCacheHit ||
       (aPipelinedBenesControls.io.result.valid &&
         bPipelinedBenesControls.io.result.valid)
     aRouteRoutable := !sparseRouteNeedsControl ||
+      controlCacheHit ||
       (aPipelinedBenesControls.io.result.valid &&
         aPipelinedBenesControls.io.result.payload.routable)
     bRouteRoutable := !sparseRouteNeedsControl ||
+      controlCacheHit ||
       (bPipelinedBenesControls.io.result.valid &&
         bPipelinedBenesControls.io.result.payload.routable)
-    aBenesFabric.io.controls :=
-      aPipelinedBenesControls.io.result.payload.controls
-    bBenesFabric.io.controls :=
-      bPipelinedBenesControls.io.result.payload.controls
+    aBenesFabric.io.controls := Mux(controlCacheHit, cachedAControls,
+      aPipelinedBenesControls.io.result.payload.controls)
+    bBenesFabric.io.controls := Mux(controlCacheHit, cachedBControls,
+      bPipelinedBenesControls.io.result.payload.controls)
+    when(inputStage.valid && sparseRouteNeedsControl && !controlCacheHit &&
+        !routeControlsReady) {
+      controlPrepareCycleCounter := controlPrepareCycleCounter + 1
+    }
   } else {
+    controlCacheHit := False
     for (lane <- 0 until cfg.macLanes) {
       aBenesControls.io.routeValid(lane) := mfiu.io.routes(lane).valid
       bBenesControls.io.routeValid(lane) := mfiu.io.routes(lane).valid
@@ -379,10 +451,25 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   routeInput.payload := routed
   inputStage.ready := routeInput.ready && routeControlsReady
   if (pipelinedBenesControls) {
-    val consumeControls = routeInput.fire && sparseRouteNeedsControl
+    val consumeControls = routeInput.fire && sparseRouteNeedsControl &&
+      !controlCacheHit
     aPipelinedBenesControls.io.result.ready := consumeControls
     bPipelinedBenesControls.io.result.ready := consumeControls
     when(consumeControls) {
+      controlCacheValid(controlCacheReplace) := True
+      controlCacheRouteValid(controlCacheReplace) :=
+        mfiu.io.routes.map(_.valid).asBits
+      for (lane <- 0 until cfg.macLanes) {
+        controlCacheASources(controlCacheReplace)(lane) :=
+          mfiu.io.routes(lane).aSourceIndex
+        controlCacheBSources(controlCacheReplace)(lane) :=
+          mfiu.io.routes(lane).bSourceIndex
+      }
+      controlCacheAControls(controlCacheReplace) :=
+        aPipelinedBenesControls.io.result.payload.controls
+      controlCacheBControls(controlCacheReplace) :=
+        bPipelinedBenesControls.io.result.payload.controls
+      controlCacheReplace := controlCacheReplace + 1
       controlsStarted := False
     }
   }
@@ -390,7 +477,14 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     assert(aRouteRoutable && bRouteRoutable,
       "MFIU emitted a route pattern not supported by the Benes solver")
   }
-  val routeStage = routeInput.m2sPipe()
+  val routeStage = if (cfg.macLanes > 64) {
+    routeInput.m2sPipe()
+  } else {
+    val fifo = new StreamFifoLowLatency(
+      PERowRoutePayload(cfg), depth = 2, latency = 1, useVec = false)
+    fifo.io.push <> routeInput
+    fifo.io.pop
+  }
 
   // Stage 2: signed multiplier lanes. Invalid lanes are explicitly zeroed.
   val route = routeStage.payload
@@ -642,6 +736,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   when(macStage.valid) { macCycleCounter := macCycleCounter + 1 }
   when(reductionStage.valid) { mrnCycleCounter := mrnCycleCounter + 1 }
   when(outputStage.valid) { responseCycleCounter := responseCycleCounter + 1 }
+  io.controlPrepareCycles := controlPrepareCycleCounter
   io.routeCycles := routeCycleCounter
   io.macCycles := macCycleCounter
   io.mrnCycles := mrnCycleCounter

@@ -504,4 +504,84 @@ class BankedReadCacheSpec extends AnyFunSuite {
       assert(transact(4, 4))
     }
   }
+
+  test("cluster ROB preserves client issue order across reverse refill completion") {
+    val clusteredCfg = CacheConfig(
+      wordWidth = 8,
+      wordsPerLine = 4,
+      addressWidth = 6,
+      bankCount = 4,
+      setsPerBank = 2,
+      clientCount = 1,
+      requestIdWidth = 4,
+      maxOutstandingPerClient = 4
+    )
+    val clusterCfg = CacheClusterConfig(clusteredCfg, clusterCount = 2)
+
+    simConfig.compile(new ClusteredReadCache(clusterCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.refillRequest.ready #= false
+      dut.io.refillResponse.valid #= false
+      dut.io.requests(0).valid #= false
+      dut.io.responses(0).ready #= true
+
+      def line(address: Int): BigInt = BigInt(address + 1) * 0x01010101L
+
+      def issue(address: Int, requestId: Int): Unit = {
+        dut.io.requests(0).payload.address #= address
+        dut.io.requests(0).payload.requestId #= requestId
+        dut.io.requests(0).valid #= true
+        while (!dut.io.requests(0).ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        dut.io.requests(0).valid #= false
+      }
+
+      issue(address = 0, requestId = 1)
+      issue(address = 2, requestId = 2)
+
+      val refills = mutable.ArrayBuffer.empty[(Int, Int)]
+      dut.io.refillRequest.ready #= true
+      while (refills.map(_._1).toSet.size < 2) {
+        if (dut.io.refillRequest.valid.toBoolean) {
+          val refill = (dut.io.refillRequest.payload.address.toInt,
+            dut.io.refillRequest.payload.bank.toInt)
+          if (!refills.exists(_._1 == refill._1)) refills += refill
+        }
+        dut.clockDomain.waitSampling()
+      }
+      assert(refills.map(_._1).toSet == Set(0, 2))
+
+      def complete(address: Int, bank: Int): Unit = {
+        dut.io.refillResponse.payload.address #= address
+        dut.io.refillResponse.payload.bank #= bank
+        dut.io.refillResponse.payload.data #= line(address)
+        dut.io.refillResponse.payload.error #= false
+        dut.io.refillResponse.valid #= true
+        while (!dut.io.refillResponse.ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        dut.io.refillResponse.valid #= false
+      }
+
+      val first = refills.find(_._1 == 0).get
+      val second = refills.find(_._1 == 2).get
+      complete(second._1, second._2)
+      for (_ <- 0 until 4) {
+        assert(!dut.io.responses(0).valid.toBoolean,
+          "a later cluster response must wait in the cluster ROB")
+        dut.clockDomain.waitSampling()
+      }
+
+      complete(first._1, first._2)
+      val responses = mutable.ArrayBuffer.empty[(Int, BigInt)]
+      while (responses.length < 2) {
+        if (dut.io.responses(0).valid.toBoolean) {
+          responses += ((dut.io.responses(0).payload.requestId.toInt,
+            dut.io.responses(0).payload.data.toBigInt))
+        }
+        dut.clockDomain.waitSampling()
+      }
+      assert(responses == Seq(1 -> line(0), 2 -> line(2)))
+    }
+  }
 }

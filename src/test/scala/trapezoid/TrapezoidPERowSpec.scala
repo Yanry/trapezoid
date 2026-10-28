@@ -200,6 +200,42 @@ class TrapezoidPERowSpec extends AnyFunSuite {
     }
   }
 
+  test("paper-width Benes control cache amortizes repeated route preparation") {
+    val routedCfg = cfg.copy(
+      fiberWidth = 8,
+      maxFibers = 4,
+      macLanes = 32,
+      outputLanes = 16,
+      localDepthPerBank = 16)
+    simConfig.compile(new TrapezoidPERow(routedCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      clearInputs(dut, routedCfg)
+      dut.io.command.payload.mode #= TrapezoidDataflow.TrIp
+      dut.io.command.payload.trip.a(0).valid #= true
+      dut.io.command.payload.trip.a(0).tag #= 1
+      dut.io.command.payload.trip.a(0).mask #= 0xff
+      dut.io.command.payload.trip.b(0).valid #= true
+      dut.io.command.payload.trip.b(0).tag #= 2
+      dut.io.command.payload.trip.b(0).mask #= 0xff
+      for (entry <- 0 until routedCfg.fiberWidth) {
+        dut.io.command.payload.trip.a(0).values(entry) #= entry + 1
+        dut.io.command.payload.trip.b(0).values(entry) #= entry + 2
+      }
+
+      issue(dut)
+      val firstPrepareCycles = dut.io.controlPrepareCycles.toLong
+      assert(firstPrepareCycles > 0,
+        "the first unseen route pattern must run the exact Benes solver")
+      dut.clockDomain.waitSampling()
+
+      issue(dut)
+      val repeatedPrepareCycles =
+        dut.io.controlPrepareCycles.toLong - firstPrepareCycles
+      assert(repeatedPrepareCycles <= 1,
+        "a cached route pattern must bypass the multi-cycle Benes solver")
+    }
+  }
+
   test("TrIP reports overflow instead of silently dropping products") {
     simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)

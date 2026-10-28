@@ -37,6 +37,10 @@ vhdl/
 *.vhd
 *.lst
 
+# Hand-written SRAM simulation/synthesis model used by Spinal BlackBoxes.
+!src/main/resources/rtl/
+!src/main/resources/rtl/TrapezoidSram.v
+
 # Spinal internal
 .spinal/
 .spinalhdl/

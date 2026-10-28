@@ -170,7 +170,9 @@ MFIU 面向最多 4 个 A fiber 和 4 个 B fiber：
 
 PE row 中有独立的 A、B 两个 `OperandDistributionNetwork`。MFIU 输出的是“哪个 source 参与哪个乘法”的索引；distribution network 把 source value 多播到对应 MAC lane。
 
-TrIP 主路径使用独立的 A/B Benes fabric。MFIU 输出 `routeValid + sourceIndex` metadata；控制生成器对合法多源 multicast pattern 做递归二分着色并产生每一级 2x2 switch controls。16 lane 及以下使用组合控制生成，paper 的 128 lane 使用带 ready/valid 的多周期控制生成器，输入命令在控制就绪前保持稳定。控制结果带 `routable`，PE row 对所有有效 TrIP route 执行断言；旧 radix-2 fallback 选择树已删除。paper 宽度采用固定 source-lane permutation，保证当前 MFIU 合法 pattern 可路由。该实现仍需要通过综合确认控制器频率和 Benes 布线面积。
+TrIP 主路径使用独立的 A/B Benes fabric。MFIU 输出 `routeValid + sourceIndex` metadata；控制生成器对合法多源 multicast pattern 做递归二分着色并产生每一级 2x2 switch controls。16 lane 及以下使用组合控制生成；paper 的 128 lane 使用带 ready/valid 的多周期精确求解器，并在 PE row 内增加 4-entry route-control cache。第一次出现的 route pattern 仍执行冷启动求解，重复 pattern 直接复用已生成的 A/B switch controls，因此 steady-state 不再支付 `263 x commandCount`。`controlPrepareCycles` 只统计冷 route 阻塞周期。控制结果带 `routable`，PE row 对所有有效 TrIP route 执行断言；旧 radix-2 fallback 选择树已删除。
+
+小/中规模配置使用低延迟 command/control FIFO；128-lane payload 太宽，当前受 SpinalHDL 1.7 超宽 FIFO elaboration 限制，只使用一个 elastic holding stage。它已经把重复 route 的吞吐改善到接近 command stream，但还不是论文目标的“metadata-only FIFO + 约 7 级、II=1 冷 route control pipeline”。冷 pattern 的准备时间、缓存替换和宽 command holding 仍会影响周期与面积。
 
 ### 4.5 Reduction tree 和 MRN
 
@@ -185,7 +187,9 @@ PE row 在 MAC 后为不同 mode 先整理顺序：
 - `TrGs` 做稳定的 valid compaction，并检查 column/coordinate 顺序；
 - `TrGt` 对 local bank 的 head 做有限排序，以恢复按 row/column 的 segment 顺序。
 
-之后输入 ready/valid MRN pipeline。每一层都带 `valid`、坐标和 `segmentStart`，相邻两个有效值只有属于同一 segment 才相加；任一级或 response FIFO 背压都会沿 Stream 反压返回。最后一级提取各 segment tail，形成响应中的 `(row, column, value)`。TrIP/DenseIp 使用这一棵 segmented reduction；TrGT/TrGS 的跨命令同坐标 merge 由下游 streaming Gustavson engine/local storage 完成。当前还不是论文中每个 MRN node 都可在两种 operation 间动态切换的逐节点复刻，但已经消除了无 ready/valid 的固定延迟假设。
+之后输入 ready/valid MRN pipeline。每一层都带 `valid`、坐标和 `segmentStart`，相邻两个有效值只有属于同一 segment 才相加；任一级或 response FIFO 背压都会沿 Stream 反压返回。最后一级提取各 segment tail，形成响应中的 `(row, column, value)`。TrIP/DenseIp 使用这一棵 segmented reduction。
+
+工程新增了单个 ready/valid `DualModeMrnNode`：IP operation 对同坐标输入做 reduction；Gustavson operation 对旧 partial stream 和新 product stream 做 compare/merge，相同坐标相加，否则输出坐标较小的一项并分别给出 consume 信号。`StreamingGustavsonTileEngine` 的 merge 主路径已使用这个 node。当前 PE 内 radix-2 segmented tree 尚未逐节点替换为该双模式 node，TrGS 的 spatial accumulator/外围控制也仍然独立，因此还不是论文中一棵 MRN 在两种 operation 间切换的完整复刻。
 
 这不是一个为每个输出 column 配置的完整 Gustavson accumulator。跨命令、跨 tile 的保留和写回由 Gustavson 前端、local buffer 或系统级结果路径负责。
 
@@ -195,9 +199,9 @@ buffer 分为三类：
 
 1. **PE row response FIFO**：吸收 reduction 输出和下游 backpressure，深度由 `responseFifoDepth` 控制。
 2. **`BankedLocalBuffer`**：四 bank 本地存储，用于按 K/subrow 组织驻留数据和 partial state；bank 选择与 local subrow 对齐，减少同周期访问冲突。
-3. **Gustavson FIFO/accumulator**：保存待处理的 B 元素、row/column 坐标和跨命令部分和。`GustavsonTileEngine` 使用两个交替的有序流 buffer，每个 buffer 按 `localBanks` 拆成独立 `Mem`；单 comparator/adder 每周期合并一个旧 entry 或 PE response entry。它已删除旧的全关联 compare-all/shift-all 插入网络，但仍是 inferred SRAM，尚未绑定目标工艺 macro。
+3. **Gustavson FIFO/accumulator**：保存待处理的 B 元素、row/column 坐标和跨命令部分和。`GustavsonTileEngine` 使用两个交替的有序流 buffer，每个 buffer 按 `localBanks` 拆分；单个双模式 MRN node 每次合并一个旧 entry 或 PE response entry。旧的全关联 compare-all/shift-all 插入网络已不在 streaming 主路径。
 
-local buffer 的 bank/line 结构影响 TrGt/TrGs 的访问和命令分组，但它不是 global cache；local buffer 也不负责完整矩阵的 DMA refill。
+`BankedLocalBuffer` 已替换为带 byte mask、同步读延迟的 SRAM BlackBox。它的 bank/line 结构影响 TrGt/TrGs 的访问和命令分组，但它不是 global cache，也不负责完整矩阵的 DMA refill。BlackBox 当前提供可仿真行为模型；映射到具体 ASIC SRAM compiler 或 FPGA BRAM/URAM 仍需后端约束。
 
 ### 4.7 Cache
 
@@ -213,14 +217,15 @@ local buffer 的 bank/line 结构影响 TrGt/TrGs 的访问和命令分组，但
 - miss 产生 refill 请求；
 - refill 完成后响应等待中的读请求；
 - 每个 client 有独立 outstanding credit，默认 4、paper profile 为 8；
-- request ID 进入 per-client issue-order FIFO，bank/refill 可乱序完成，response FIFO 按该 client 的发出顺序退休；
+- cache 内 request ID 进入 per-client issue-order FIFO，bank/refill 可乱序完成，response FIFO 按该 client 的发出顺序退休；
 - 每个 bank 有一个独立 miss context/MSHR，不同 bank 的 miss 可同时在飞；
-- data/tag storage 拆成 `bank x way` 独立 SRAM，避免推断一块 `lineWidth x ways` 的超宽 memory；
+- cluster wrapper 另有 per-client ROB，跨 cluster 的 response 也按 client issue order 退休；
+- data/tag storage 拆成 `bank x way` 独立同步 SRAM BlackBox，避免推断一块 `lineWidth x ways` 的超宽 memory；
 - cluster 将多个 bank 组合起来，系统级模型再将多个 cluster 连接到 DMA 读路径。
 
 cluster wrapper 会先用 global bank bits 选择 cluster，再删除 cluster index bits，将剩余地址交给 local cache 做 bank/set/tag 解码；refill 请求返回系统边界时再插回 cluster bits。这样每个 cluster 都能使用全部 128 sets，避免 cluster bits 固定后只访问部分 sets。
 
-当前没有完整的 dirty writeback、论文未明确的 replacement policy 复刻、真实 HBM/AXI 协议、NoC 路由和 cache coherence。C 写路径是系统级测试中的最终响应边界，不能理解为已经实现了论文硬件的完整内存子系统。
+当前每个 bank 仍只有一个 miss context，不是“每 bank 多 MSHR”；外部 refill 也仍是单 Stream 仲裁，不是多个并行 refill channel。replacement state 仍使用 inferred memory。工程还没有完整 dirty writeback、论文 replacement policy 复刻、真实 HBM/AXI 协议、NoC 路由和 cache coherence。C 写路径是系统级测试中的最终响应边界，不能理解为已经实现了论文硬件的完整内存子系统。
 
 ## 5. 四种 mode 的 dataflow
 
@@ -269,7 +274,9 @@ TrGt 的 B 输入通过四个独立 subrow FIFO temporally gather。最终 B 元
 
 当前 cached TrGT scheduler 已按 A-row occupancy 做 subrow packing。CSR command 携带 `aRowLength`，一行需要的 subrow 数为 `ceil(aRowLength / macLanesPerSubrow)`；短行可与后续行共享同一个 PE row 的四个 subrow，长行可连续占用多个 subrow。四个 subrow 填满、下一行放不下或 CSR 输入结束时关闭 packed tile。完成判断使用 packed tile 的 `assignedTiles/completedTiles`，不再把 CSR 非空行数误当成 TrGT tile 数。
 
-TrGT adapter 现在为每个 packed group 提供双深度 command FIFO，并用 `bPrefetchDepth` 参数建立 B-line outstanding window。每个 B-line request 携带 line index 作为 requestId，返回数据按 slot 写入 prefetch buffer，消费端按 `requestIndex` 顺序发射，因此 cache response 可以乱序返回而不改变 B stream 顺序。仍有差距：当前窗口属于单个 adapter，尚未把多个 packed group 的 B buffer 做成论文式完整跨 group ping-pong，也没有把 A-row packing 与所有 PE row 的 cache refill 完全并行化。
+TrGT adapter 现在有两个 group descriptor/context。当前 group 执行时可以继续接收下一 group 的 A metadata；group 按 `Fill -> Ready -> LoadA/Execute -> Drain` 的顺序交接，并保持输入 group 顺序。B-line request ID 编码 `groupId + lineId`，response 解码后写回对应 slot，允许 cache response 乱序返回而不改变 B stream 顺序。
+
+这仍是部分 ping-pong：descriptor 收集和 A context fill 已能与当前 group 重叠，但 B request/refill engine 仍服务单个 execute context，下一 group 不能在当前 group 执行时完整完成 B refill。要达到论文 steady-state，还需要为两个 context 独立维护 B slot/MSHR 状态，并让 fill/execute 两套 context 同时访问 cache cluster。
 
 ### 5.4 `TrGs`
 
@@ -375,16 +382,16 @@ final C write response consumed
 
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
-| HS x HS | 1160.0 | 808.0 | 397.0 | 350.0 |
-| HS x MS | 1173.7 | 821.7 | 483.7 | 350.0 |
-| HS x D | 1205.0 | 853.0 | 877.0 | 350.0 |
-| MS x MS | 1580.7 | 1226.0 | 2486.7 | 1897.7 |
-| MS x D | 1946.0 | 1578.0 | 17253.3 | 2518.3 |
-| D x D | 1962.0 | 2026.0 | 43877.0 | 8192.0 |
+| HS x HS | 1160.0 | 808.0 | 401.0 | 350.0 |
+| HS x MS | 1173.7 | 821.7 | 503.0 | 350.0 |
+| HS x D | 1205.0 | 853.0 | 1016.0 | 350.0 |
+| MS x MS | 1580.7 | 1226.0 | 2730.0 | 1897.7 |
+| MS x D | 1946.0 | 1578.0 | 24087.7 | 2518.3 |
+| D x D | 1962.0 | 2026.0 | 58353.0 | 8192.0 |
 
-这些数字来自同一个共享 `ModeSharedTileController`、同一套 PE row/local storage 和同一个 cold-cache 模型。`HS x MS/D` 下 TrGS 最快，`MS x MS/D` 下 TrIP 最快，`D x D` 下 DenseIp 最快；这三组推荐方向与论文一致。`HS x HS` 仍是 TrGS 的 350 cycle 小于 TrGT 的 397 cycle，原因是 16x16、0.39% A 只有一个非零，TrGT 的 subrow packing 没有第二条短 row 可合并，却仍要完成 CSR 扫描和 packed-group close。其 first C write 为 388 cycle，而 TrGS 为 110 cycle。
+这些数字来自同一个共享 `ModeSharedTileController`、同一套 PE row/local storage、cluster ROB 和 cold-cache 模型。`HS x MS/D` 下 TrGS 最快，`MS x MS/D` 下 TrIP 最快，`D x D` 下 DenseIp 最快；这三组推荐方向与论文一致。`HS x HS` 仍是 TrGS 的 350 cycle 小于 TrGT 的 401 cycle，原因是 16x16、0.39% A 只有一个非零，TrGT 的 subrow packing 没有第二条短 row 可合并，却仍要完成 CSR 扫描和 packed-group close。其 first C write 为 392 cycle，而 TrGS 为 110 cycle。
 
-本轮 cache credit/MSHR/reorder 使不同 bank miss 可以重叠，但小规模 Gustavson 路径的额外 ordered streaming merge 也进入了真实计时。它降低了全关联 accumulator 的面积增长风险，却不会自动缩短周期：TrGT 在 `MS x D` 和 `D x D` 中要执行大量按列、按 local-bank 分组的命令，因此分别达到 17253.3 和 43877 cycle。这些非推荐 mode 结果用于暴露当前调度代价，不应与论文只选择推荐 mode 的曲线直接比较。
+本轮将 Gustavson ordered merge 接入 ready/valid 双模式 MRN node，并加入双 group descriptor context。它降低了全关联 accumulator 的面积增长风险并验证了 backpressure，但单 node 串行 compare/merge 增加了每个 entry 的握手周期，而下一 group 的 B refill 尚不能与当前 group 真正重叠。因此 TrGT 在 `MS x D` 和 `D x D` 中分别达到 24087.7 和 58353 cycle。这个回归是当前微架构的真实 RTL 结果，说明仅增加 descriptor ping-pong 不能恢复论文 steady-state；下一步必须并行 B refill 与 merge。
 
 ### 7.2 `PaperSinglePERowCycleSimulation`
 
@@ -421,17 +428,19 @@ scripts/run-paper-single-perow.sh
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
 | HS x HS | 141 | 276 | 14 | 14 |
-| HS x MS | 141 | 1854 | 39 | 15 |
-| HS x D | 141 | 8429 | 141 | 21 |
-| MS x MS | 141 | 1854 | 195 | 65 |
-| MS x D | 141 | 8429 | 909 | 221 |
-| D x D | 141 | 33677 | 4109 | 1037 |
+| HS x MS | 141 | 544 | 39 | 15 |
+| HS x D | 141 | 45 | 141 | 21 |
+| MS x MS | 141 | 544 | 195 | 65 |
+| MS x D | 141 | 45 | 909 | 221 |
+| D x D | 141 | 403 | 4109 | 1037 |
 
-这里的 DenseIp 141 cycle 主要由 128 个逐列 command 加 PE row pipeline/drain 构成。TrGT/TrGS 与上一版命令数量主导的结果一致。TrIP 则真实计入了新的 128-lane 多周期 Benes control solver：1、7、32、128 条 TrIP command 分别得到 276、1854、8429、33677 cycle，约为每条命令 263 cycle 的控制生成和流水 drain。当前控制器在 PE row 输入处串行求解，尚未用 metadata FIFO 与前一条命令的 MAC/MRN 执行重叠，因此这个结果验证了完整可路由性，但不是论文期望的 TrIP steady-state 吞吐。
+这里的 DenseIp 141 cycle 主要由 128 个逐列 command 加 PE row pipeline/drain 构成。TrGT/TrGS 仍主要由当前命令拆分数量决定。TrIP 的 4-entry route-control cache 改变了原先 `263 x commandCount` 的趋势：冷 route pattern 先执行一次精确求解，后续相同 pattern 直接复用 controls。例如 `HS x HS` 的 1 条命令产生 262 个 `controlPrepareCycles`；`HS x MS` 的 7 条命令只产生 524 个 prepare cycle，而不是约 1841 个。
 
-测试还输出 `route`、`MAC`、`MRN`、`response` 四个 stage-valid counter，以及 `commandCount`、`responseCount`、`usefulMacs`、`laneSlots` 和 checksum。`routeCycles` 只在 route stage 持有有效 payload 时计数，不包含输入命令等待 Benes control solver 的周期；例如 `D x D` TrIP 总周期为 33677，但四个 stage counter 分别只有约 128。四个 counter 是 occupancy delta，不是互斥阶段延迟，也不包含 CSR/DMA/cache/C write。完整端到端周期仍以最终 C write response 为准。
+需要注意，这张表来自一次连续的 24-case 仿真，PE row 不在每个 workload 之间 reset，所以 route-control cache 会跨 case 保留。按当前固定顺序，`HS x D` 和 `MS x D` 的 route pattern 已被前面的 case 预热，`controlPrepareCycles=0`，因此其 TrIP 周期只有 45；`D x D` 又遇到一个冷 pattern，prepare 为 262 cycle。表中 TrIP 数字是“同一运行序列中的真实 RTL warm-cache 周期”，不是每个 workload 独立 cold-start 的公平结果。曾尝试在 BlackBox/层次化仿真中对每个 case 中途 reset，但会使第一个 DenseIp case停滞；在解决 reset/BlackBox 初始化问题前，测试保留连续运行，并输出每个 case 的 prepare delta。
 
-本次首次全量层次化构建中，paper kernel 生成约 113 秒，Verilator 编译约 679 秒，24-case RTL 仿真约 384 秒。运行时间不属于表中的硬件 cycle。
+测试还输出 `controlPrepareCycles`、`route`、`MAC`、`MRN`、`response` 五个 counter，以及 `commandCount`、`responseCount`、`usefulMacs`、`laneSlots` 和 checksum。`controlPrepareCycles` 表示 cold route 阻塞；其余四个是各 stage 持有 valid payload 的 occupancy delta，不是互斥阶段延迟，也不包含 CSR/DMA/cache/C write。完整端到端周期仍以 7.1 的最终 C write response 为准。
+
+本次成功的全量层次化构建中，paper kernel 生成约 252 秒，Verilator 编译约 666 秒，24-case RTL 仿真约 60 秒。运行时间不属于表中的硬件 cycle。
 
 ### 7.3 Full paper array 的状态
 
@@ -451,7 +460,7 @@ scripts/run-paper-single-perow.sh
 
 ### 8.3 mode 的命令拆分还不是论文完整 scheduler
 
-当前测试为了覆盖全部组合，使用明确的、可验证的 command grouping：DenseIp 一列一命令，TrGt 按 B column 和 A bank 分组，TrGs 按 A nonzero 和 B line 分组，TrIp 使用当前动态 packing。论文中的 scheduler 还会联合考虑 subrow、buffer occupancy、跨 row 负载和 memory availability。paper 单-row TrIP 还在每条命令前串行执行 Benes control solver；命令拆分和控制准备方式不同，周期排序就会不同。
+当前测试为了覆盖全部组合，使用明确的、可验证的 command grouping：DenseIp 一列一命令，TrGt 按 B column 和 A bank 分组，TrGs 按 A nonzero 和 B line 分组，TrIp 使用当前动态 packing。论文中的 scheduler 还会联合考虑 subrow、buffer occupancy、跨 row 负载和 memory availability。paper 单-row TrIP 已能缓存并复用 route controls，但冷 pattern 仍执行多周期 solver，并且当前 7.2 的 route cache 会跨 workload 预热；命令拆分、冷/热控制准备方式和论文不同时，周期排序也会不同。
 
 ### 8.4 计时边界不同
 
@@ -465,13 +474,13 @@ paper profile 已配置为论文的 4 clusters、128 banks、16-way、64 B line 
 
 ### 8.6 hardware implementation 仍有结构差异
 
-TrIP 主路径已对当前 MFIU 合法 pattern 生成完整 A/B Benes controls，`routable` 失败会断言，旧 fallback 选择树已删除。仍有差距：128-lane 控制器是当前工程自行实现的多周期递归 solver，尚未用论文版门级结构、布线约束和目标频率综合验证。
+TrIP 主路径已对当前 MFIU 合法 pattern 生成完整 A/B Benes controls，`routable` 失败会断言，旧 fallback 选择树已删除。4-entry route-control cache 让重复 pattern 不再逐命令阻塞约 263 cycle，并新增 `controlPrepareCycles`。仍有差距：冷 pattern 仍由工程自定义的多周期递归 solver 生成；paper 宽度还没有 metadata-only 多 entry FIFO、约 7-stage/II=1 的冷 control pipeline，也未用论文版门级结构、布线约束和目标频率综合验证。
 
-更直接的周期差距是该 solver 尚未 decouple：route metadata、control result 和待执行 command 没有形成可并行的 FIFO/pipeline，所以每条 TrIP command 都阻塞 PE row 输入约 263 cycle。下一步应将控制生成与上一命令的 distribution/MAC/MRN 重叠，并给 control-prepare 单独计数；否则 7.2 的 TrIP 数字主要测量 solver，而不是计算数据流。
+论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows。当前 scheduler 已实现 occupancy-aware 多行 packing、长行多 subrow 占用、B-line request reorder，以及两个 group descriptor/A context；但只有当前 execute group 能发 B refill。B prefetch、streaming merge 和下一 packed group 之间尚未形成完整 steady-state 双缓冲重叠。
 
-论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows。当前 scheduler 已实现 occupancy-aware 多行 packing、长行多 subrow 占用、B-line prefetch/reorder 和多 outstanding cache；但 B prefetch、A-row packing、streaming merge 和下一 packed group 之间还没有完全形成论文式 steady-state 双缓冲重叠。
+`StreamingGustavsonTileEngine` 已使用双 buffer、banked storage 和单个 ready/valid 双模式 MRN node 做 ordered merge，旧全关联插入 accumulator 不再位于 streaming 主路径。`BankedLocalBuffer` 和 cache data/tag 已绑定可仿真的同步 SRAM BlackBox。剩余差距是 PE 内 segmented tree 和 TrGS spatial path 还未统一到同一组双模式 MRN nodes；SRAM BlackBox 也尚未映射目标工艺 macro 并验证真实端口、读延迟和功耗。
 
-`GustavsonTileEngine` 已替换为双 buffer、banked inferred SRAM 和单 comparator/adder 的 ordered streaming merge，旧全关联插入 accumulator 不再位于主路径。剩余差距是还未绑定实际 SRAM macro，也没有逐节点复刻论文双模式 MRN；当前 PE 内 segmented reduction 与跨命令 merge 分属两个模块。
+cache cluster 已有 client credit、cache 内 request ordering、跨 cluster client ROB、每 bank 一个 miss context，以及 bank/way SRAM。它仍缺少每 bank 多 MSHR、多个并行 refill channel、冲突 replay 和论文内存网络时序，因此 cache-level memory parallelism 仍低于目标。
 
 ### 8.7 数值和验证对象不同
 
@@ -502,13 +511,15 @@ utilization = usefulMacs / laneSlots
 
 按优先级建议：
 
-1. 让 TrGT 的两组 packed-group buffer 真正跨组 ping-pong：一组执行/merge 时，另一组同时完成 A load、B-line refill 和 route preparation。
-2. 将当前 inferred bank/way cache SRAM、Gustavson 双 buffer 和 local storage 绑定为目标工艺/FPGA memory macro，验证端口数、读延迟和冲突 replay。
-3. 将 128-lane Benes control generation 从 PE 输入阻塞路径解耦为 metadata FIFO + control FIFO，使下一命令 route preparation 与当前命令 MAC/MRN 重叠，并增加独立 control-prepare counter。
-4. 把 PE 内 segmented reduction 与跨命令 ordered merge 进一步合并成论文式逐节点双模式 MRN，并测量 backpressure 下的 II、面积和关键路径。
-5. 导入论文相同矩阵，或至少使用相同 row/fiber length histogram、tile mapping 和 mode selection，而不只匹配平均 density。
-6. 扩展 array scheduler 的 row balancing、buffer occupancy 和 memory availability 联合决策；当前动态 B packing 只依据所有活动 row 的最大 effectual-MAC 数。
-7. 继续细分 setup、memory、route-control、MAC/MRN、merge 和 writeback；PE counter 是 stage occupancy，不是互斥阶段时长。
-8. 在 SRAM blackbox/层次化 Verilator 基础上再次尝试 128-row full array，并对齐 32x32 cluster crossbar、2 TB/s HBM、DMA burst 和 NoC/multicast 竞争。若比较面积和功耗，还需固定目标工艺、时钟约束、综合脚本和 switching activity。
+1. 把 TrGT 当前两个 descriptor/A context 扩展为两套独立 B slot、request/reorder 和 refill 状态；一组执行/merge 时，另一组同时完成 A load 和全部 B-line refill，再用明确的 `Fill/Ready/Execute/Drain` ownership 交换。
+2. 将冷 Benes control generation 改为真正的受限-pattern metadata pipeline：MFIU compaction 同时生成各级 switch metadata，约 7 stage、II=1；增加 metadata FIFO/control FIFO，并保留 `routable` assertion 和 `controlPrepareCycles`，最终删除冷路径上的通用图着色 solver。
+3. 将 PE 内 segmented reduction、TrGS spatial accumulation 和 Gustavson ordered merge 统一到可配置的双模式 MRN node/tree，测量 backpressure 下的 II、面积和关键路径，并避免当前单 node merge 对 dense Gustavson workload 的串行化。
+4. 将每 bank 一个 miss context 扩展为真正的多 MSHR，增加 cluster-level refill channel arbitration/reorder 与多个外部 refill streams；为相同 set/bank 冲突加入 replay。
+5. 将 cache replacement、Gustavson partial buffers 等剩余 inferred memory 也绑定为目标工艺/FPGA memory macro，验证端口数、读延迟、write mask、冲突与初始化语义。
+6. 修复 paper single-row BlackBox 仿真中的 per-workload reset/初始化，使 7.2 同时输出独立 cold-start 和连续 warm-cache 两组结果，避免 route cache 预热混淆比较。
+7. 导入论文相同矩阵，或至少使用相同 row/fiber length histogram、tile mapping 和 mode selection，而不只匹配平均 density。
+8. 扩展 array scheduler 的 row balancing、buffer occupancy 和 memory availability 联合决策；当前动态 B packing 只依据所有活动 row 的最大 effectual-MAC 数。
+9. 继续细分 setup、memory、route-control、MAC/MRN、merge 和 writeback；PE counter 是 stage occupancy，不是互斥阶段时长。
+10. 在 SRAM BlackBox/层次化 Verilator 基础上再次尝试 128-row full array，并对齐 32x32 cluster crossbar、2 TB/s HBM、DMA burst 和 NoC/multicast 竞争。若比较面积和功耗，还需固定目标工艺、时钟约束、综合脚本和 switching activity。
 
 在这些条件全部满足之前，当前结果最适合表述为“真实 RTL 对当前实现的数据流和计时边界进行验证”，而不是“复现论文性能曲线”。

@@ -35,6 +35,12 @@ class ClusteredReadCache(clusterCfg: CacheClusterConfig) extends Component {
     val responses = Vec(master(Stream(CacheReadResponse(cacheCfg))), cacheCfg.clientCount)
     val refillRequest = master(Stream(CacheRefillRequest(cacheCfg)))
     val refillResponse = slave(Stream(CacheRefillResponse(cacheCfg)))
+    val extraRefillRequests = if (cacheCfg.refillChannelCount > 1)
+      Vec(master(Stream(CacheRefillRequest(cacheCfg))),
+        cacheCfg.refillChannelCount - 1) else null
+    val extraRefillResponses = if (cacheCfg.refillChannelCount > 1)
+      Vec(slave(Stream(CacheRefillResponse(cacheCfg))),
+        cacheCfg.refillChannelCount - 1) else null
     val bankBusy = out Bits(cacheCfg.bankCount bits)
     val clientOutstanding = out Bits(cacheCfg.clientCount bits)
     val hitCount = out UInt(32 bits)
@@ -50,6 +56,20 @@ class ClusteredReadCache(clusterCfg: CacheClusterConfig) extends Component {
   }
 
   val clusters = Array.fill(clusterCount)(new BankedReadCache(localCfg))
+  private val refillRequestPorts = (0 until cacheCfg.refillChannelCount).map {
+    channel => if (channel == 0) io.refillRequest
+      else io.extraRefillRequests(channel - 1)
+  }
+  private val refillResponsePorts = (0 until cacheCfg.refillChannelCount).map {
+    channel => if (channel == 0) io.refillResponse
+      else io.extraRefillResponses(channel - 1)
+  }
+  private def clusterRefillRequest(cluster: Int, channel: Int) =
+    if (channel == 0) clusters(cluster).io.refillRequest
+    else clusters(cluster).io.extraRefillRequests(channel - 1)
+  private def clusterRefillResponse(cluster: Int, channel: Int) =
+    if (channel == 0) clusters(cluster).io.refillResponse
+    else clusters(cluster).io.extraRefillResponses(channel - 1)
   val clientClusterOrder = Array.fill(cacheCfg.clientCount)(
     StreamFifo(UInt(clusterCfg.clusterIndexWidth bits),
       cacheCfg.maxOutstandingPerClient))
@@ -103,54 +123,54 @@ class ClusteredReadCache(clusterCfg: CacheClusterConfig) extends Component {
     clientClusterOrder(client).io.pop.ready := io.responses(client).fire
   }
 
-  val refillChoices = Bits(clusterCount bits)
-  var earlierRefill: Bool = False
-  for (cluster <- 0 until clusterCount) {
-    refillChoices(cluster) := clusters(cluster).io.refillRequest.valid &&
-      !earlierRefill
-    earlierRefill = earlierRefill || clusters(cluster).io.refillRequest.valid
-  }
-  io.refillRequest.valid := refillChoices.orR
-  io.refillRequest.payload := CacheRefillRequest(cacheCfg).getZero
-  for (cluster <- 0 until clusterCount) {
-    clusters(cluster).io.refillRequest.ready :=
-      io.refillRequest.ready && refillChoices(cluster)
-    when(refillChoices(cluster)) {
-      io.refillRequest.payload.address :=
-          globalAddressOf(clusters(cluster).io.refillRequest.payload.address,
-            cluster)
-      if (clusterCount == 1) {
-        io.refillRequest.payload.bank :=
-          clusters(cluster).io.refillRequest.payload.bank.resized
-      } else {
-        io.refillRequest.payload.bank :=
-          (U(cluster, clusterCfg.clusterIndexWidth bits) ##
-            clusters(cluster).io.refillRequest.payload.bank).asUInt
+  for (channel <- 0 until cacheCfg.refillChannelCount) {
+    val refillChoices = Bits(clusterCount bits)
+    var earlierRefill: Bool = False
+    for (cluster <- 0 until clusterCount) {
+      val clusterRequest = clusterRefillRequest(cluster, channel)
+      refillChoices(cluster) := clusterRequest.valid && !earlierRefill
+      earlierRefill = earlierRefill || clusterRequest.valid
+    }
+    val externalRequest = refillRequestPorts(channel)
+    externalRequest.valid := refillChoices.orR
+    externalRequest.payload := CacheRefillRequest(cacheCfg).getZero
+    for (cluster <- 0 until clusterCount) {
+      val clusterRequest = clusterRefillRequest(cluster, channel)
+      clusterRequest.ready := externalRequest.ready && refillChoices(cluster)
+      when(refillChoices(cluster)) {
+        externalRequest.payload.address :=
+          globalAddressOf(clusterRequest.payload.address, cluster)
+        if (clusterCount == 1) {
+          externalRequest.payload.bank := clusterRequest.payload.bank.resized
+        } else {
+          externalRequest.payload.bank :=
+            (U(cluster, clusterCfg.clusterIndexWidth bits) ##
+              clusterRequest.payload.bank).asUInt
+        }
       }
     }
-  }
 
-  val responseCluster = if (clusterCount == 1) {
-    U(0, clusterCfg.clusterIndexWidth bits)
-  } else {
-    io.refillResponse.payload.bank(cacheCfg.bankIndexWidth - 1 downto
-      localBankWidth)
-  }
-  io.refillResponse.ready := False
-  for (cluster <- 0 until clusterCount) {
-    val selected = responseCluster === cluster
-    clusters(cluster).io.refillResponse.valid :=
-      io.refillResponse.valid && selected
-    clusters(cluster).io.refillResponse.payload.bank :=
-      io.refillResponse.payload.bank(localBankWidth - 1 downto 0).resized
-    clusters(cluster).io.refillResponse.payload.address :=
-      localAddressOf(io.refillResponse.payload.address)
-    clusters(cluster).io.refillResponse.payload.data :=
-      io.refillResponse.payload.data
-    clusters(cluster).io.refillResponse.payload.error :=
-      io.refillResponse.payload.error
-    when(selected) {
-      io.refillResponse.ready := clusters(cluster).io.refillResponse.ready
+    val externalResponse = refillResponsePorts(channel)
+    val responseCluster = if (clusterCount == 1) {
+      U(0, clusterCfg.clusterIndexWidth bits)
+    } else {
+      externalResponse.payload.bank(cacheCfg.bankIndexWidth - 1 downto
+        localBankWidth)
+    }
+    externalResponse.ready := False
+    for (cluster <- 0 until clusterCount) {
+      val clusterResponse = clusterRefillResponse(cluster, channel)
+      val selected = responseCluster === cluster
+      clusterResponse.valid := externalResponse.valid && selected
+      clusterResponse.payload.bank :=
+        externalResponse.payload.bank(localBankWidth - 1 downto 0).resized
+      clusterResponse.payload.address :=
+        localAddressOf(externalResponse.payload.address)
+      clusterResponse.payload.data := externalResponse.payload.data
+      clusterResponse.payload.error := externalResponse.payload.error
+      when(selected) {
+        externalResponse.ready := clusterResponse.ready
+      }
     }
   }
 
@@ -413,7 +433,9 @@ class CachedTrGtSubrowAdapter(
   private val addressIndexWidth = scala.math.max(1, log2Up(cfg.macLanes))
   private val elementIndexWidth = scala.math.max(1, log2Up(gustCfg.elementsPerLine))
   private val subrowIndexWidth = scala.math.max(1, log2Up(cfg.localBanks))
-  private val prefetchDepth = tileCfg.bPrefetchDepth
+  private val prefetchCapacity = cfg.localBanks * cfg.localDepthPerBank
+  private val prefetchSlotWidth = scala.math.max(1, log2Up(prefetchCapacity))
+  private val prefetchCountWidth = log2Up(prefetchCapacity + 1)
   private val groupCount = 2
   private val lineIdWidth = scala.math.max(1, log2Up(gustCfg.maxLinesPerRow))
   require(cacheCfg.requestIdWidth >= lineIdWidth + 1,
@@ -517,6 +539,11 @@ class CachedTrGtSubrowAdapter(
   val lineCountStorage = Vec((0 until groupCount).map(_ =>
     Vec((0 until cfg.macLanes).map(_ =>
       Reg(UInt(gustCfg.lineCountWidth bits)) init 0))))
+  val lineBaseStorage = Vec((0 until groupCount).map(_ =>
+    Vec((0 until cfg.macLanes).map(_ =>
+      Reg(UInt(prefetchSlotWidth bits)) init 0))))
+  val groupLineAllocation = Vec((0 until groupCount).map(_ =>
+    Reg(UInt(prefetchCountWidth bits)) init 0))
   val currentIndex = Reg(UInt(scanIndexWidth bits)) init 0
   val aLoadIndex = Vec((0 until groupCount).map(_ =>
     Reg(UInt(scanIndexWidth bits)) init 0))
@@ -530,13 +557,13 @@ class CachedTrGtSubrowAdapter(
   val nextRequestIndex = Vec((0 until groupCount).map(_ =>
     Reg(UInt(gustCfg.lineCountWidth bits)) init 0))
   val prefetchOccupancy = Vec((0 until groupCount).map(_ =>
-    Reg(UInt(tileCfg.bPrefetchCountWidth bits)) init 0))
+    Reg(UInt(prefetchCountWidth bits)) init 0))
   val requestOutstanding = Vec((0 until groupCount).map(_ =>
-    Reg(UInt(tileCfg.bPrefetchCountWidth bits)) init 0))
+    Reg(UInt(prefetchCountWidth bits)) init 0))
   val prefetchValid = Vec((0 until groupCount).map(_ =>
-    Vec((0 until prefetchDepth).map(_ => RegInit(False)))))
+    Vec((0 until prefetchCapacity).map(_ => RegInit(False)))))
   val prefetchData = Vec((0 until groupCount).map(_ =>
-    Vec((0 until prefetchDepth).map(_ =>
+    Vec((0 until prefetchCapacity).map(_ =>
       Reg(Bits(cacheCfg.lineWidth bits)) init 0))))
   val elementCursor = Reg(UInt(elementIndexWidth bits)) init 0
   val doneReg = RegInit(False)
@@ -587,7 +614,15 @@ class CachedTrGtSubrowAdapter(
   }
 
   val lineElements = Vec(TrGsB(cfg), gustCfg.elementsPerLine)
-  val currentPrefetchSlot = requestIndex(tileCfg.bPrefetchSlotWidth - 1 downto 0)
+  val currentLineBase = UInt(prefetchSlotWidth bits)
+  currentLineBase := 0
+  for (index <- 0 until cfg.macLanes) {
+    when(currentIndex === index) {
+      currentLineBase := lineBaseStorage(executeGroup.asUInt)(index)
+    }
+  }
+  val currentPrefetchSlot =
+    (currentLineBase + requestIndex.resized).resize(prefetchSlotWidth)
   val currentLineValid = prefetchValid(executeGroup.asUInt)(currentPrefetchSlot)
   val currentLineData = prefetchData(executeGroup.asUInt)(currentPrefetchSlot)
   for (element <- 0 until gustCfg.elementsPerLine) {
@@ -682,6 +717,21 @@ class CachedTrGtSubrowAdapter(
     when(backgroundAChoices(index)) { backgroundAIndex := index }
   }
   val backgroundAFound = backgroundAChoices.orR
+  val backgroundNextChoices = Bits(cfg.macLanes bits)
+  for (index <- 0 until cfg.macLanes) {
+    backgroundNextChoices(index) :=
+      U(index, scanIndexWidth bits) >
+        prefetchAIndex(backgroundGroup.asUInt).resize(scanIndexWidth) &&
+        Mux(backgroundGroup, aValid(1)(index), aValid(0)(index))
+  }
+  val backgroundNextAIndex = UInt(addressIndexWidth bits)
+  backgroundNextAIndex := 0
+  for (index <- (0 until cfg.macLanes).reverse) {
+    when(backgroundNextChoices(index)) {
+      backgroundNextAIndex := index
+    }
+  }
+  val backgroundNextAFound = backgroundNextChoices.orR
   val backgroundLineCount = UInt(gustCfg.lineCountWidth bits)
   backgroundLineCount := 0
   for (index <- 0 until cfg.macLanes) {
@@ -701,12 +751,32 @@ class CachedTrGtSubrowAdapter(
     nextRequestIndex(backgroundGroup.asUInt) :=
       U(0, gustCfg.lineCountWidth bits)
     prefetchOccupancy(backgroundGroup.asUInt) :=
-      U(0, tileCfg.bPrefetchCountWidth bits)
+      U(0, prefetchCountWidth bits)
     requestOutstanding(backgroundGroup.asUInt) :=
-      U(0, tileCfg.bPrefetchCountWidth bits)
-    for (slot <- 0 until prefetchDepth) {
+      U(0, prefetchCountWidth bits)
+    for (slot <- 0 until prefetchCapacity) {
       prefetchValid(backgroundGroup.asUInt)(slot) := False
     }
+  }
+
+  val backgroundWindowComplete = groupReady(backgroundGroup.asUInt) &&
+    prefetchActive(backgroundGroup.asUInt) &&
+    nextRequestIndex(backgroundGroup.asUInt) >=
+      prefetchLineCount(backgroundGroup.asUInt) &&
+    requestOutstanding(backgroundGroup.asUInt) === 0 &&
+    backgroundNextAFound &&
+    prefetchOccupancy(backgroundGroup.asUInt) < prefetchCapacity
+  when(backgroundWindowComplete) {
+    prefetchAIndex(backgroundGroup.asUInt) := backgroundNextAIndex
+    for (index <- 0 until cfg.macLanes) {
+      when(backgroundNextAIndex === index) {
+        prefetchLineCount(backgroundGroup.asUInt) :=
+          Mux(backgroundGroup, lineCountStorage(1)(index),
+            lineCountStorage(0)(index))
+      }
+    }
+    nextRequestIndex(backgroundGroup.asUInt) :=
+      U(0, gustCfg.lineCountWidth bits)
   }
 
   val currentSubrow = UInt(subrowIndexWidth bits)
@@ -738,6 +808,12 @@ class CachedTrGtSubrowAdapter(
     cacheCfg.addressWidth + 1 bits)
   val currentAddressError = currentAValid &&
     (currentLineCount === 0 || exclusiveEnd > addressLimit)
+  val fillAllocationBase = Mux(groupCollectOpen(fillGroup.asUInt),
+    groupLineAllocation(fillGroup.asUInt), U(0, prefetchCountWidth bits))
+  val fillAllocationEnd = fillAllocationBase +
+    io.rowCommand.payload.lineCount.resize(prefetchCountWidth)
+  val groupStorageOverflow = io.rowCommand.payload.a.valid &&
+    fillAllocationEnd > prefetchCapacity
 
   io.rowCommand.ready := !io.clear && !groupReady(fillGroup.asUInt)
   when(io.rowCommand.fire) {
@@ -748,7 +824,12 @@ class CachedTrGtSubrowAdapter(
           aValid(group)(index) := False
         }
       }
+      for (slot <- 0 until prefetchCapacity) {
+        prefetchValid(fillGroup.asUInt)(slot) := False
+      }
       groupCollectOpen(fillGroup.asUInt) := True
+      groupLineAllocation(fillGroup.asUInt) :=
+        U(0, prefetchCountWidth bits)
       aLoadIndex(fillGroup.asUInt) := U(0, scanIndexWidth bits)
       aLoadComplete(fillGroup.asUInt) := False
     }
@@ -758,6 +839,10 @@ class CachedTrGtSubrowAdapter(
       doneReg := True
     } elsewhen(io.rowCommand.payload.aIndex.resize(scanIndexWidth) >=
         U(cfg.macLanes, scanIndexWidth bits)) {
+      addressErrorReg := True
+      state := CachedTrGtState.Collect
+      doneReg := True
+    } elsewhen(groupStorageOverflow) {
       addressErrorReg := True
       state := CachedTrGtState.Collect
       doneReg := True
@@ -772,8 +857,11 @@ class CachedTrGtSubrowAdapter(
               io.rowCommand.payload.bBaseAddress
             lineCountStorage(group)(io.rowCommand.payload.aIndex) :=
               io.rowCommand.payload.lineCount
+            lineBaseStorage(group)(io.rowCommand.payload.aIndex) :=
+              fillAllocationBase.resized
           }
         }
+        groupLineAllocation(fillGroup.asUInt) := fillAllocationEnd
       }
       when(io.rowCommand.payload.endOfTile) {
         groupReady(fillGroup.asUInt) := True
@@ -822,24 +910,22 @@ class CachedTrGtSubrowAdapter(
       state := CachedTrGtState.Finish
     } otherwise {
       requestIndex := 0
+      val currentWindowReady = prefetchValid(executeGroup.asUInt)(
+        currentLineBase)
       val executeWindowMatches = prefetchActive(executeGroup.asUInt) &&
         prefetchAIndex(executeGroup.asUInt) === currentIndex.resized
-      when(!executeWindowMatches) {
+      when(!currentWindowReady && !executeWindowMatches) {
         prefetchActive(executeGroup.asUInt) := True
         prefetchAIndex(executeGroup.asUInt) := currentIndex.resized
         prefetchLineCount(executeGroup.asUInt) := currentLineCount
         nextRequestIndex(executeGroup.asUInt) :=
           U(0, gustCfg.lineCountWidth bits)
         prefetchOccupancy(executeGroup.asUInt) :=
-          U(0, tileCfg.bPrefetchCountWidth bits)
+          U(0, prefetchCountWidth bits)
         requestOutstanding(executeGroup.asUInt) :=
-          U(0, tileCfg.bPrefetchCountWidth bits)
-        for (slot <- 0 until prefetchDepth) {
-          prefetchValid(executeGroup.asUInt)(slot) := False
-        }
+          U(0, prefetchCountWidth bits)
       }
-      state := Mux(executeWindowMatches &&
-        prefetchValid(executeGroup.asUInt)(0),
+      state := Mux(currentWindowReady,
         CachedTrGtState.EmitLine, CachedTrGtState.RequestLine)
     }
   }
@@ -847,9 +933,9 @@ class CachedTrGtSubrowAdapter(
   val executeContext = executeGroup.asUInt
   val backgroundContext = backgroundGroup.asUInt
   val executePrefetchHasCapacity =
-    prefetchOccupancy(executeContext) < prefetchDepth
+    prefetchOccupancy(executeContext) < prefetchCapacity
   val backgroundPrefetchHasCapacity =
-    prefetchOccupancy(backgroundContext) < prefetchDepth
+    prefetchOccupancy(backgroundContext) < prefetchCapacity
   val executeWindowMatches = prefetchActive(executeContext) &&
     prefetchAIndex(executeContext) === currentIndex.resized
   val foregroundCanIssue = (state === CachedTrGtState.RequestLine ||
@@ -888,19 +974,36 @@ class CachedTrGtSubrowAdapter(
     lineIdWidth - 1 downto 0).resize(gustCfg.lineCountWidth)
   val responseGroup = io.cacheResponse.payload.requestId(lineIdWidth)
   val responseContext = responseGroup.asUInt
-  val responseSlot = responseLineIndex(
-    tileCfg.bPrefetchSlotWidth - 1 downto 0)
+  val responseAIndex = prefetchAIndex(responseContext)
+  val responseLineBase = UInt(prefetchSlotWidth bits)
+  responseLineBase := 0
+  for (index <- 0 until cfg.macLanes) {
+    when(responseAIndex === index) {
+      responseLineBase := lineBaseStorage(responseContext)(index)
+    }
+  }
+  val responseStorageSlot = (responseLineBase +
+    responseLineIndex.resized).resize(prefetchSlotWidth)
   io.cacheResponse.ready := !io.clear && requestOutstanding.asBits.orR
   when(io.cacheResponse.fire) {
+    val responseLineCount = UInt(gustCfg.lineCountWidth bits)
+    responseLineCount := 0
+    for (index <- 0 until cfg.macLanes) {
+      when(responseAIndex === index) {
+        responseLineCount := lineCountStorage(responseContext)(index)
+      }
+    }
     when(io.cacheResponse.payload.error ||
         !prefetchActive(responseContext) ||
-        responseLineIndex >= prefetchLineCount(responseContext)) {
+        responseLineIndex >= responseLineCount) {
       memoryErrorReg := True
       state := CachedTrGtState.Finish
     } otherwise {
-      prefetchData(responseContext)(responseSlot) := io.cacheResponse.payload.data
-      prefetchValid(responseContext)(responseSlot) := True
+      prefetchData(responseContext)(responseStorageSlot) :=
+        io.cacheResponse.payload.data
+      prefetchValid(responseContext)(responseStorageSlot) := True
       when(responseGroup === executeGroup &&
+          responseAIndex === currentIndex.resized &&
           state === CachedTrGtState.RequestLine &&
           responseLineIndex === requestIndex) {
         elementCursor := 0
@@ -951,17 +1054,12 @@ class CachedTrGtSubrowAdapter(
     ((!selectedElementValid) || (selectedElementValid &&
       !laterElement && bPushFire))
   val nextLineIndex = (requestIndex + 1).resized
-  val nextLineSlot = nextLineIndex(
-    tileCfg.bPrefetchSlotWidth - 1 downto 0)
   when(state === CachedTrGtState.EmitLine && selectedElementValid &&
       bPushFire && laterElement) {
     elementCursor := selectedElementIndex + 1
   }
   when(consumeCurrentLine) {
     prefetchValid(executeContext)(currentPrefetchSlot) := False
-    when(requestIndex + 1 >= currentLineCount) {
-      prefetchActive(executeContext) := False
-    }
     when(terminalElement) {
       currentIndex := (currentIndex + 1).resized
       state := CachedTrGtState.WaitDone
@@ -969,7 +1067,8 @@ class CachedTrGtSubrowAdapter(
       when(requestIndex + 1 < currentLineCount) {
         requestIndex := requestIndex + 1
         elementCursor := 0
-        state := Mux(prefetchValid(executeContext)(nextLineSlot),
+        state := Mux(prefetchValid(executeContext)(
+          (currentLineBase + nextLineIndex.resized).resize(prefetchSlotWidth)),
           CachedTrGtState.EmitLine, CachedTrGtState.RequestLine)
       } otherwise {
         currentIndex := (currentIndex + 1).resized
@@ -1002,8 +1101,8 @@ class CachedTrGtSubrowAdapter(
     groupReady(executeGroup.asUInt) := False
     prefetchActive(executeGroup.asUInt) := False
     prefetchOccupancy(executeGroup.asUInt) :=
-      U(0, tileCfg.bPrefetchCountWidth bits)
-    for (slot <- 0 until prefetchDepth) {
+      U(0, prefetchCountWidth bits)
+    for (slot <- 0 until prefetchCapacity) {
       prefetchValid(executeGroup.asUInt)(slot) := False
     }
     nextExecuteGroup := !executeGroup
@@ -1034,7 +1133,8 @@ class CachedTrGtSubrowAdapter(
       nextRequestIndex(group) := 0
       prefetchOccupancy(group) := 0
       requestOutstanding(group) := 0
-      for (slot <- 0 until prefetchDepth) {
+      groupLineAllocation(group) := U(0, prefetchCountWidth bits)
+      for (slot <- 0 until prefetchCapacity) {
         prefetchValid(group)(slot) := False
       }
       for (index <- 0 until cfg.macLanes) aValid(group)(index) := False
@@ -1443,6 +1543,12 @@ class UnifiedEndToEndSystem(
     val descriptor = slave(Stream(UnifiedMatrixDescriptor(systemCfg)))
     val dmaReadRequest = master(Stream(CacheRefillRequest(cacheCfg)))
     val dmaReadResponse = slave(Stream(CacheRefillResponse(cacheCfg)))
+    val extraDmaReadRequests = if (cacheCfg.refillChannelCount > 1)
+      Vec(master(Stream(CacheRefillRequest(cacheCfg))),
+        cacheCfg.refillChannelCount - 1) else null
+    val extraDmaReadResponses = if (cacheCfg.refillChannelCount > 1)
+      Vec(slave(Stream(CacheRefillResponse(cacheCfg))),
+        cacheCfg.refillChannelCount - 1) else null
     val dmaWriteRequest = master(Stream(DmaWriteRequest(cacheCfg)))
     val dmaWriteResponse = slave(Stream(DmaWriteResponse(cacheCfg)))
     val busy = out Bool()
@@ -1767,6 +1873,13 @@ class UnifiedEndToEndSystem(
 
   io.dmaReadRequest <> cache.io.refillRequest
   cache.io.refillResponse <> io.dmaReadResponse
+  if (cacheCfg.refillChannelCount > 1) {
+    for (channel <- 0 until cacheCfg.refillChannelCount - 1) {
+      io.extraDmaReadRequests(channel) <> cache.io.extraRefillRequests(channel)
+      cache.io.extraRefillResponses(channel) <>
+        io.extraDmaReadResponses(channel)
+    }
+  }
   io.dmaWriteRequest <> writeback.io.writeRequest
   writeback.io.writeResponse <> io.dmaWriteResponse
 

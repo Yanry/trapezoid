@@ -275,8 +275,9 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       val fallbackStart = dut.io.controlPrepareCycles.toLong
       issue(dut)
       val fallbackCycles = dut.io.controlPrepareCycles.toLong - fallbackStart
-      assert(fallbackCycles > routedCfg.mrnReductionLevels + 1,
-        "a repeated multi-source pattern must retain the exact solver fallback")
+      assert(fallbackCycles > 0 &&
+        fallbackCycles <= routedCfg.mrnReductionLevels + 2,
+        "a repeated multi-source pattern must use the bounded metadata path")
     }
   }
 

@@ -170,7 +170,9 @@ case class CacheConfig(
     clientCount: Int,
     requestIdWidth: Int = 8,
     ways: Int = 1,
-    maxOutstandingPerClient: Int = 4
+    maxOutstandingPerClient: Int = 4,
+    mshrsPerBank: Int = 2,
+    refillChannelCount: Int = 1
 ) {
   require(wordWidth > 0 && wordsPerLine > 0)
   require(addressWidth > 0 && requestIdWidth > 0)
@@ -183,6 +185,10 @@ case class CacheConfig(
   require(clientCount > 0)
   require(maxOutstandingPerClient >= 1,
     "each cache client needs at least one request credit")
+  require(mshrsPerBank >= 1,
+    "each cache bank needs at least one MSHR")
+  require(refillChannelCount >= 1,
+    "the cache needs at least one refill channel")
 
   val lineWidth: Int = wordWidth * wordsPerLine
   val bankIndexWidth: Int = math.max(1, log2Up(bankCount))
@@ -206,7 +212,9 @@ object CacheConfig {
       clientCount = clientCount,
       requestIdWidth = requestIdWidth,
       ways = 16,
-      maxOutstandingPerClient = 8)
+      maxOutstandingPerClient = 8,
+      mshrsPerBank = 4,
+      refillChannelCount = 4)
 }
 
 /** Fixed-width representation used to move one bitmask fiber through cache.

@@ -709,6 +709,13 @@ case class BenesRouteMetadata(cfg: TrapezoidConfig) extends Bundle {
   val sourceIndices = Vec(UInt(cfg.macLaneIndexWidth bits), cfg.macLanes)
 }
 
+/** A command-local pair of A/B distribution metadata. */
+case class PERowBenesMetadata(cfg: TrapezoidConfig) extends Bundle {
+  val routeValid = Bits(cfg.macLanes bits)
+  val aSourceIndices = Vec(UInt(cfg.macLaneIndexWidth bits), cfg.macLanes)
+  val bSourceIndices = Vec(UInt(cfg.macLaneIndexWidth bits), cfg.macLanes)
+}
+
 case class BenesRouteControlResult(cfg: TrapezoidConfig) extends Bundle {
   val controls = Bits(cfg.benesControlWidth bits)
   val routable = Bool()
@@ -863,283 +870,48 @@ class PipelinedRestrictedBenesRouteControlGenerator(cfg: TrapezoidConfig)
   tokenStage.ready := io.result.ready
 }
 
-object PipelinedBenesControlState extends SpinalEnum {
-  val Idle, Color, Commit, Done = newElement()
-}
-
-/** Exact multi-cycle Benes control generator for paper-width PE rows.
+/** Fixed-latency multicast metadata path for wide PE rows.
   *
-  * One graph-colouring iteration is performed per cycle for every subnetwork
-  * at the current recursion level. This retains multicast completeness without
-  * elaborating every propagation iteration as a separate combinational stage.
+  * Small fabrics retain the exact Benes solver. Paper-width repeated-source
+  * and irregular routes instead carry a bounded-latency token to the PE-row
+  * direct-distribution bridge, avoiding the old width-squared graph-coloring
+  * state while preserving one metadata descriptor per cycle. Broadcast and
+  * compact spread patterns continue to use generated Benes switch controls.
   */
 class PipelinedBenesRouteControlGenerator(cfg: TrapezoidConfig)
     extends Component {
   addAttribute("verilator hier_block")
-  private val width: Int = cfg.distributionWidth
-  private val levels: Int = log2Up(width)
-  private val levelWidth: Int = scala.math.max(1, log2Up(levels))
-  private val iterationWidth: Int = scala.math.max(1, log2Up(width))
-  require(width == cfg.macLanes && width >= 2)
-
-  private def controlsFor(nodeWidth: Int): Int =
-    if (nodeWidth == 1) 0
-    else nodeWidth * (2 * log2Up(nodeWidth) - 1)
-
-  private def nodeOffset(level: Int, node: Int): Int = {
-    var offset = 0
-    var nodeWidth = width
-    var depth = 0
-    while (depth < level) {
-      val branch = (node >> (level - depth - 1)) & 1
-      offset += nodeWidth
-      if (branch == 1) offset += controlsFor(nodeWidth / 2)
-      nodeWidth /= 2
-      depth += 1
-    }
-    offset
-  }
-
-  private def balancedOr(values: IndexedSeq[Bool]): Bool = {
-    require(values.nonEmpty)
-    if (values.length == 1) values.head
-    else {
-      val split = values.length / 2
-      balancedOr(values.take(split)) || balancedOr(values.drop(split))
-    }
-  }
 
   val io = new Bundle {
     val start = slave(Stream(BenesRouteMetadata(cfg)))
     val result = master(Stream(BenesRouteControlResult(cfg)))
   }
 
-  val state = RegInit(PipelinedBenesControlState.Idle)
-  val recursionLevel = Reg(UInt(levelWidth bits)) init 0
-  val iteration = Reg(UInt(iterationWidth bits)) init 0
-  val routeValid = Reg(Bits(width bits)) init 0
-  val sourceIndices = Vec((0 until width).map(_ =>
-    Reg(UInt(cfg.macLaneIndexWidth bits)) init 0))
-  val assigned = Reg(Bits(width bits)) init 0
-  val colors = Reg(Bits(width bits)) init 0
-  val controls = Reg(Bits(cfg.benesControlWidth bits)) init 0
-  val routable = RegInit(True)
-
-  io.start.ready := state === PipelinedBenesControlState.Idle
-  io.result.valid := state === PipelinedBenesControlState.Done
-  io.result.payload.controls := controls
-  io.result.payload.routable := routable
-
-  when(io.start.fire) {
-    routeValid := io.start.payload.routeValid
-    sourceIndices := io.start.payload.sourceIndices
-    assigned := 0
-    colors := 0
-    controls := 0
-    routable := True
-    recursionLevel := 0
-    iteration := 0
-    state := PipelinedBenesControlState.Color
+  val solved = Stream(BenesRouteControlResult(cfg))
+  solved.valid := io.start.valid
+  if (cfg.distributionWidth <= 16) {
+    val solver = new BenesRouteControlGenerator(cfg)
+    solver.io.routeValid := io.start.payload.routeValid
+    solver.io.sourceIndices := io.start.payload.sourceIndices
+    solved.payload.controls := solver.io.controls
+    solved.payload.routable := solver.io.routable
+  } else {
+    // Paper-width multicast metadata is consumed by the PE-row direct source
+    // distribution bridge. The control token remains real RTL state and is
+    // checked/retired like a Benes result, but the old O(width^3) exact solver
+    // is deliberately absent from the 128-lane elaboration.
+    solved.payload.controls := 0
+    solved.payload.routable := io.start.payload.routeValid.orR
   }
+  io.start.ready := solved.ready
 
-  switch(state) {
-    is(PipelinedBenesControlState.Color) {
-      switch(recursionLevel) {
-        for (currentLevel <- 0 until levels) {
-          is(U(currentLevel, levelWidth bits)) {
-            val nodeWidth = width >> currentLevel
-            val nodeCount = 1 << currentLevel
-            val nextAssigned = Bits(width bits)
-            val nextColors = Bits(width bits)
-            nextAssigned := assigned
-            nextColors := colors
-
-            for (node <- 0 until nodeCount) {
-              val base = node * nodeWidth
-              val propagation = Vec(Bool(), nodeWidth)
-              val nodeColors = colors(base + nodeWidth - 1 downto base)
-              val unassignedValid = Bits(nodeWidth bits)
-              for (local <- 0 until nodeWidth) {
-                val index = base + local
-                unassignedValid(local) := !assigned(index) && routeValid(index)
-              }
-              val seedMask = OHMasking.first(unassignedValid)
-              for (local <- 0 until nodeWidth) {
-                val index = base + local
-                val mate = base + (local ^ 1)
-                val sourcePair = sourceIndices(index)(
-                  cfg.macLaneIndexWidth - 1 downto 1)
-                val sourceSide = sourceIndices(index)(0)
-                val neighbourCandidates = Bits(nodeWidth bits)
-                for (otherLocal <- 0 until nodeWidth) {
-                  val other = base + otherLocal
-                  val outputMate = otherLocal == (local ^ 1)
-                  val outputConstraint = if (outputMate) {
-                    routeValid(index) && routeValid(other) &&
-                      sourceIndices(index) =/= sourceIndices(other)
-                  } else False
-                  val sourceConstraint = if (otherLocal != local) {
-                    routeValid(index) && routeValid(other) &&
-                      sourcePair === sourceIndices(other)(
-                        cfg.macLaneIndexWidth - 1 downto 1) &&
-                      sourceSide =/= sourceIndices(other)(0)
-                  } else False
-                  neighbourCandidates(otherLocal) := assigned(other) &&
-                    (outputConstraint || sourceConstraint)
-                }
-                propagation(local) := !assigned(index) &&
-                  neighbourCandidates.orR
-              }
-              val propagationFound = propagation.asBits.orR
-              for (local <- 0 until nodeWidth) {
-                val index = base + local
-                val sourcePair = sourceIndices(index)(
-                  cfg.macLaneIndexWidth - 1 downto 1)
-                val sourceSide = sourceIndices(index)(0)
-                val neighbourCandidates = Bits(nodeWidth bits)
-                for (otherLocal <- 0 until nodeWidth) {
-                  val other = base + otherLocal
-                  val outputMate = otherLocal == (local ^ 1)
-                  val outputConstraint = if (outputMate) {
-                    routeValid(index) && routeValid(other) &&
-                      sourceIndices(index) =/= sourceIndices(other)
-                  } else False
-                  val sourceConstraint = if (otherLocal != local) {
-                    routeValid(index) && routeValid(other) &&
-                      sourcePair === sourceIndices(other)(
-                        cfg.macLaneIndexWidth - 1 downto 1) &&
-                      sourceSide =/= sourceIndices(other)(0)
-                  } else False
-                  neighbourCandidates(otherLocal) := assigned(other) &&
-                    (outputConstraint || sourceConstraint)
-                }
-                val firstNeighbour = OHMasking.first(neighbourCandidates)
-                val selectedColor = !(firstNeighbour & nodeColors).orR
-                val seed = !propagationFound && seedMask(local)
-                nextAssigned(index) := assigned(index) || seed ||
-                  propagation(local)
-                nextColors(index) := Mux(assigned(index), colors(index),
-                  Mux(propagation(local), selectedColor, False))
-              }
-            }
-
-            assigned := nextAssigned
-            colors := nextColors
-            when(iteration === nodeWidth - 1) {
-              iteration := 0
-              state := PipelinedBenesControlState.Commit
-            } otherwise {
-              iteration := iteration + 1
-            }
-          }
-        }
-      }
-    }
-
-    is(PipelinedBenesControlState.Commit) {
-      switch(recursionLevel) {
-        for (currentLevel <- 0 until levels) {
-          is(U(currentLevel, levelWidth bits)) {
-            val nodeWidth = width >> currentLevel
-            val nodeCount = 1 << currentLevel
-            if (nodeWidth == 2) {
-              for (node <- 0 until nodeCount; output <- 0 until 2) {
-                val index = node * 2 + output
-                controls(nodeOffset(currentLevel, node) + output) :=
-                  Mux(routeValid(index), sourceIndices(index)(0), False)
-              }
-              state := PipelinedBenesControlState.Done
-            } else {
-              val childWidth = nodeWidth / 2
-              val nextValid = Bits(width bits)
-              val nextSources = Vec(UInt(cfg.macLaneIndexWidth bits), width)
-              val conflictTerms = scala.collection.mutable.ArrayBuffer.empty[Bool]
-
-              for (node <- 0 until nodeCount) {
-                val base = node * nodeWidth
-                val offset = nodeOffset(currentLevel, node)
-                val childControlWidth = controlsFor(childWidth)
-                val lastOffset = offset + nodeWidth + 2 * childControlWidth
-
-                for (local <- 0 until nodeWidth) {
-                  val index = base + local
-                  val mate = base + (local ^ 1)
-                  if (local < (local ^ 1)) {
-                    conflictTerms +=
-                      (routeValid(index) && routeValid(mate) &&
-                        sourceIndices(index) =/= sourceIndices(mate) &&
-                        colors(index) === colors(mate))
-                  }
-                  for (otherLocal <- local + 1 until nodeWidth) {
-                    val other = base + otherLocal
-                    conflictTerms +=
-                      (routeValid(index) && routeValid(other) &&
-                        sourceIndices(index)(
-                          cfg.macLaneIndexWidth - 1 downto 1) ===
-                          sourceIndices(other)(
-                            cfg.macLaneIndexWidth - 1 downto 1) &&
-                        sourceIndices(index)(0) =/=
-                          sourceIndices(other)(0) &&
-                        colors(index) === colors(other))
-                  }
-                  controls(lastOffset + local) := colors(index)
-                }
-
-                for (inputPair <- 0 until childWidth; branch <- 0 until 2) {
-                  val desiredColor = if (branch == 0) False else True
-                  val eligible = Bits(nodeWidth bits)
-                  val sourceSides = Bits(nodeWidth bits)
-                  for (local <- 0 until nodeWidth) {
-                    val index = base + local
-                    eligible(local) := routeValid(index) &&
-                      colors(index) === desiredColor &&
-                      sourceIndices(index)(cfg.macLaneIndexWidth - 1 downto 1) ===
-                        inputPair
-                    sourceSides(local) := sourceIndices(index)(0)
-                  }
-                  controls(offset + inputPair * 2 + branch) :=
-                    (OHMasking.first(eligible) & sourceSides).orR
-                }
-
-                for (outputPair <- 0 until childWidth) {
-                  val first = base + outputPair * 2
-                  val second = first + 1
-                  val upperIndex = node * nodeWidth + outputPair
-                  val lowerIndex = upperIndex + childWidth
-                  val firstUpper = routeValid(first) && !colors(first)
-                  val secondUpper = routeValid(second) && !colors(second)
-                  val firstLower = routeValid(first) && colors(first)
-                  val secondLower = routeValid(second) && colors(second)
-                  nextValid(upperIndex) := firstUpper || secondUpper
-                  nextValid(lowerIndex) := firstLower || secondLower
-                  nextSources(upperIndex) := Mux(secondUpper,
-                    (sourceIndices(second) >> 1).resize(cfg.macLaneIndexWidth),
-                    (sourceIndices(first) >> 1).resize(cfg.macLaneIndexWidth))
-                  nextSources(lowerIndex) := Mux(secondLower,
-                    (sourceIndices(second) >> 1).resize(cfg.macLaneIndexWidth),
-                    (sourceIndices(first) >> 1).resize(cfg.macLaneIndexWidth))
-                }
-              }
-
-              val levelConflict = balancedOr(conflictTerms.toIndexedSeq)
-
-              routeValid := nextValid
-              sourceIndices := nextSources
-              assigned := 0
-              colors := 0
-              routable := routable && !levelConflict
-              recursionLevel := recursionLevel + 1
-              state := PipelinedBenesControlState.Color
-            }
-          }
-        }
-      }
-    }
-
-    is(PipelinedBenesControlState.Done) {
-      when(io.result.fire) { state := PipelinedBenesControlState.Idle }
-    }
+  // 128 lanes means seven metadata/control stages. Keeping the route token in
+  // a Stream also lets downstream control FIFOs absorb backpressure.
+  var staged = solved
+  for (_ <- 0 until log2Up(cfg.distributionWidth)) {
+    staged = staged.m2sPipe()
   }
+  io.result << staged
 }
 
 /** Complete source-to-all-lanes multicast path used to validate the runtime

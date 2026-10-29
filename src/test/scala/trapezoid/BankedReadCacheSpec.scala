@@ -282,6 +282,152 @@ class BankedReadCacheSpec extends AnyFunSuite {
     }
   }
 
+  test("multiple refill channels issue and complete independent banks together") {
+    val multiCfg = cacheCfg.copy(
+      bankCount = 4,
+      clientCount = 2,
+      mshrsPerBank = 2,
+      refillChannelCount = 2)
+    simConfig.compile(new BankedReadCache(multiCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.refillRequest.ready #= true
+      dut.io.extraRefillRequests(0).ready #= true
+      dut.io.refillResponse.valid #= false
+      dut.io.extraRefillResponses(0).valid #= false
+      for (client <- 0 until multiCfg.clientCount) {
+        dut.io.requests(client).payload.address #= client
+        dut.io.requests(client).payload.requestId #= client + 1
+        dut.io.requests(client).valid #= true
+        dut.io.responses(client).ready #= true
+      }
+
+      dut.clockDomain.waitSampling()
+      dut.io.requests(0).valid #= false
+      dut.io.requests(1).valid #= false
+
+      var request0 = Option.empty[(Int, Int)]
+      var request1 = Option.empty[(Int, Int)]
+      var timeout = 0
+      while ((request0.isEmpty || request1.isEmpty) && timeout < 100) {
+        sleep(1)
+        if (dut.io.refillRequest.valid.toBoolean) {
+          request0 = Some((dut.io.refillRequest.payload.bank.toInt,
+            dut.io.refillRequest.payload.address.toInt))
+        }
+        if (dut.io.extraRefillRequests(0).valid.toBoolean) {
+          request1 = Some((dut.io.extraRefillRequests(0).payload.bank.toInt,
+            dut.io.extraRefillRequests(0).payload.address.toInt))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(request0.nonEmpty && request1.nonEmpty)
+      assert(request0.get._1 != request1.get._1)
+
+      val line0 = BigInt("11223344", 16)
+      val line1 = BigInt("55667788", 16)
+      dut.io.refillResponse.payload.bank #= request0.get._1
+      dut.io.refillResponse.payload.address #= request0.get._2
+      dut.io.refillResponse.payload.data #= line0
+      dut.io.refillResponse.payload.error #= false
+      dut.io.refillResponse.valid #= true
+      dut.io.extraRefillResponses(0).payload.bank #= request1.get._1
+      dut.io.extraRefillResponses(0).payload.address #= request1.get._2
+      dut.io.extraRefillResponses(0).payload.data #= line1
+      dut.io.extraRefillResponses(0).payload.error #= false
+      dut.io.extraRefillResponses(0).valid #= true
+      dut.clockDomain.waitSampling()
+      dut.io.refillResponse.valid #= false
+      dut.io.extraRefillResponses(0).valid #= false
+
+      val responses = mutable.Map.empty[Int, BigInt]
+      timeout = 0
+      while (responses.size < 2 && timeout < 100) {
+        sleep(1)
+        for (client <- 0 until multiCfg.clientCount
+             if dut.io.responses(client).valid.toBoolean) {
+          responses(client) = dut.io.responses(client).payload.data.toBigInt
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(responses.values.toSet == Set(line0, line1))
+      assert(dut.io.refillCount.toLong == 2)
+    }
+  }
+
+  test("one bank keeps multiple set misses in MSHRs before refill") {
+    simConfig.compile(new BankedReadCache(cacheCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.refillRequest.ready #= true
+      dut.io.refillResponse.valid #= false
+      for (client <- 0 until cacheCfg.clientCount) {
+        dut.io.requests(client).payload.address #= client * 2
+        dut.io.requests(client).payload.requestId #= client + 1
+        dut.io.requests(client).valid #= true
+        dut.io.responses(client).ready #= false
+      }
+
+      val accepted = Array.fill(cacheCfg.clientCount)(false)
+      val refills = mutable.ArrayBuffer.empty[(Int, Int)]
+      var timeout = 0
+      while ((accepted.contains(false) || refills.size < 2) && timeout < 100) {
+        sleep(1)
+        for (client <- 0 until cacheCfg.clientCount) {
+          if (!accepted(client) && dut.io.requests(client).ready.toBoolean) {
+            accepted(client) = true
+          }
+        }
+        if (dut.io.refillRequest.valid.toBoolean) {
+          refills += ((dut.io.refillRequest.payload.bank.toInt,
+            dut.io.refillRequest.payload.address.toInt))
+        }
+        dut.clockDomain.waitSampling()
+        for (client <- 0 until cacheCfg.clientCount if accepted(client)) {
+          dut.io.requests(client).valid #= false
+        }
+        timeout += 1
+      }
+      assert(accepted.forall(identity))
+      assert(refills.map(_._1).toSet == Set(0))
+      assert(refills.map(_._2).toSet == Set(0, 2))
+
+      for ((bank, address) <- refills.reverse) {
+        dut.io.refillResponse.payload.bank #= bank
+        dut.io.refillResponse.payload.address #= address
+        dut.io.refillResponse.payload.data #= BigInt(address + 1) * 0x01010101L
+        dut.io.refillResponse.payload.error #= false
+        dut.io.refillResponse.valid #= true
+        var responseAccepted = false
+        while (!responseAccepted) {
+          sleep(1)
+          responseAccepted = dut.io.refillResponse.ready.toBoolean
+          dut.clockDomain.waitSampling()
+        }
+        dut.io.refillResponse.valid #= false
+      }
+
+      for (client <- 0 until cacheCfg.clientCount) {
+        dut.io.responses(client).ready #= true
+      }
+      val responses = mutable.Map.empty[Int, BigInt]
+      timeout = 0
+      while (responses.size < 2 && timeout < 100) {
+        sleep(1)
+        for (client <- 0 until cacheCfg.clientCount
+             if dut.io.responses(client).valid.toBoolean) {
+          responses(client) = dut.io.responses(client).payload.data.toBigInt
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(responses == Map(
+        0 -> BigInt(0x01010101L), 1 -> BigInt(0x03030303L)))
+    }
+  }
+
   test("one client keeps multiple bank misses outstanding and retires in request order") {
     simConfig.compile(new BankedReadCache(cacheCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)

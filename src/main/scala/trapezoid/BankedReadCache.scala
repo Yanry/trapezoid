@@ -4,22 +4,19 @@ import spinal.core._
 import spinal.lib._
 
 object CacheBankState extends SpinalEnum {
-  val Idle, Lookup, RequestRefill, WaitRefill, Respond = newElement()
+  val Idle, Lookup = newElement()
 }
 
-/** Multi-client, banked, set-associative read cache.
-  *
-  * Each bank accepts one request at a time and may hold one independent miss.
-  * Clients carry several outstanding requests. Request-order FIFOs and response
-  * FIFOs preserve each client's issue order even when banks/refills complete out
-  * of order. Refills choose an invalid way first, then use a per-set round-robin
-  * pointer. Data and tags are split by bank and way so the paper cache does not
-  * infer one lineWidth*ways-wide memory word.
-  */
+object CacheMshrState extends SpinalEnum {
+  val Free, Reserved, RequestRefill, WaitRefill, Respond = newElement()
+}
+
+/** Multi-client banked read cache with per-bank MSHRs and refill channels. */
 class BankedReadCache(cacheCfg: CacheConfig) extends Component {
   private val validBitCount = cacheCfg.setsPerBank * cacheCfg.ways
   private val outstandingCountWidth =
     log2Up(cacheCfg.maxOutstandingPerClient + 1)
+  private val mshrIndexWidth = scala.math.max(1, log2Up(cacheCfg.mshrsPerBank))
 
   val io = new Bundle {
     val clear = in Bool()
@@ -27,6 +24,12 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
     val responses = Vec(master(Stream(CacheReadResponse(cacheCfg))), cacheCfg.clientCount)
     val refillRequest = master(Stream(CacheRefillRequest(cacheCfg)))
     val refillResponse = slave(Stream(CacheRefillResponse(cacheCfg)))
+    val extraRefillRequests = if (cacheCfg.refillChannelCount > 1)
+      Vec(master(Stream(CacheRefillRequest(cacheCfg))),
+        cacheCfg.refillChannelCount - 1) else null
+    val extraRefillResponses = if (cacheCfg.refillChannelCount > 1)
+      Vec(slave(Stream(CacheRefillResponse(cacheCfg))),
+        cacheCfg.refillChannelCount - 1) else null
     val bankBusy = out Bits(cacheCfg.bankCount bits)
     val clientOutstanding = out Bits(cacheCfg.clientCount bits)
     val hitCount = out UInt(32 bits)
@@ -34,11 +37,18 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
     val refillCount = out UInt(32 bits)
   }
 
+  private val refillRequestPorts = (0 until cacheCfg.refillChannelCount).map {
+    channel => if (channel == 0) io.refillRequest
+      else io.extraRefillRequests(channel - 1)
+  }
+  private val refillResponsePorts = (0 until cacheCfg.refillChannelCount).map {
+    channel => if (channel == 0) io.refillResponse
+      else io.extraRefillResponses(channel - 1)
+  }
+
   private def bankOf(address: UInt): UInt = if (cacheCfg.bankCount == 1) {
     U(0, cacheCfg.bankIndexWidth bits)
-  } else {
-    address(log2Up(cacheCfg.bankCount) - 1 downto 0)
-  }
+  } else address(log2Up(cacheCfg.bankCount) - 1 downto 0)
 
   private def setOf(address: UInt): UInt = {
     val low = log2Up(cacheCfg.bankCount)
@@ -50,7 +60,10 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
     address(cacheCfg.addressWidth - 1 downto low)
   }
 
-  val states = Vec((0 until cacheCfg.bankCount).map(_ => RegInit(CacheBankState.Idle)))
+  val bankStates = Vec((0 until cacheCfg.bankCount)
+    .map(_ => RegInit(CacheBankState.Idle)))
+  val lookupMshr = Vec((0 until cacheCfg.bankCount).map(_ =>
+    Reg(UInt(mshrIndexWidth bits)) init 0))
   val validBits = Vec((0 until cacheCfg.bankCount).map(_ =>
     Reg(Bits(validBitCount bits)) init 0))
   val dataMemories = Array.fill(cacheCfg.bankCount, cacheCfg.ways)(
@@ -60,20 +73,32 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
   val replacementMemories = Array.fill(cacheCfg.bankCount)(
     Mem(UInt(cacheCfg.wayIndexWidth bits), cacheCfg.setsPerBank))
 
-  val addressRegs = Vec((0 until cacheCfg.bankCount).map(_ =>
-    Reg(UInt(cacheCfg.addressWidth bits)) init 0))
-  val setRegs = Vec((0 until cacheCfg.bankCount).map(_ =>
-    Reg(UInt(cacheCfg.setIndexWidth bits)) init 0))
-  val clientRegs = Vec((0 until cacheCfg.bankCount).map(_ =>
-    Reg(UInt(cacheCfg.clientIndexWidth bits)) init 0))
-  val requestIdRegs = Vec((0 until cacheCfg.bankCount).map(_ =>
-    Reg(UInt(cacheCfg.requestIdWidth bits)) init 0))
-  val victimWayRegs = Vec((0 until cacheCfg.bankCount).map(_ =>
-    Reg(UInt(cacheCfg.wayIndexWidth bits)) init 0))
-  val responseData = Vec((0 until cacheCfg.bankCount).map(_ =>
-    Reg(Bits(cacheCfg.lineWidth bits)) init 0))
-  val responseWasHit = Vec((0 until cacheCfg.bankCount).map(_ => RegInit(False)))
-  val responseError = Vec((0 until cacheCfg.bankCount).map(_ => RegInit(False)))
+  val mshrStates = Array.fill(cacheCfg.bankCount)(
+    Vec((0 until cacheCfg.mshrsPerBank).map(_ =>
+      RegInit(CacheMshrState.Free))))
+  val mshrAddress = Array.fill(cacheCfg.bankCount)(
+    Vec((0 until cacheCfg.mshrsPerBank).map(_ =>
+      Reg(UInt(cacheCfg.addressWidth bits)) init 0)))
+  val mshrSet = Array.fill(cacheCfg.bankCount)(
+    Vec((0 until cacheCfg.mshrsPerBank).map(_ =>
+      Reg(UInt(cacheCfg.setIndexWidth bits)) init 0)))
+  val mshrClient = Array.fill(cacheCfg.bankCount)(
+    Vec((0 until cacheCfg.mshrsPerBank).map(_ =>
+      Reg(UInt(cacheCfg.clientIndexWidth bits)) init 0)))
+  val mshrRequestId = Array.fill(cacheCfg.bankCount)(
+    Vec((0 until cacheCfg.mshrsPerBank).map(_ =>
+      Reg(UInt(cacheCfg.requestIdWidth bits)) init 0)))
+  val mshrVictim = Array.fill(cacheCfg.bankCount)(
+    Vec((0 until cacheCfg.mshrsPerBank).map(_ =>
+      Reg(UInt(cacheCfg.wayIndexWidth bits)) init 0)))
+  val mshrData = Array.fill(cacheCfg.bankCount)(
+    Vec((0 until cacheCfg.mshrsPerBank).map(_ =>
+      Reg(Bits(cacheCfg.lineWidth bits)) init 0)))
+  val mshrWasHit = Array.fill(cacheCfg.bankCount)(
+    Vec((0 until cacheCfg.mshrsPerBank).map(_ => RegInit(False))))
+  val mshrError = Array.fill(cacheCfg.bankCount)(
+    Vec((0 until cacheCfg.mshrsPerBank).map(_ => RegInit(False))))
+
   val outstandingCounts = Vec((0 until cacheCfg.clientCount).map(_ =>
     Reg(UInt(outstandingCountWidth bits)) init 0))
   val requestOrder = Array.fill(cacheCfg.clientCount)(
@@ -85,10 +110,7 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
   val hitCount = Reg(UInt(32 bits)) init 0
   val missCount = Reg(UInt(32 bits)) init 0
   val refillCount = Reg(UInt(32 bits)) init 0
-  val hitEvents = Bits(cacheCfg.bankCount bits)
-  val missEvents = Bits(cacheCfg.bankCount bits)
 
-  io.bankBusy := states.map(_ =/= CacheBankState.Idle).asBits
   for (client <- 0 until cacheCfg.clientCount) {
     requestOrder(client).io.flush := io.clear
     responseQueues(client).io.flush := io.clear
@@ -99,9 +121,19 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
     io.responses(client) <> responseQueues(client).io.pop
     io.clientOutstanding(client) := outstandingCounts(client) =/= 0
   }
-  io.hitCount := hitCount
-  io.missCount := missCount
-  io.refillCount := refillCount
+
+  val freeMshrFound = Vec(Bool(), cacheCfg.bankCount)
+  val freeMshrIndex = Vec(UInt(mshrIndexWidth bits), cacheCfg.bankCount)
+  for (bank <- 0 until cacheCfg.bankCount) {
+    val free = Bits(cacheCfg.mshrsPerBank bits)
+    for (slot <- 0 until cacheCfg.mshrsPerBank) {
+      free(slot) := mshrStates(bank)(slot) === CacheMshrState.Free
+    }
+    freeMshrFound(bank) := free.orR
+    freeMshrIndex(bank) := OHToUInt(OHMasking.first(free)).resized
+    io.bankBusy(bank) := bankStates(bank) =/= CacheBankState.Idle ||
+      !free.andR
+  }
 
   val bankAccepts = Vec(Bool(), cacheCfg.bankCount)
   val selectedClients = Vec(UInt(cacheCfg.clientIndexWidth bits), cacheCfg.bankCount)
@@ -116,7 +148,8 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
       choices(client) := eligible && !earlierEligible
       earlierEligible = earlierEligible || eligible
     }
-    bankAccepts(bank) := choices.asBits.orR && states(bank) === CacheBankState.Idle
+    bankAccepts(bank) := choices.asBits.orR && freeMshrFound(bank) &&
+      bankStates(bank) === CacheBankState.Idle
     selectedClients(bank) := 0
     for (client <- 0 until cacheCfg.clientCount) {
       when(choices(client)) { selectedClients(bank) := client }
@@ -137,9 +170,59 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
   val readWayTags = Array.fill(cacheCfg.bankCount, cacheCfg.ways)(
     UInt(cacheCfg.tagWidth bits))
   val readReplacement = Vec(UInt(cacheCfg.wayIndexWidth bits), cacheCfg.bankCount)
+  val hitEvents = Bits(cacheCfg.bankCount bits)
+  val missEvents = Bits(cacheCfg.bankCount bits)
+  hitEvents := 0
+  missEvents := 0
+
+  val refillWriteValid = Vec(Bool(), cacheCfg.bankCount)
+  val refillWriteSlot = Vec(UInt(mshrIndexWidth bits), cacheCfg.bankCount)
+  val refillWriteData = Vec(Bits(cacheCfg.lineWidth bits), cacheCfg.bankCount)
+  val refillWriteError = Vec(Bool(), cacheCfg.bankCount)
+  refillWriteValid.foreach(_ := False)
+  refillWriteSlot.foreach(_ := 0)
+  refillWriteData.foreach(_ := 0)
+  refillWriteError.foreach(_ := False)
+  val refillSuccessEvents = Bits(cacheCfg.refillChannelCount bits)
+  refillSuccessEvents := 0
+
+  val responseSelections = Array.fill(cacheCfg.refillChannelCount,
+    cacheCfg.bankCount, cacheCfg.mshrsPerBank)(Bool())
+  val earlierResponseChannel = Array.fill(cacheCfg.bankCount)(False: Bool)
+  for (channel <- 0 until cacheCfg.refillChannelCount) {
+    var channelSelected: Bool = False
+    for (bank <- 0 until cacheCfg.bankCount) {
+      var earlierSlot: Bool = False
+      for (slot <- 0 until cacheCfg.mshrsPerBank) {
+        val matches = refillResponsePorts(channel).valid &&
+          refillResponsePorts(channel).payload.bank === bank &&
+          mshrStates(bank)(slot) === CacheMshrState.WaitRefill &&
+          refillResponsePorts(channel).payload.address === mshrAddress(bank)(slot)
+        responseSelections(channel)(bank)(slot) := matches &&
+          !earlierSlot && !earlierResponseChannel(bank)
+        earlierSlot = earlierSlot || matches
+        channelSelected = channelSelected ||
+          responseSelections(channel)(bank)(slot)
+      }
+      earlierResponseChannel(bank) = earlierResponseChannel(bank) || earlierSlot
+    }
+    refillResponsePorts(channel).ready := !io.clear && channelSelected
+    for (bank <- 0 until cacheCfg.bankCount; slot <- 0 until cacheCfg.mshrsPerBank) {
+      when(refillResponsePorts(channel).fire &&
+          responseSelections(channel)(bank)(slot)) {
+        refillWriteValid(bank) := True
+        refillWriteSlot(bank) := slot
+        refillWriteData(bank) := refillResponsePorts(channel).payload.data
+        refillWriteError(bank) := refillResponsePorts(channel).payload.error
+        mshrData(bank)(slot) := refillResponsePorts(channel).payload.data
+        mshrError(bank)(slot) := refillResponsePorts(channel).payload.error
+        mshrStates(bank)(slot) := CacheMshrState.Respond
+        refillSuccessEvents(channel) := !refillResponsePorts(channel).payload.error
+      }
+    }
+  }
+
   for (bank <- 0 until cacheCfg.bankCount) {
-    hitEvents(bank) := False
-    missEvents(bank) := False
     val selectedRequest = CacheReadRequest(cacheCfg)
     selectedRequest := CacheReadRequest(cacheCfg).getZero
     for (client <- 0 until cacheCfg.clientCount) {
@@ -150,33 +233,40 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
     val accept = bankAccepts(bank) && !io.clear
     val requestSet = setOf(selectedRequest.address)
     for (way <- 0 until cacheCfg.ways) {
-      val refillWrite = io.refillResponse.fire &&
-        io.refillResponse.payload.bank === bank &&
-        !io.refillResponse.payload.error && victimWayRegs(bank) === way
+      val writeSlot = refillWriteSlot(bank)
+      val refillWrite = refillWriteValid(bank) &&
+        !refillWriteError(bank) && mshrVictim(bank)(writeSlot) === way
       dataMemories(bank)(way).io.read_enable := accept
       dataMemories(bank)(way).io.read_address := requestSet
       dataMemories(bank)(way).io.write_enable := refillWrite
-      dataMemories(bank)(way).io.write_address := setRegs(bank)
-      dataMemories(bank)(way).io.write_data := io.refillResponse.payload.data
+      dataMemories(bank)(way).io.write_address := mshrSet(bank)(writeSlot)
+      dataMemories(bank)(way).io.write_data := refillWriteData(bank)
       tagMemories(bank)(way).io.read_enable := accept
       tagMemories(bank)(way).io.read_address := requestSet
       tagMemories(bank)(way).io.write_enable := refillWrite
-      tagMemories(bank)(way).io.write_address := setRegs(bank)
-      tagMemories(bank)(way).io.write_data := tagOf(addressRegs(bank)).asBits
+      tagMemories(bank)(way).io.write_address := mshrSet(bank)(writeSlot)
+      tagMemories(bank)(way).io.write_data :=
+        tagOf(mshrAddress(bank)(writeSlot)).asBits
       readWayData(bank)(way) := dataMemories(bank)(way).io.read_data
       readWayTags(bank)(way) := tagMemories(bank)(way).io.read_data.asUInt
     }
     readReplacement(bank) := replacementMemories(bank).readSync(requestSet, accept)
 
     when(accept) {
-      addressRegs(bank) := selectedRequest.address
-      setRegs(bank) := requestSet
-      clientRegs(bank) := selectedClients(bank)
-      requestIdRegs(bank) := selectedRequest.requestId
-      states(bank) := CacheBankState.Lookup
+      val slot = freeMshrIndex(bank)
+      lookupMshr(bank) := slot
+      mshrStates(bank)(slot) := CacheMshrState.Reserved
+      mshrAddress(bank)(slot) := selectedRequest.address
+      mshrSet(bank)(slot) := requestSet
+      mshrClient(bank)(slot) := selectedClients(bank)
+      mshrRequestId(bank)(slot) := selectedRequest.requestId
+      mshrWasHit(bank)(slot) := False
+      mshrError(bank)(slot) := False
+      bankStates(bank) := CacheBankState.Lookup
     }
 
-    when(states(bank) === CacheBankState.Lookup) {
+    when(bankStates(bank) === CacheBankState.Lookup) {
+      val slot = lookupMshr(bank)
       val hitWays = Bits(cacheCfg.ways bits)
       val invalidWays = Bits(cacheCfg.ways bits)
       val selectedHitData = Bits(cacheCfg.lineWidth bits)
@@ -184,94 +274,79 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
       selectedHitData := 0
       selectedVictim := readReplacement(bank)
       for (way <- 0 until cacheCfg.ways) {
-        val validIndex = if (cacheCfg.ways == 1) {
-          setRegs(bank)
-        } else {
-          (setRegs(bank).asBits ## U(way, cacheCfg.wayIndexWidth bits).asBits).asUInt
-        }
+        val validIndex = if (cacheCfg.ways == 1) mshrSet(bank)(slot)
+          else (mshrSet(bank)(slot).asBits ##
+            U(way, cacheCfg.wayIndexWidth bits).asBits).asUInt
         hitWays(way) := validBits(bank)(validIndex) &&
-          readWayTags(bank)(way) === tagOf(addressRegs(bank))
+          readWayTags(bank)(way) === tagOf(mshrAddress(bank)(slot))
         invalidWays(way) := !validBits(bank)(validIndex)
-        when(hitWays(way)) {
-          selectedHitData := readWayData(bank)(way)
-        }
+        when(hitWays(way)) { selectedHitData := readWayData(bank)(way) }
       }
       for (way <- (0 until cacheCfg.ways).reverse) {
-        when(invalidWays(way)) {
-          selectedVictim := way
-        }
+        when(invalidWays(way)) { selectedVictim := way }
       }
-      victimWayRegs(bank) := selectedVictim
-
+      mshrVictim(bank)(slot) := selectedVictim
       when(hitWays.orR) {
-        responseData(bank) := selectedHitData
-        responseWasHit(bank) := True
-        responseError(bank) := False
+        mshrData(bank)(slot) := selectedHitData
+        mshrWasHit(bank)(slot) := True
+        mshrStates(bank)(slot) := CacheMshrState.Respond
         hitEvents(bank) := True
-        states(bank) := CacheBankState.Respond
       } otherwise {
-        responseWasHit(bank) := False
+        mshrStates(bank)(slot) := CacheMshrState.RequestRefill
         missEvents(bank) := True
-        states(bank) := CacheBankState.RequestRefill
+      }
+      bankStates(bank) := CacheBankState.Idle
+    }
+
+    when(refillWriteValid(bank)) {
+      val slot = refillWriteSlot(bank)
+      when(!refillWriteError(bank)) {
+        val validIndex = if (cacheCfg.ways == 1) mshrSet(bank)(slot)
+          else (mshrSet(bank)(slot).asBits ##
+            mshrVictim(bank)(slot).asBits).asUInt
+        validBits(bank)(validIndex) := True
+        replacementMemories(bank).write(mshrSet(bank)(slot),
+          if (cacheCfg.ways == 1) U(0, cacheCfg.wayIndexWidth bits)
+          else (mshrVictim(bank)(slot) + 1).resized)
       }
     }
   }
 
   val hitsThisCycle = CountOne(hitEvents).resize(32)
   val missesThisCycle = CountOne(missEvents).resize(32)
+  val refillsThisCycle = CountOne(refillSuccessEvents).resize(32)
   when(hitsThisCycle =/= 0) { hitCount := hitCount + hitsThisCycle }
   when(missesThisCycle =/= 0) { missCount := missCount + missesThisCycle }
+  when(refillsThisCycle =/= 0) { refillCount := refillCount + refillsThisCycle }
 
-  val refillChoices = Vec(Bool(), cacheCfg.bankCount)
-  var earlierRefill: Bool = False
-  for (bank <- 0 until cacheCfg.bankCount) {
-    val eligible = states(bank) === CacheBankState.RequestRefill
-    refillChoices(bank) := eligible && !earlierRefill
-    earlierRefill = earlierRefill || eligible
-  }
-  val refillBank = UInt(cacheCfg.bankIndexWidth bits)
-  refillBank := 0
-  for (bank <- 0 until cacheCfg.bankCount) {
-    when(refillChoices(bank)) { refillBank := bank }
-  }
-  io.refillRequest.valid := !io.clear && refillChoices.asBits.orR
-  io.refillRequest.payload.bank := refillBank
-  io.refillRequest.payload.address := 0
-  for (bank <- 0 until cacheCfg.bankCount) {
-    when(refillBank === bank) {
-      io.refillRequest.payload.address := addressRegs(bank)
+  val earlierIssuedBank = Array.fill(cacheCfg.bankCount)(False: Bool)
+  for (channel <- 0 until cacheCfg.refillChannelCount) {
+    val choices = Bits(cacheCfg.bankCount * cacheCfg.mshrsPerBank bits)
+    var earlier: Bool = False
+    for (bank <- 0 until cacheCfg.bankCount; slot <- 0 until cacheCfg.mshrsPerBank) {
+      val index = bank * cacheCfg.mshrsPerBank + slot
+      val eligible = mshrStates(bank)(slot) === CacheMshrState.RequestRefill &&
+        !earlierIssuedBank(bank)
+      choices(index) := eligible && !earlier
+      earlier = earlier || eligible
     }
-    when(io.refillRequest.fire && refillChoices(bank)) {
-      states(bank) := CacheBankState.WaitRefill
-    }
-  }
-
-  io.refillResponse.ready := False
-  for (bank <- 0 until cacheCfg.bankCount) {
-    val targetsBank = io.refillResponse.payload.bank === bank
-    val expected = states(bank) === CacheBankState.WaitRefill &&
-      io.refillResponse.payload.address === addressRegs(bank)
-    when(targetsBank) { io.refillResponse.ready := !io.clear && expected }
-    when(io.refillResponse.fire && targetsBank) {
-      responseData(bank) := io.refillResponse.payload.data
-      responseError(bank) := io.refillResponse.payload.error
-      when(!io.refillResponse.payload.error) {
-        val validIndex = if (cacheCfg.ways == 1) {
-          setRegs(bank)
-        } else {
-          (setRegs(bank).asBits ## victimWayRegs(bank).asBits).asUInt
+    refillRequestPorts(channel).valid := !io.clear && choices.orR
+    refillRequestPorts(channel).payload := CacheRefillRequest(cacheCfg).getZero
+    for (bank <- 0 until cacheCfg.bankCount; slot <- 0 until cacheCfg.mshrsPerBank) {
+      val index = bank * cacheCfg.mshrsPerBank + slot
+      when(choices(index)) {
+        refillRequestPorts(channel).payload.bank := bank
+        refillRequestPorts(channel).payload.address := mshrAddress(bank)(slot)
+        when(refillRequestPorts(channel).fire) {
+          mshrStates(bank)(slot) := CacheMshrState.WaitRefill
         }
-        validBits(bank)(validIndex) := True
-        if (cacheCfg.ways == 1) {
-          replacementMemories(bank).write(setRegs(bank),
-            U(0, cacheCfg.wayIndexWidth bits))
-        } else {
-          replacementMemories(bank).write(setRegs(bank),
-            (victimWayRegs(bank) + 1).resized)
-        }
-        refillCount := refillCount + 1
       }
-      states(bank) := CacheBankState.Respond
+    }
+    for (bank <- 0 until cacheCfg.bankCount) {
+      val bankSelected = (0 until cacheCfg.mshrsPerBank)
+        .map(slot => choices(bank * cacheCfg.mshrsPerBank + slot))
+        .reduce(_ || _)
+      earlierIssuedBank(bank) = earlierIssuedBank(bank) || bankSelected
     }
   }
 
@@ -283,30 +358,29 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
         when(selectedClients(bank) === client) {
           acceptedByClient(client) := True
           requestOrder(client).io.push.valid := True
-          requestOrder(client).io.push.payload :=
-            io.requests(client).payload.requestId
+          requestOrder(client).io.push.payload := io.requests(client).payload.requestId
         }
       }
     }
   }
 
   for (client <- 0 until cacheCfg.clientCount) {
-    val responseChoices = Bits(cacheCfg.bankCount bits)
     var earlierResponse: Bool = False
-    for (bank <- 0 until cacheCfg.bankCount) {
-      val eligible = !io.clear && states(bank) === CacheBankState.Respond &&
-        clientRegs(bank) === client && requestOrder(client).io.pop.valid &&
-        requestOrder(client).io.pop.payload === requestIdRegs(bank)
-      responseChoices(bank) := eligible && !earlierResponse
+    for (bank <- 0 until cacheCfg.bankCount; slot <- 0 until cacheCfg.mshrsPerBank) {
+      val eligible = !io.clear &&
+        mshrStates(bank)(slot) === CacheMshrState.Respond &&
+        mshrClient(bank)(slot) === client && requestOrder(client).io.pop.valid &&
+        requestOrder(client).io.pop.payload === mshrRequestId(bank)(slot)
+      val selected = eligible && !earlierResponse
       earlierResponse = earlierResponse || eligible
-      when(responseChoices(bank)) {
+      when(selected) {
         responseQueues(client).io.push.valid := True
-        responseQueues(client).io.push.payload.requestId := requestIdRegs(bank)
-        responseQueues(client).io.push.payload.data := responseData(bank)
-        responseQueues(client).io.push.payload.wasHit := responseWasHit(bank)
-        responseQueues(client).io.push.payload.error := responseError(bank)
+        responseQueues(client).io.push.payload.requestId := mshrRequestId(bank)(slot)
+        responseQueues(client).io.push.payload.data := mshrData(bank)(slot)
+        responseQueues(client).io.push.payload.wasHit := mshrWasHit(bank)(slot)
+        responseQueues(client).io.push.payload.error := mshrError(bank)(slot)
         when(responseQueues(client).io.push.fire) {
-          states(bank) := CacheBankState.Idle
+          mshrStates(bank)(slot) := CacheMshrState.Free
         }
       }
     }
@@ -317,12 +391,17 @@ class BankedReadCache(cacheCfg: CacheConfig) extends Component {
     }
   }
 
+  io.hitCount := hitCount
+  io.missCount := missCount
+  io.refillCount := refillCount
+
   when(io.clear) {
-    for (bank <- 0 until cacheCfg.bankCount) {
-      states(bank) := CacheBankState.Idle
-      validBits(bank) := 0
+    bankStates.foreach(_ := CacheBankState.Idle)
+    validBits.foreach(_ := 0)
+    for (bank <- 0 until cacheCfg.bankCount; slot <- 0 until cacheCfg.mshrsPerBank) {
+      mshrStates(bank)(slot) := CacheMshrState.Free
     }
-    for (client <- 0 until cacheCfg.clientCount) outstandingCounts(client) := 0
+    outstandingCounts.foreach(_ := 0)
     hitCount := 0
     missCount := 0
     refillCount := 0
@@ -341,6 +420,8 @@ object GenerateBankedReadCache extends App {
     bankCount = 32,
     setsPerBank = 128,
     clientCount = 32,
-    ways = 16
+    ways = 16,
+    mshrsPerBank = 4,
+    refillChannelCount = 4
   )))
 }

@@ -27,6 +27,26 @@ case class DualModeMrnResponse(cfg: TrapezoidConfig) extends Bundle {
   val consumeRight = Bool()
 }
 
+object DualModeMrnPolicy {
+  def sameCoordinate(
+      leftValid: Bool,
+      leftRow: UInt,
+      leftColumn: UInt,
+      rightValid: Bool,
+      rightRow: UInt,
+      rightColumn: UInt
+  ): Bool = leftValid && rightValid && leftRow === rightRow &&
+    leftColumn === rightColumn
+
+  def leftBefore(
+      leftRow: UInt,
+      leftColumn: UInt,
+      rightRow: UInt,
+      rightColumn: UInt
+  ): Bool = leftRow < rightRow ||
+    (leftRow === rightRow && leftColumn < rightColumn)
+}
+
 /** One elastic MRN compare/reduce node shared by IP and Gustavson policies. */
 class DualModeMrnNode(cfg: TrapezoidConfig) extends Component {
   val io = new Bundle {
@@ -39,13 +59,18 @@ class DualModeMrnNode(cfg: TrapezoidConfig) extends Component {
   io.input.ready := transformed.ready
   transformed.payload := DualModeMrnResponse(cfg).getZero
 
-  val sameCoordinate = io.input.payload.left.valid &&
-    io.input.payload.right.valid &&
-    io.input.payload.left.row === io.input.payload.right.row &&
-    io.input.payload.left.column === io.input.payload.right.column
-  val leftBeforeRight = io.input.payload.left.row < io.input.payload.right.row ||
-    (io.input.payload.left.row === io.input.payload.right.row &&
-      io.input.payload.left.column < io.input.payload.right.column)
+  val sameCoordinate = DualModeMrnPolicy.sameCoordinate(
+    io.input.payload.left.valid,
+    io.input.payload.left.row,
+    io.input.payload.left.column,
+    io.input.payload.right.valid,
+    io.input.payload.right.row,
+    io.input.payload.right.column)
+  val leftBeforeRight = DualModeMrnPolicy.leftBefore(
+    io.input.payload.left.row,
+    io.input.payload.left.column,
+    io.input.payload.right.row,
+    io.input.payload.right.column)
 
   when(io.input.payload.mode === MrnNodeMode.IpReduce) {
     transformed.payload.consumeLeft := io.input.payload.left.valid

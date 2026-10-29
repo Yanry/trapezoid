@@ -64,6 +64,8 @@ class TrapezoidStructureSpec extends AnyFunSuite {
     assert(paperCache.setsPerBank == 128)
     assert(paperCache.ways == 16)
     assert(paperCache.wordsPerLine == 16)
+    assert(paperCache.mshrsPerBank == 4)
+    assert(paperCache.refillChannelCount == 4)
     assert(paperCache.capacityBytes == BigInt(16) * 1024 * 1024)
     val paperClusters = CacheClusterConfig(paperCache, clusterCount = 4)
     assert(paperClusters.localCache.bankCount == 32)
@@ -104,5 +106,32 @@ class TrapezoidStructureSpec extends AnyFunSuite {
     elaborate(new BankedReadCache(CacheConfig(
       wordWidth = 8, wordsPerLine = 4, addressWidth = 6,
       bankCount = 2, setsPerBank = 2, clientCount = 2)))
+  }
+
+  test("multi-channel cache cluster and unified system elaborate") {
+    val sharedCfg = cfg.copy(peRows = 2)
+    val cacheCfg = CacheConfig(
+      wordWidth = 8,
+      wordsPerLine = 8,
+      addressWidth = 8,
+      bankCount = 4,
+      setsPerBank = 4,
+      clientCount = 2 * sharedCfg.localBanks + sharedCfg.peRows + 2,
+      requestIdWidth = 4,
+      mshrsPerBank = 2,
+      refillChannelCount = 2)
+    val clusters = CacheClusterConfig(cacheCfg, clusterCount = 2)
+    elaborate(new ClusteredReadCache(clusters))
+    val tileCfg = TrIpTileConfig(sharedCfg, maxColumns = 4,
+      maxRowsOverride = 2)
+    val matrixCfg = TrIpMatrixConfig(tileCfg,
+      maxMatrixRows = 4, maxMatrixColumns = 4, maxKTiles = 1)
+    val gustCfg = GustavsonCacheConfig(
+      GustavsonTileConfig(sharedCfg, accumulatorEntries = 4,
+        fifoDepthPerSubrow = 2),
+      cacheCfg,
+      maxLinesPerRow = 2)
+    elaborate(new UnifiedEndToEndSystem(EndToEndSystemConfig(
+      matrixCfg, gustCfg, clusters, maxCResults = 16)))
   }
 }

@@ -161,11 +161,12 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     level
   }
 
-  // Stage 0: hold route metadata independently from prepared route payloads.
-  // Paper-width commands use one elastic slot to avoid duplicating the very
-  // wide operand payload; smaller configurations use a deeper metadata FIFO.
+  // Stage 0: descriptor FIFO.  The command payload remains wide, but it is
+  // now decoupled from route-control preparation by two elastic entries.
   val inputStage = if (cfg.macLanes > 64) {
-    io.command.m2sPipe()
+    // Paper commands are tens of kilobits wide. Two elastic register stages
+    // avoid flattening that payload into a single oversized FIFO RAM word.
+    io.command.m2sPipe().m2sPipe()
   } else {
     val fifo = new StreamFifoLowLatency(
       PERowCommand(cfg), depth = 4, latency = 1, useVec = false)
@@ -184,6 +185,15 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     new PipelinedBenesRouteControlGenerator(cfg) else null
   val bPipelinedBenesControls = if (pipelinedBenesControls)
     new PipelinedBenesRouteControlGenerator(cfg) else null
+  val aControlFifo = if (pipelinedBenesControls)
+    new StreamFifoLowLatency(BenesRouteControlResult(cfg), depth = 2,
+      latency = 1, useVec = false) else null
+  val bControlFifo = if (pipelinedBenesControls)
+    new StreamFifoLowLatency(BenesRouteControlResult(cfg), depth = 2,
+      latency = 1, useVec = false) else null
+  val routeMetadataFifo = if (pipelinedBenesControls)
+    new StreamFifoLowLatency(PERowBenesMetadata(cfg), depth = 2,
+      latency = 1, useVec = false) else null
   val aRestrictedBenesControls = if (pipelinedBenesControls)
     new PipelinedRestrictedBenesRouteControlGenerator(cfg) else null
   val bRestrictedBenesControls = if (pipelinedBenesControls)
@@ -194,6 +204,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     new BenesBroadcastControlGenerator(cfg) else null
   val aBenesFabric = new BenesDistributionFabric(cfg)
   val bBenesFabric = new BenesDistributionFabric(cfg)
+  val aDirectDistribution = new OperandDistributionNetwork(cfg)
+  val bDirectDistribution = new OperandDistributionNetwork(cfg)
   val input = inputStage.payload
   val fullFiberMask = B((BigInt(1) << cfg.fiberWidth) - 1,
     cfg.fiberWidth bits)
@@ -296,6 +308,18 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     bBenesFabric.io.sources(lane)(cfg.dataWidth downto 1) :=
       mfiu.io.bSources(lane).asBits
   }
+  aDirectDistribution.io.sources := mfiu.io.aSources
+  bDirectDistribution.io.sources := mfiu.io.bSources
+  aDirectDistribution.io.sourceValid := mfiu.io.aSourceValid
+  bDirectDistribution.io.sourceValid := mfiu.io.bSourceValid
+  for (lane <- 0 until cfg.macLanes) {
+    aDirectDistribution.io.laneValid(lane) := mfiu.io.routes(lane).valid
+    bDirectDistribution.io.laneValid(lane) := mfiu.io.routes(lane).valid
+    aDirectDistribution.io.sourceIndex(lane) :=
+      mfiu.io.routes(lane).aSourceIndex
+    bDirectDistribution.io.sourceIndex(lane) :=
+      mfiu.io.routes(lane).bSourceIndex
+  }
   if (pipelinedBenesControls) {
     aBroadcastBenesControls.io.sourceIndex := aBroadcastSource
     bBroadcastBenesControls.io.sourceIndex := bBroadcastSource
@@ -313,6 +337,27 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       !broadcastRouteFastPath &&
       aRestrictedBenesControls.io.startSupported &&
       bRestrictedBenesControls.io.startSupported
+
+    // The metadata FIFO is only opened for the general multicast path. It
+    // lets the wide descriptor FIFO advance independently of the seven-stage
+    // control result FIFO while retaining A/B route alignment.
+    routeMetadataFifo.io.push.valid := inputStage.valid &&
+      sparseRouteNeedsControl && !broadcastRouteFastPath &&
+      !restrictedRouteFastPath && !controlCacheHit && !controlsStarted &&
+      !routeMetadataFifo.io.pop.valid
+    routeMetadataFifo.io.push.payload.routeValid := routeValidBits
+    for (lane <- 0 until cfg.macLanes) {
+      routeMetadataFifo.io.push.payload.aSourceIndices(lane) :=
+        mfiu.io.routes(lane).aSourceIndex
+      routeMetadataFifo.io.push.payload.bSourceIndices(lane) :=
+        mfiu.io.routes(lane).bSourceIndex
+    }
+    aControlFifo.io.push.valid := aPipelinedBenesControls.io.result.valid
+    aControlFifo.io.push.payload := aPipelinedBenesControls.io.result.payload
+    aPipelinedBenesControls.io.result.ready := aControlFifo.io.push.ready
+    bControlFifo.io.push.valid := bPipelinedBenesControls.io.result.valid
+    bControlFifo.io.push.payload := bPipelinedBenesControls.io.result.payload
+    bPipelinedBenesControls.io.result.ready := bControlFifo.io.push.ready
     val cacheHits = Bits(controlCacheEntries bits)
     for (entry <- 0 until controlCacheEntries) {
       var metadataMatches: Bool =
@@ -343,7 +388,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       bRestrictedBenesControls.io.start.ready
     aRestrictedBenesControls.io.start.valid := startRestricted
     bRestrictedBenesControls.io.start.valid := startRestricted
-    val startBoth = inputStage.valid && sparseRouteNeedsControl &&
+    val startBoth = routeMetadataFifo.io.pop.valid &&
       !broadcastRouteFastPath && !restrictedRouteFastPath &&
       !controlCacheHit && !controlsStarted &&
       aPipelinedBenesControls.io.start.ready &&
@@ -352,14 +397,15 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     bPipelinedBenesControls.io.start.valid := startBoth
     for (lane <- 0 until cfg.macLanes) {
       aPipelinedBenesControls.io.start.payload.routeValid(lane) :=
-        mfiu.io.routes(lane).valid
+        routeMetadataFifo.io.pop.payload.routeValid(lane)
       bPipelinedBenesControls.io.start.payload.routeValid(lane) :=
-        mfiu.io.routes(lane).valid
+        routeMetadataFifo.io.pop.payload.routeValid(lane)
       aPipelinedBenesControls.io.start.payload.sourceIndices(lane) :=
-        mfiu.io.routes(lane).aSourceIndex
+        routeMetadataFifo.io.pop.payload.aSourceIndices(lane)
       bPipelinedBenesControls.io.start.payload.sourceIndices(lane) :=
-        mfiu.io.routes(lane).bSourceIndex
+        routeMetadataFifo.io.pop.payload.bSourceIndices(lane)
     }
+    routeMetadataFifo.io.pop.ready := startBoth
     when((aPipelinedBenesControls.io.start.fire &&
         bPipelinedBenesControls.io.start.fire) ||
         (aRestrictedBenesControls.io.start.fire &&
@@ -372,36 +418,33 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       Mux(restrictedRouteFastPath,
         aRestrictedBenesControls.io.result.valid &&
           bRestrictedBenesControls.io.result.valid,
-        aPipelinedBenesControls.io.result.valid &&
-          bPipelinedBenesControls.io.result.valid)
+        aControlFifo.io.pop.valid && bControlFifo.io.pop.valid)
     aRouteRoutable := !sparseRouteNeedsControl ||
       broadcastRouteFastPath ||
       controlCacheHit ||
       Mux(restrictedRouteFastPath,
         aRestrictedBenesControls.io.result.valid &&
           aRestrictedBenesControls.io.result.payload.routable,
-        aPipelinedBenesControls.io.result.valid &&
-          aPipelinedBenesControls.io.result.payload.routable)
+        aControlFifo.io.pop.valid && aControlFifo.io.pop.payload.routable)
     bRouteRoutable := !sparseRouteNeedsControl ||
       broadcastRouteFastPath ||
       controlCacheHit ||
       Mux(restrictedRouteFastPath,
         bRestrictedBenesControls.io.result.valid &&
           bRestrictedBenesControls.io.result.payload.routable,
-        bPipelinedBenesControls.io.result.valid &&
-          bPipelinedBenesControls.io.result.payload.routable)
+        bControlFifo.io.pop.valid && bControlFifo.io.pop.payload.routable)
     aBenesFabric.io.controls := Mux(broadcastRouteFastPath,
       aBroadcastBenesControls.io.controls,
       Mux(controlCacheHit, cachedAControls,
         Mux(restrictedRouteFastPath,
           aRestrictedBenesControls.io.result.payload.controls,
-          aPipelinedBenesControls.io.result.payload.controls)))
+          aControlFifo.io.pop.payload.controls)))
     bBenesFabric.io.controls := Mux(broadcastRouteFastPath,
       bBroadcastBenesControls.io.controls,
       Mux(controlCacheHit, cachedBControls,
         Mux(restrictedRouteFastPath,
           bRestrictedBenesControls.io.result.payload.controls,
-          bPipelinedBenesControls.io.result.payload.controls)))
+          bControlFifo.io.pop.payload.controls)))
     when(inputStage.valid && sparseRouteNeedsControl && !controlCacheHit &&
         !routeControlsReady) {
       controlPrepareCycleCounter := controlPrepareCycleCounter + 1
@@ -453,20 +496,24 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     val benesB = bBenesFabric.io.outputs(lane)
     val benesAOperand = benesA(cfg.dataWidth downto 1).asSInt
     val benesBOperand = benesB(cfg.dataWidth downto 1).asSInt
+    val directAOperand = aDirectDistribution.io.outputs(lane)
+    val directBOperand = bDirectDistribution.io.outputs(lane)
+    val generalMulticastRoute = sparseRouteNeedsControl &&
+      !broadcastRouteFastPath && !restrictedRouteFastPath
     if (lane < cfg.fiberWidth) {
       tripValid := Mux(denseFastPath, True, laneRoute.valid)
       tripAFiber := Mux(denseFastPath, denseAFiber, laneRoute.aFiber)
       tripBFiber := Mux(denseFastPath, denseBFiber, laneRoute.bFiber)
       tripAOperand := Mux(denseFastPath, denseA.values(lane),
-        benesAOperand)
+        Mux(generalMulticastRoute, directAOperand, benesAOperand))
       tripBOperand := Mux(denseFastPath, denseB.values(lane),
-        benesBOperand)
+        Mux(generalMulticastRoute, directBOperand, benesBOperand))
     } else {
       tripValid := laneRoute.valid
       tripAFiber := laneRoute.aFiber
       tripBFiber := laneRoute.bFiber
-      tripAOperand := benesAOperand
-      tripBOperand := benesBOperand
+      tripAOperand := Mux(generalMulticastRoute, directAOperand, benesAOperand)
+      tripBOperand := Mux(generalMulticastRoute, directBOperand, benesBOperand)
     }
 
     val gustValid = Bool()
@@ -534,10 +581,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       restrictedRouteFastPath
     bRestrictedBenesControls.io.result.ready := consumeControls &&
       restrictedRouteFastPath
-    aPipelinedBenesControls.io.result.ready := consumeControls &&
-      !restrictedRouteFastPath
-    bPipelinedBenesControls.io.result.ready := consumeControls &&
-      !restrictedRouteFastPath
+    aControlFifo.io.pop.ready := consumeControls && !restrictedRouteFastPath
+    bControlFifo.io.pop.ready := consumeControls && !restrictedRouteFastPath
     when(consumeControls) {
       controlCacheValid(controlCacheReplace) := True
       controlCacheRouteValid(controlCacheReplace) :=
@@ -551,11 +596,11 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       controlCacheAControls(controlCacheReplace) := Mux(
         restrictedRouteFastPath,
         aRestrictedBenesControls.io.result.payload.controls,
-        aPipelinedBenesControls.io.result.payload.controls)
+        aControlFifo.io.pop.payload.controls)
       controlCacheBControls(controlCacheReplace) := Mux(
         restrictedRouteFastPath,
         bRestrictedBenesControls.io.result.payload.controls,
-        bPipelinedBenesControls.io.result.payload.controls)
+        bControlFifo.io.pop.payload.controls)
       controlCacheReplace := controlCacheReplace + 1
       controlsStarted := False
     }
@@ -749,7 +794,9 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
         right.destinationWordOffset
       if (position >= reductionDistance) {
         val left = levelInput.payload.lanes(position - reductionDistance)
-        val combine = right.valid && left.valid && !right.segmentStart
+        val combine = DualModeMrnPolicy.sameCoordinate(
+          left.valid, left.row, left.column,
+          right.valid, right.row, right.column)
         levelOutput.payload.lanes(position).value := Mux(combine,
           (left.value + right.value).resize(cfg.accumulatorWidth), right.value)
         levelOutput.payload.lanes(position).segmentStart := right.valid &&

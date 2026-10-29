@@ -300,6 +300,11 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val broadcastRouteFastPath = sparseRouteNeedsControl &&
     !aBroadcastMismatch && !bBroadcastMismatch
   val restrictedRouteFastPath = Bool()
+  // Paper-width irregular/repeated-source metadata is currently consumed by
+  // the direct source-selection bridge. Only the broadcast and restricted
+  // Benes paths require a routability proof from the control generator.
+  val directDistributionRoute = sparseRouteNeedsControl &&
+    !broadcastRouteFastPath && !restrictedRouteFastPath
   for (lane <- 0 until cfg.macLanes) {
     aBenesFabric.io.sources(lane)(0) := mfiu.io.aSourceValid(lane)
     aBenesFabric.io.sources(lane)(cfg.dataWidth downto 1) :=
@@ -498,8 +503,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     val benesBOperand = benesB(cfg.dataWidth downto 1).asSInt
     val directAOperand = aDirectDistribution.io.outputs(lane)
     val directBOperand = bDirectDistribution.io.outputs(lane)
-    val generalMulticastRoute = sparseRouteNeedsControl &&
-      !broadcastRouteFastPath && !restrictedRouteFastPath
+    val generalMulticastRoute = directDistributionRoute
     if (lane < cfg.fiberWidth) {
       tripValid := Mux(denseFastPath, True, laneRoute.valid)
       tripAFiber := Mux(denseFastPath, denseAFiber, laneRoute.aFiber)
@@ -567,8 +571,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   }
   routed.overflow := Mux(denseFastPath, False,
     Mux(inputTripMode, mfiu.io.overflow ||
-      (mfiu.io.count =/= 0 && (!aRouteRoutable ||
-        !bRouteRoutable)), gustRouteErrors.orR))
+      (mfiu.io.count =/= 0 && !directDistributionRoute &&
+        (!aRouteRoutable || !bRouteRoutable)), gustRouteErrors.orR))
 
   val routeInput = Stream(PERowRoutePayload(cfg))
   routeInput.valid := inputStage.valid && routeControlsReady
@@ -611,7 +615,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       controlCacheReplace := 0
     }
   }
-  when(routeInput.valid && useSparseTripRoute && mfiu.io.count =/= 0) {
+  when(routeInput.valid && useSparseTripRoute && mfiu.io.count =/= 0 &&
+      !directDistributionRoute) {
     assert(aRouteRoutable && bRouteRoutable,
       "MFIU emitted a route pattern not supported by the Benes solver")
   }

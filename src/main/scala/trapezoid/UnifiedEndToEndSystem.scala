@@ -436,6 +436,7 @@ class CachedTrGtSubrowAdapter(
   private val prefetchCapacity = cfg.localBanks * cfg.localDepthPerBank
   private val prefetchSlotWidth = scala.math.max(1, log2Up(prefetchCapacity))
   private val prefetchCountWidth = log2Up(prefetchCapacity + 1)
+  private val prefetchBankAddressWidth = cfg.localAddressWidth
   private val groupCount = 2
   private val lineIdWidth = scala.math.max(1, log2Up(gustCfg.maxLinesPerRow))
   require(cacheCfg.requestIdWidth >= lineIdWidth + 1,
@@ -562,9 +563,26 @@ class CachedTrGtSubrowAdapter(
     Reg(UInt(prefetchCountWidth bits)) init 0))
   val prefetchValid = Vec((0 until groupCount).map(_ =>
     Vec((0 until prefetchCapacity).map(_ => RegInit(False)))))
-  val prefetchData = Vec((0 until groupCount).map(_ =>
-    Vec((0 until prefetchCapacity).map(_ =>
-      Reg(Bits(cacheCfg.lineWidth bits)) init 0))))
+  // B lines are physically banked by the local-buffer bank index. The valid
+  // bitmap remains register state because a group reset invalidates all slots
+  // without spending a cycle writing the data SRAM; data itself is inferred as
+  // one memory per group and per bank.
+  val prefetchDataMem = Array.fill(groupCount, cfg.localBanks) {
+    Mem(Bits(cacheCfg.lineWidth bits), cfg.localDepthPerBank)
+  }
+
+  private def prefetchDataAt(group: UInt, slot: UInt): Bits = {
+    val selected = Bits(cacheCfg.lineWidth bits)
+    selected := 0
+    val bank = slot(prefetchSlotWidth - 1 downto prefetchBankAddressWidth)
+    val address = slot(prefetchBankAddressWidth - 1 downto 0)
+    for (groupIndex <- 0 until groupCount; bankIndex <- 0 until cfg.localBanks) {
+      when(group === groupIndex && bank === bankIndex) {
+        selected := prefetchDataMem(groupIndex)(bankIndex).readAsync(address)
+      }
+    }
+    selected
+  }
   val elementCursor = Reg(UInt(elementIndexWidth bits)) init 0
   val doneReg = RegInit(False)
   val overflowReg = RegInit(False)
@@ -624,7 +642,8 @@ class CachedTrGtSubrowAdapter(
   val currentPrefetchSlot =
     (currentLineBase + requestIndex.resized).resize(prefetchSlotWidth)
   val currentLineValid = prefetchValid(executeGroup.asUInt)(currentPrefetchSlot)
-  val currentLineData = prefetchData(executeGroup.asUInt)(currentPrefetchSlot)
+  val currentLineData = prefetchDataAt(executeGroup.asUInt,
+    currentPrefetchSlot)
   for (element <- 0 until gustCfg.elementsPerLine) {
     val offset = element * gustCfg.elementWidth
     lineElements(element).valid := currentLineValid &&
@@ -984,6 +1003,10 @@ class CachedTrGtSubrowAdapter(
   }
   val responseStorageSlot = (responseLineBase +
     responseLineIndex.resized).resize(prefetchSlotWidth)
+  val responseStorageBank = responseStorageSlot(
+    prefetchSlotWidth - 1 downto prefetchBankAddressWidth)
+  val responseStorageAddress = responseStorageSlot(
+    prefetchBankAddressWidth - 1 downto 0)
   io.cacheResponse.ready := !io.clear && requestOutstanding.asBits.orR
   when(io.cacheResponse.fire) {
     val responseLineCount = UInt(gustCfg.lineCountWidth bits)
@@ -999,8 +1022,13 @@ class CachedTrGtSubrowAdapter(
       memoryErrorReg := True
       state := CachedTrGtState.Finish
     } otherwise {
-      prefetchData(responseContext)(responseStorageSlot) :=
-        io.cacheResponse.payload.data
+      for (group <- 0 until groupCount; bank <- 0 until cfg.localBanks) {
+        when(responseGroup === (if (group == 1) True else False) &&
+            responseStorageBank === bank) {
+          prefetchDataMem(group)(bank).write(responseStorageAddress,
+            io.cacheResponse.payload.data)
+        }
+      }
       prefetchValid(responseContext)(responseStorageSlot) := True
       when(responseGroup === executeGroup &&
           responseAIndex === currentIndex.resized &&

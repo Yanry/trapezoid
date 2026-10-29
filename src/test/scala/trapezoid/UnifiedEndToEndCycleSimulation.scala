@@ -97,7 +97,9 @@ object EndToEndCycleSimulation extends App {
     bankCount = 8,
     setsPerBank = 64,
     clientCount = cacheClientCount,
-    requestIdWidth = 8
+    requestIdWidth = 8,
+    mshrsPerBank = 2,
+    refillChannelCount = 2
   )
   private val gustCfg = GustavsonCacheConfig(
     GustavsonTileConfig(cfg,
@@ -207,8 +209,8 @@ object EndToEndCycleSimulation extends App {
                               bBasisPoints: Int, paperMode: String)
   private case class Workload(category: Category, sample: Int,
                               a: DenseMatrix, b: DenseMatrix)
-  private case class PendingRead(bank: Int, address: Int, data: BigInt,
-                                 readyEdge: Long)
+  private case class PendingRead(channel: Int, bank: Int, address: Int,
+                                 data: BigInt, readyEdge: Long)
   private case class PendingWrite(address: Int, readyEdge: Long)
   private case class Measurement(
       category: Category,
@@ -428,6 +430,16 @@ object EndToEndCycleSimulation extends App {
     dut.io.dmaReadResponse.payload.address #= 0
     dut.io.dmaReadResponse.payload.data #= 0
     dut.io.dmaReadResponse.payload.error #= false
+    if (cacheCfg.refillChannelCount > 1) {
+      for (channel <- 0 until cacheCfg.refillChannelCount - 1) {
+        dut.io.extraDmaReadRequests(channel).ready #= true
+        dut.io.extraDmaReadResponses(channel).valid #= false
+        dut.io.extraDmaReadResponses(channel).payload.bank #= 0
+        dut.io.extraDmaReadResponses(channel).payload.address #= 0
+        dut.io.extraDmaReadResponses(channel).payload.data #= 0
+        dut.io.extraDmaReadResponses(channel).payload.error #= false
+      }
+    }
     dut.io.dmaWriteRequest.ready #= true
     dut.io.dmaWriteResponse.valid #= false
     dut.io.dmaWriteResponse.payload.address #= 0
@@ -437,6 +449,11 @@ object EndToEndCycleSimulation extends App {
       dut.io.clear #= true
       dut.io.descriptor.valid #= false
       dut.io.dmaReadResponse.valid #= false
+      if (cacheCfg.refillChannelCount > 1) {
+        for (channel <- 0 until cacheCfg.refillChannelCount - 1) {
+          dut.io.extraDmaReadResponses(channel).valid #= false
+        }
+      }
       dut.io.dmaWriteResponse.valid #= false
       dut.clockDomain.waitSampling(2)
       dut.io.clear #= false
@@ -450,9 +467,10 @@ object EndToEndCycleSimulation extends App {
       val memory = ipMemory(workload, modeName) ++ csrMemory(workload)
       val expected = expectedEntries(workload)
       val observed = mutable.Map.empty[(Int, Int), Long]
-      val pendingReads = mutable.Queue.empty[PendingRead]
+      val pendingReads = mutable.ArrayBuffer.empty[PendingRead]
       val pendingWrites = mutable.Queue.empty[PendingWrite]
-      var activeRead: Option[PendingRead] = None
+      val activeReads = Array.fill[Option[PendingRead]](
+        cacheCfg.refillChannelCount)(None)
       var activeWrite: Option[PendingWrite] = None
       var edge = 0L
       var startEdge = -1L
@@ -477,24 +495,47 @@ object EndToEndCycleSimulation extends App {
       dut.io.descriptor.valid #= true
 
       while (finalEdge < 0 && edge < timeoutEdges) {
-        if (activeRead.isEmpty &&
-            pendingReads.headOption.exists(_.readyEdge <= edge + 1)) {
-          activeRead = Some(pendingReads.dequeue())
+        for (channel <- activeReads.indices if activeReads(channel).isEmpty) {
+          val readyIndex = pendingReads.indexWhere(read =>
+            read.channel == channel && read.readyEdge <= edge + 1)
+          if (readyIndex >= 0) {
+            activeReads(channel) = Some(pendingReads.remove(readyIndex))
+          }
         }
         if (activeWrite.isEmpty &&
             pendingWrites.headOption.exists(_.readyEdge <= edge + 1)) {
           activeWrite = Some(pendingWrites.dequeue())
         }
-        if (activeRead.nonEmpty || pendingReads.nonEmpty) readActiveCycles += 1
+        if (activeReads.exists(_.nonEmpty) || pendingReads.nonEmpty) {
+          readActiveCycles += 1
+        }
         if (activeWrite.nonEmpty || pendingWrites.nonEmpty) writeActiveCycles += 1
 
         dut.io.dmaReadRequest.ready #= true
-        dut.io.dmaReadResponse.valid #= activeRead.nonEmpty
-        activeRead.foreach { response =>
+        dut.io.dmaReadResponse.valid #= activeReads(0).nonEmpty
+        activeReads(0).foreach { response =>
           dut.io.dmaReadResponse.payload.bank #= response.bank
           dut.io.dmaReadResponse.payload.address #= response.address
           dut.io.dmaReadResponse.payload.data #= response.data
           dut.io.dmaReadResponse.payload.error #= false
+        }
+        if (cacheCfg.refillChannelCount > 1) {
+          for (channel <- 1 until cacheCfg.refillChannelCount) {
+            val externalChannel = channel - 1
+            dut.io.extraDmaReadRequests(externalChannel).ready #= true
+            dut.io.extraDmaReadResponses(externalChannel).valid #=
+              activeReads(channel).nonEmpty
+            activeReads(channel).foreach { response =>
+              dut.io.extraDmaReadResponses(externalChannel).payload.bank #=
+                response.bank
+              dut.io.extraDmaReadResponses(externalChannel).payload.address #=
+                response.address
+              dut.io.extraDmaReadResponses(externalChannel).payload.data #=
+                response.data
+              dut.io.extraDmaReadResponses(externalChannel).payload.error #=
+                false
+            }
+          }
         }
         dut.io.dmaWriteRequest.ready #= true
         dut.io.dmaWriteResponse.valid #= activeWrite.nonEmpty
@@ -506,18 +547,26 @@ object EndToEndCycleSimulation extends App {
         sleep(1)
         val descriptorFire = dut.io.descriptor.valid.toBoolean &&
           dut.io.descriptor.ready.toBoolean
-        val readRequestFire = dut.io.dmaReadRequest.valid.toBoolean &&
-          dut.io.dmaReadRequest.ready.toBoolean
-        val readResponseFire = activeRead.nonEmpty &&
-          dut.io.dmaReadResponse.ready.toBoolean
+        val readRequestFires = (0 until cacheCfg.refillChannelCount).map {
+          case 0 => dut.io.dmaReadRequest.valid.toBoolean &&
+            dut.io.dmaReadRequest.ready.toBoolean
+          case channel =>
+            val externalChannel = channel - 1
+            dut.io.extraDmaReadRequests(externalChannel).valid.toBoolean &&
+              dut.io.extraDmaReadRequests(externalChannel).ready.toBoolean
+        }
+        val readResponseFires = (0 until cacheCfg.refillChannelCount).map {
+          case 0 => activeReads(0).nonEmpty &&
+            dut.io.dmaReadResponse.ready.toBoolean
+          case channel =>
+            val externalChannel = channel - 1
+            activeReads(channel).nonEmpty &&
+              dut.io.extraDmaReadResponses(externalChannel).ready.toBoolean
+        }
         val writeRequestFire = dut.io.dmaWriteRequest.valid.toBoolean &&
           dut.io.dmaWriteRequest.ready.toBoolean
         val writeResponseFire = activeWrite.nonEmpty &&
           dut.io.dmaWriteResponse.ready.toBoolean
-        val readBank = if (readRequestFire)
-          dut.io.dmaReadRequest.payload.bank.toInt else 0
-        val readAddress = if (readRequestFire)
-          dut.io.dmaReadRequest.payload.address.toInt else 0
         val writeAddress = if (writeRequestFire)
           dut.io.dmaWriteRequest.payload.address.toInt else 0
         val writeData = if (writeRequestFire)
@@ -530,15 +579,27 @@ object EndToEndCycleSimulation extends App {
           startEdge = edge
           dut.io.descriptor.valid #= false
         }
-        if (readRequestFire) {
+        for (channel <- 0 until cacheCfg.refillChannelCount
+             if readRequestFires(channel)) {
+          val (readBank, readAddress) = if (channel == 0) {
+            (dut.io.dmaReadRequest.payload.bank.toInt,
+              dut.io.dmaReadRequest.payload.address.toInt)
+          } else {
+            val externalChannel = channel - 1
+            (dut.io.extraDmaReadRequests(externalChannel).payload.bank.toInt,
+              dut.io.extraDmaReadRequests(externalChannel).payload.address.toInt)
+          }
           require(memory.contains(readAddress),
-            s"$modeName requested unmapped line $readAddress")
+            s"$modeName requested unmapped line $readAddress on channel $channel")
           require(readBank == (readAddress & (cacheCfg.bankCount - 1)))
-          pendingReads.enqueue(PendingRead(readBank, readAddress,
-            memory(readAddress), edge + readLatencyCycles))
+          pendingReads += PendingRead(channel, readBank, readAddress,
+            memory(readAddress), edge + readLatencyCycles)
           readRequests += 1
         }
-        if (readResponseFire) activeRead = None
+        for (channel <- 0 until cacheCfg.refillChannelCount
+             if readResponseFires(channel)) {
+          activeReads(channel) = None
+        }
         if (writeRequestFire) {
           if (firstWriteEdge < 0) firstWriteEdge = edge
           observed += decodeResult(writeData)
@@ -624,6 +685,8 @@ object EndToEndCycleSimulation extends App {
     s"capacity: ${cacheCfg.capacityBytes} bytes; ways: ${cacheCfg.ways}")
   println(s"Cold cache; read DMA latency: $readLatencyCycles cycles; " +
     s"write response latency: $writeLatencyCycles cycles")
+  println(s"Read refill channels: ${cacheCfg.refillChannelCount}; " +
+    s"MSHRs per bank: ${cacheCfg.mshrsPerBank}")
   println(s"C write DMA: up to ${systemCfg.writeOutstandingDepth} ordered " +
     "outstanding requests")
   println("Boundary: unified descriptor acceptance through the final C DMA write response.")

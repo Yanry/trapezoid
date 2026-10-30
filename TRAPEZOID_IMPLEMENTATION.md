@@ -176,7 +176,7 @@ TrIP 主路径保留独立的 A/B Benes fabric。MFIU 输出 `routeValid + sourc
 
 受限控制器先检查 broadcast 或 `sourceIndex == spread(outputLane)`，128 lane 时经过 `log2(128)=7` 个 ready/valid stage。通用路径由 descriptor FIFO 写入 `PERowBenesMetadata` FIFO，A/B metadata 同步进入两个 7-stage、II=1 token pipeline，结果再写入独立 A/B control FIFO。这样 repeated-source pattern 不再执行旧版约 263-cycle 的逐命令图着色；7.2 中 `MS x MS` 和 `MS x D` 的 cold prepare 已降到 18/9 cycle。
 
-paper-width 通用 repeated-source/不规则 route 现在由 `TrapezoidBenesRouteControl.sv` 根据 MFIU metadata 生成完整的 128-lane、13-stage Benes control word，A/B 两棵 fabric 使用独立 control FIFO 接收结果；不再存在 direct-distribution bridge。solver endpoint 已改为带异步 reset、ready/valid 和 7 个 elastic control registers 的 RTL pipeline，A/B 两路可以 II=1 地接收 metadata；PE row 只有在 A/B 控制字都有效且 `routable` 时才消费 route，避免未准备或非法控制字进入 datapath。Verilator 已对这些 route 做了 `routable` 断言和端到端 checksum 验证。当前剩余差距是每个 register stage 仍转发完整 control word，图遍历 task 仍在 stage 0 组合求解；它已经是有真实时序边界的 7-stage RTL 控制端点，但还不是论文意义上“每个 Benes level 各自执行一个 metadata step”的完全拆分状态机。PE row 内的 4-entry route cache 仍复用已准备的 controls/token，`endOfTile` 会恢复 cold state。
+paper-width 通用 repeated-source/不规则 route 现在由 `TrapezoidBenesRouteControl.sv` 根据 MFIU metadata 生成完整的 128-lane、13-stage Benes control word，A/B 两棵 fabric 使用独立 control FIFO 接收结果；不再存在 direct-distribution bridge。当前 7-stage endpoint 已改为只在各级寄存 `routeValid + sourceIndex` metadata，末端根据第 7 级稳定 metadata 生成控制字，避免在每个 stage 复制完整 control word；A/B 两路可以 II=1 地接收 metadata，PE row 只有在 A/B 控制字都有效且 `routable` 时才消费 route。Verilator 已对这些 route 做了 `routable` 断言和端到端 checksum 验证。当前剩余差距是末端 `solveSubnet` 仍为组合式图遍历，尚未拆成论文意义上“每个 Benes level 各自执行一个 metadata step”的完全状态机；下一步应将末端 solver 替换为 level-local metadata FSM。PE row 内的 4-entry route cache 仍复用已准备的 controls/token，`endOfTile` 会恢复 cold state。
 
 ### 4.5 Reduction tree 和 MRN
 
@@ -383,7 +383,7 @@ final C write response consumed
 - 论文原始 FPGA/ASIC 的频率、NoC 和功耗；
 - 128-row full paper array 的已完成周期结果，除非确实完成对应仿真。
 
-2026-10-30 使用默认 `--scale=small` 完成真实 Verilator 验证。72 个 case（6 类 x 4 mode x 3 samples）的结果、write 数和 checksum 全部通过；本轮小规模 RTL 使用 2 个 refill channel 和每 bank 2 个 MSHR。Verilator 编译耗时 533.202 秒，72-case 仿真耗时 257.826 秒，完整命令耗时 813 秒。这些主机时间不计入硬件周期。下面是本轮 3 个 sample 的平均周期结果：
+2026-10-30 本轮重新完成真实 Verilator 验证。72 个 case（6 类 x 4 mode x 3 samples）的结果、write 数和 checksum 全部通过；本轮小规模 RTL 使用 2 个 refill channel 和每 bank 2 个 MSHR。metadata-only Benes 改动没有改变功能结果和端到端周期表。Verilator 编译耗时约 527 秒，72-case 仿真耗时约 250 秒，完整命令耗时约 804 秒。这些主机时间不计入硬件周期。下面是本轮 3 个 sample 的平均周期结果：
 
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
@@ -449,7 +449,7 @@ scripts/run-paper-single-perow.sh
 
 测试还输出 `controlPrepareCycles`、`route`、`MAC`、`MRN`、`response` 五个 counter，以及 `commandCount`、`responseCount`、`usefulMacs`、`laneSlots` 和 checksum。`controlPrepareCycles` 表示 cold route 阻塞；其余四个是各 stage 持有 valid payload 的 occupancy delta，不是互斥阶段延迟，也不包含 CSR/DMA/cache/C write。完整端到端周期仍以 7.1 的最终 C write response 为准。
 
-本次成功的全量层次化构建重新生成并编译了 paper kernel，Verilator 编译耗时 550.047 秒，24-case RTL 仿真耗时 215.928 秒，完整命令耗时 769 秒。运行时间不属于表中的硬件 cycle。编译期间的 `Mem.readAsync can only be write first` 是当前 inferred memory 的 Verilog 映射警告，不是仿真失败。完整日志保存在 `/tmp/trapezoid-paper-single-perow-20261030-stagepipe-full.log`；本轮 7.1 日志保存在 `/tmp/trapezoid-e2e-small-20261030-stagepipe-full.log`。
+本次成功的全量层次化构建重新生成并编译了 paper kernel，Verilator 编译耗时约 541 秒，24-case RTL 仿真耗时约 123 秒，完整命令耗时约 969 秒。运行时间不属于表中的硬件 cycle。第一次运行暴露了 hierarchical Verilator 在当前发行版中查找 `/usr/share/verilator/verilator_bin` 的工具路径问题，`scripts/run-paper-single-perow.sh` 已通过临时 `VERILATOR_ROOT` 兼容目录解决；随后 RTL 编译和仿真全部通过。编译期间的 `Mem.readAsync can only be write first` 是当前 inferred memory 的 Verilog 映射警告，不是仿真失败。
 
 ### 7.3 Full paper array 的状态
 
@@ -483,7 +483,7 @@ paper profile 已配置为论文的 4 clusters、128 banks、16-way、64 B line 
 
 ### 8.6 hardware implementation 仍有结构差异
 
-TrIP 已有两级 descriptor elastic FIFO、独立 route metadata FIFO、A/B control FIFO 和 7-stage/II=1 metadata pipeline，旧的约 263-cycle graph-coloring fallback 已删除。broadcast、compacted spread、repeated-source block multicast 和不规则 route 都驱动同一棵 Benes fabric；paper-width 通用控制由 `TrapezoidBenesRouteControl.sv` 生成每一级 switch control，并输出 `routable`。7.2 的 `MS x MS`、`MS x D` 和 `D x D` 均通过真实 Benes path 完成功能验证。当前实现已经把 solver 封装成带 reset 和 backpressure 的 7-stage RTL endpoint，但图遍历 task 仍在入口组合完成，stage 间传递的是完整 control word，尚未拆成论文意义上的逐级、每周期一个 metadata step 的状态机；因此控制器面积、关键路径和功耗还不能视为论文 PPA 结果。
+TrIP 已有两级 descriptor elastic FIFO、独立 route metadata FIFO、A/B control FIFO 和 7-stage/II=1 metadata pipeline，旧的约 263-cycle graph-coloring fallback 已删除。broadcast、compacted spread、repeated-source block multicast 和不规则 route 都驱动同一棵 Benes fabric；paper-width 通用控制由 `TrapezoidBenesRouteControl.sv` 生成并输出 `routable`。7.2 的 `MS x MS`、`MS x D` 和 `D x D` 均通过真实 Benes path 完成功能验证。当前 7 个 stage 只寄存 `routeValid + sourceIndex` metadata，完整 control word 只在末端生成，避免了宽控制字在每级复制；但图遍历 task 仍在末端组合完成，尚未拆成论文意义上的逐级、每周期一个 metadata step 的状态机。因此控制器面积、关键路径和功耗还不能视为论文 PPA 结果。
 
 论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows。当前 scheduler 已实现 occupancy-aware 多行 packing、长行多 subrow 占用、两个 group descriptor/A context，以及按实际 line count 分配的完整 B-window group buffer。B-line payload 已改为按 `group x local-bank` 划分的 inferred `Mem`，valid bitmap、descriptor、cursor 和 outstanding 状态仍是寄存器控制面；background group 可以连续预取所有有效 A 的 B lines。剩余差距是这些 inferred memory 尚未绑定目标工艺的同步 SRAM BlackBox，单 request arbitration 也限制了预取带宽，因此 7.1 dense TrGT 的周期只小幅下降。
 

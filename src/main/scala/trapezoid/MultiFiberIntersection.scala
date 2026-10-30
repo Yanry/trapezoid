@@ -910,10 +910,10 @@ class PipelinedRestrictedBenesRouteControlGenerator(cfg: TrapezoidConfig)
 
 /** Fixed-latency metadata path for wide PE rows.
   *
-  * The route metadata is solved by the same multicast Benes control generator
-  * for every fabric width. The seven elastic stages for a 128-lane fabric
-  * carry the generated per-level switch controls; there is no wide-fabric
-  * direct source-selection fallback in the datapath.
+  * Wide RTL carries compact route metadata through seven elastic stages. The
+  * current endpoint still solves the graph at the final stage; a later
+  * implementation can replace that endpoint with level-local Benes FSMs
+  * without changing the PE-row FIFO contract.
   */
 class PipelinedBenesRouteControlGenerator(cfg: TrapezoidConfig)
     extends Component {

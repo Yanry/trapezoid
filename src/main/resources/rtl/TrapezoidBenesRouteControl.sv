@@ -194,10 +194,11 @@ module TrapezoidBenesRouteControl #(
     integer lane;
     logic [CONTROL_WIDTH-1:0] solvedControls;
     logic solvedLegal;
-    logic [CONTROL_WIDTH-1:0] preparedControls;
-    logic preparedLegal;
-    logic [CONTROL_WIDTH-1:0] stageControls [0:6];
-    logic stageLegal [0:6];
+    // Carry compact route metadata through the elastic stages.  The wide
+    // control word is generated only from the final metadata stage instead
+    // of being replicated in every pipeline register.
+    logic [LANES-1:0] stageRouteValid [0:6];
+    logic [LANES*INDEX_WIDTH-1:0] stageSources [0:6];
     logic stageValid [0:6];
     logic stageReady [0:6];
     integer readyIndex;
@@ -205,13 +206,11 @@ module TrapezoidBenesRouteControl #(
 
     always_comb begin
         for (lane = 0; lane < LANES; lane = lane + 1) begin
-            routeIsValid[lane] = routeValid[lane];
-            routeSource[lane] = sourceIndices[lane*INDEX_WIDTH +: INDEX_WIDTH];
+            routeIsValid[lane] = stageRouteValid[6][lane];
+            routeSource[lane] = stageSources[6][lane*INDEX_WIDTH +: INDEX_WIDTH];
         end
         solveSubnet(LANES, 0, routeIsValid, routeSource,
                     solvedControls, solvedLegal);
-        preparedControls = solvedControls;
-        preparedLegal = solvedLegal && (|routeValid);
     end
 
     always_comb begin
@@ -221,8 +220,8 @@ module TrapezoidBenesRouteControl #(
                 stageReady[readyIndex + 1];
         startReady = stageReady[0];
         resultValid = stageValid[6];
-        controls = stageControls[6];
-        routable = stageLegal[6];
+        controls = solvedControls;
+        routable = solvedLegal && (|stageRouteValid[6]);
     end
 
     // The route solver is a clock-domain endpoint, so reset must clear both
@@ -233,8 +232,8 @@ module TrapezoidBenesRouteControl #(
         if (reset) begin
             for (seqIndex = 0; seqIndex < 7; seqIndex = seqIndex + 1) begin
                 stageValid[seqIndex] <= 1'b0;
-                stageLegal[seqIndex] <= 1'b0;
-                stageControls[seqIndex] <= '0;
+                stageRouteValid[seqIndex] <= '0;
+                stageSources[seqIndex] <= '0;
             end
         end else begin
             for (seqIndex = 0; seqIndex < 7; seqIndex = seqIndex + 1) begin
@@ -242,14 +241,15 @@ module TrapezoidBenesRouteControl #(
                     if (seqIndex == 0) begin
                         stageValid[seqIndex] <= startValid;
                         if (startValid) begin
-                            stageControls[seqIndex] <= preparedControls;
-                            stageLegal[seqIndex] <= preparedLegal;
+                            stageRouteValid[seqIndex] <= routeValid;
+                            stageSources[seqIndex] <= sourceIndices;
                         end
                     end else begin
                         stageValid[seqIndex] <= stageValid[seqIndex - 1];
                         if (stageValid[seqIndex - 1]) begin
-                            stageControls[seqIndex] <= stageControls[seqIndex - 1];
-                            stageLegal[seqIndex] <= stageLegal[seqIndex - 1];
+                            stageRouteValid[seqIndex] <=
+                                stageRouteValid[seqIndex - 1];
+                            stageSources[seqIndex] <= stageSources[seqIndex - 1];
                         end
                     end
                 end

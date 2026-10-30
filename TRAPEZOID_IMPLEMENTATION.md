@@ -281,7 +281,9 @@ TrGt 的 B 输入通过四个独立 subrow FIFO temporally gather。最终 B 元
 
 TrGT adapter 现在有两个 group descriptor/context、两套 A load cursor 和两套独立 B reorder buffer。`IndexedGustavsonA` 与 `GustavsonStart` 都携带 `groupId`；当前 context 运行时可以写入 inactive context。每个 group 的 B buffer 容量为 `localBanks * localDepthPerBank` 条 cache line。收集 descriptor 时按 A 的实际 `lineCount` 分配可变长度 `lineBase`，不再为每个 A 固定只保留 `bPrefetchDepth` 个槽，因此 background group 可以依次预取所有有效 A 的后续 B windows。
 
-共享 cache request 端口优先服务 execute group，空闲周期服务 background group；request ID 编码 `groupId + lineId`。同一 group 只有在当前 A 的 outstanding response 清空后才切换 `prefetchAIndex`，因此 response 可在两个 group 之间乱序返回而不会混淆 A window。group 按 `Fill -> Ready/A-load -> Execute -> Drain` 交接。剩余差距是两套 A/B context 目前仍由寄存器 Vec 表达，尚未绑定成论文式共享物理 SRAM；单 adapter 也仍只有一个 cache request arbitration point，不能等价模拟多个 memory channel 的整组带宽。
+B-window data memory 现在通过 `readSync` 接口访问。refill 写入 valid bitmap 后，当前 line 仍需经过一个 local-buffer SRAM read cycle 才能进入 `EmitLine`；这使 TrGT 的端到端周期包含真实的同步 local-buffer 读延迟，而不是组合 `readAsync` 查表。
+
+共享 cache request 端口使用 `prefetchIssueTurn` 做公平轮转：当 execute group 和 background group 都能发射时交错选择，只有一侧能发射时立即服务该侧；request ID 编码 `groupId + lineId`。同一 group 只有在当前 A 的 outstanding response 清空后才切换 `prefetchAIndex`，因此 response 可在两个 group 之间乱序返回而不会混淆 A window。group 按 `Fill -> Ready/A-load -> Execute -> Drain` 交接。该轮转消除了固定 execute 优先可能造成的 background starvation，但端口仍然每周期最多接受一个请求，尚不能等价模拟论文中的多 memory channel 整组带宽。两套 A/B context 目前也仍由寄存器 Vec 表达，尚未绑定成论文式共享物理 SRAM。
 
 ### 5.4 `TrGs`
 
@@ -383,20 +385,20 @@ final C write response consumed
 - 论文原始 FPGA/ASIC 的频率、NoC 和功耗；
 - 128-row full paper array 的已完成周期结果，除非确实完成对应仿真。
 
-2026-10-30 本轮重新完成真实 Verilator 验证。72 个 case（6 类 x 4 mode x 3 samples）的结果、write 数和 checksum 全部通过；本轮小规模 RTL 使用 2 个 refill channel 和每 bank 2 个 MSHR。metadata-only Benes 改动没有改变功能结果和端到端周期表。Verilator 编译耗时约 527 秒，72-case 仿真耗时约 250 秒，完整命令耗时约 804 秒。这些主机时间不计入硬件周期。下面是本轮 3 个 sample 的平均周期结果：
+2026-10-30 本轮重新完成真实 Verilator 验证。72 个 case（6 类 x 4 mode x 3 samples）的结果、write 数和 checksum 全部通过；本轮小规模 RTL 使用 2 个 refill channel 和每 bank 2 个 MSHR。新增的 TrGT 双 group 公平轮转没有改变这组 workload 的周期表，说明当前样例的主要瓶颈仍是 command decomposition、ordered merge 和 scheduler bookkeeping，而不是双 group 端口的固定优先级。Verilator 编译耗时约 522 秒，72-case 仿真耗时约 249 秒，完整命令耗时约 792 秒。这些主机时间不计入硬件周期。下面是本轮 3 个 sample 的平均周期结果：
 
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
-| HS x HS | 1114.0 | 762.0 | 401.0 | 350.0 |
-| HS x MS | 1127.7 | 775.7 | 503.0 | 350.0 |
-| HS x D | 1159.0 | 807.0 | 1016.0 | 350.0 |
-| MS x MS | 1534.7 | 1180.0 | 2706.0 | 1884.3 |
-| MS x D | 1900.0 | 1532.0 | 24085.3 | 2420.0 |
-| D x D | 1916.0 | 1980.0 | 58300.0 | 7328.0 |
+| HS x HS | 1114.0 | 762.0 | 403.0 | 350.0 |
+| HS x MS | 1127.7 | 775.7 | 505.0 | 350.0 |
+| HS x D | 1159.0 | 807.0 | 1018.0 | 350.0 |
+| MS x MS | 1534.7 | 1180.0 | 2728.0 | 1884.3 |
+| MS x D | 1900.0 | 1532.0 | 24085.7 | 2420.0 |
+| D x D | 1916.0 | 1980.0 | 58305.0 | 7328.0 |
 
-这些数字来自同一个共享 `ModeSharedTileController`、同一套 PE row/local storage、cluster ROB、双 refill channel 和 cold-cache 模型。`HS x MS/D` 下 TrGS 最快，`MS x MS/D` 下 TrIP 最快，`D x D` 下 DenseIp 最快；这三组推荐方向与论文一致。`HS x HS` 仍是 TrGS 的 350 cycle 小于 TrGT 的 401 cycle，原因是 16x16、0.39% A 只有一个非零，TrGT 的 subrow packing 没有第二条短 row 可合并，却仍要完成 CSR 扫描和 packed-group close。其 first C write 为 392 cycle，而 TrGS 为 110 cycle。
+这些数字来自同一个共享 `ModeSharedTileController`、同一套 PE row/local storage、cluster ROB、双 refill channel 和 cold-cache 模型。`HS x MS/D` 下 TrGS 最快，`MS x MS/D` 下 TrIP 最快，`D x D` 下 DenseIp 最快；这三组推荐方向与论文一致。`HS x HS` 仍是 TrGS 的 350 cycle 小于 TrGT 的 403 cycle，原因是 16x16、0.39% A 只有一个非零，TrGT 的 subrow packing 没有第二条短 row 可合并，却仍要完成 CSR 扫描、同步 local-buffer 读和 packed-group close。其 first C write 为 394 cycle，而 TrGS 为 110 cycle。
 
-完整双 group B-window buffer 在 7.1 中通过连续 group checksum 验证。双 channel driver 还验证了 refill 请求可以按 channel 返回，cache miss/refill 计数和最终 C checksum 保持正确；本轮 small 的典型配置为 2 个 refill channel、每 bank 2 个 MSHR。TrGT 在 `MS x MS`、`MS x D`、`D x D` 分别为 2706/24085.3/58300 cycle，说明主要瓶颈仍是 182/896/4096 条 PE command、单流 ordered merge 和 scheduler bookkeeping，而不是单个 B window refill。TrGs 在 `MS x MS`、`MS x D`、`D x D` 分别为 1884.3/2420/7328 cycle。paper-width Benes metadata pipeline 只在 `macLanes > 16` 分支实例化，因此不直接改变小规模 TrIP route latency。本次 7.1 日志为 `/tmp/trapezoid-e2e-small-20261030-stagepipe-full.log`。
+完整双 group B-window buffer 在 7.1 中通过连续 group checksum 验证。双 channel driver 还验证了 refill 请求可以按 channel 返回，cache miss/refill 计数和最终 C checksum 保持正确；本轮 small 的典型配置为 2 个 refill channel、每 bank 2 个 MSHR。同步 SRAM 读改动使 TrGT 在 `MS x MS`、`MS x D`、`D x D` 分别为 2728/24085.7/58305 cycle，较前一版增加的周期来自 local-buffer read latency；主要瓶颈仍是 182/896/4096 条 PE command、单流 ordered merge 和 scheduler bookkeeping。TrGs 在 `MS x MS`、`MS x D`、`D x D` 仍为 1884.3/2420/7328 cycle。paper-width Benes metadata pipeline 只在 `macLanes > 16` 分支实例化，因此不直接改变小规模 TrIP route latency。本次 7.1 运行命令为 `sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation --scale=small --samples=3'`，完整输出保存在 `/tmp/trapezoid-e2e-small-20261030-fair-prefetch.log`。
 
 ### 7.2 `PaperSinglePERowCycleSimulation`
 
@@ -449,7 +451,7 @@ scripts/run-paper-single-perow.sh
 
 测试还输出 `controlPrepareCycles`、`route`、`MAC`、`MRN`、`response` 五个 counter，以及 `commandCount`、`responseCount`、`usefulMacs`、`laneSlots` 和 checksum。`controlPrepareCycles` 表示 cold route 阻塞；其余四个是各 stage 持有 valid payload 的 occupancy delta，不是互斥阶段延迟，也不包含 CSR/DMA/cache/C write。完整端到端周期仍以 7.1 的最终 C write response 为准。
 
-本次成功的全量层次化构建重新生成并编译了 paper kernel，Verilator 编译耗时约 541 秒，24-case RTL 仿真耗时约 123 秒，完整命令耗时约 969 秒。运行时间不属于表中的硬件 cycle。第一次运行暴露了 hierarchical Verilator 在当前发行版中查找 `/usr/share/verilator/verilator_bin` 的工具路径问题，`scripts/run-paper-single-perow.sh` 已通过临时 `VERILATOR_ROOT` 兼容目录解决；随后 RTL 编译和仿真全部通过。编译期间的 `Mem.readAsync can only be write first` 是当前 inferred memory 的 Verilog 映射警告，不是仿真失败。
+本次成功的全量层次化构建重新生成并编译了 paper kernel，Verilator 编译耗时约 574 秒，24-case RTL 仿真耗时约 120 秒，完整命令耗时约 696 秒。运行时间不属于表中的硬件 cycle。`scripts/run-paper-single-perow.sh` 设置了当前 Verilator 发行版所需的临时 `VERILATOR_ROOT` 兼容目录；RTL 编译和仿真全部通过。编译期间的 inferred FIFO/memory `readAsync` 映射警告不影响本次单 PE row 功能验证。本轮公平轮转仲裁同样没有改变 7.2 的周期表，因为该测试只实例化单个 PE row，无法形成两个 TrGT group 的持续竞争。完整输出保存在 `/tmp/trapezoid-paper-single-perow-20261030-fair-prefetch.log`。
 
 ### 7.3 Full paper array 的状态
 
@@ -485,7 +487,7 @@ paper profile 已配置为论文的 4 clusters、128 banks、16-way、64 B line 
 
 TrIP 已有两级 descriptor elastic FIFO、独立 route metadata FIFO、A/B control FIFO 和 7-stage/II=1 metadata pipeline，旧的约 263-cycle graph-coloring fallback 已删除。broadcast、compacted spread、repeated-source block multicast 和不规则 route 都驱动同一棵 Benes fabric；paper-width 通用控制由 `TrapezoidBenesRouteControl.sv` 生成并输出 `routable`。7.2 的 `MS x MS`、`MS x D` 和 `D x D` 均通过真实 Benes path 完成功能验证。当前 7 个 stage 只寄存 `routeValid + sourceIndex` metadata，完整 control word 只在末端生成，避免了宽控制字在每级复制；但图遍历 task 仍在末端组合完成，尚未拆成论文意义上的逐级、每周期一个 metadata step 的状态机。因此控制器面积、关键路径和功耗还不能视为论文 PPA 结果。
 
-论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows。当前 scheduler 已实现 occupancy-aware 多行 packing、长行多 subrow 占用、两个 group descriptor/A context，以及按实际 line count 分配的完整 B-window group buffer。B-line payload 已改为按 `group x local-bank` 划分的 inferred `Mem`，valid bitmap、descriptor、cursor 和 outstanding 状态仍是寄存器控制面；background group 可以连续预取所有有效 A 的 B lines。剩余差距是这些 inferred memory 尚未绑定目标工艺的同步 SRAM BlackBox，单 request arbitration 也限制了预取带宽，因此 7.1 dense TrGT 的周期只小幅下降。
+论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows。当前 scheduler 已实现 occupancy-aware 多行 packing、长行多 subrow 占用、两个 group descriptor/A context，以及按实际 line count 分配的完整 B-window group buffer。B-line payload 已按 `group x local-bank` 划分，并通过 inferred `Mem.readSync` 建模一拍 local-buffer 读；valid bitmap、descriptor、cursor 和 outstanding 状态仍是寄存器控制面，background group 可以连续预取所有有效 A 的 B lines。当前单 cache request 端口已加入 execute/background 公平轮转，但仍是一个 issue point，尚未达到论文多通道 steady-state 带宽；这些 inferred memory 也尚未绑定目标工艺的同步 SRAM BlackBox。
 
 `StreamingGustavsonTileEngine` 已使用双 buffer、banked storage 和 ready/valid 双模式 MRN node 做 ordered merge；PE segmented tree 与它共享 `DualModeMrnPolicy`。剩余差距是两侧仍是不同的物理树/node，TrGS spatial path 也有独立外围状态机。SRAM BlackBox 尚未映射目标工艺 macro 并验证真实端口、读延迟和功耗。
 
@@ -520,7 +522,7 @@ utilization = usefulMacs / laneSlots
 
 按优先级建议：
 
-1. 将 TrGT descriptor/cursor/valid 控制面和现有 B group inferred `Mem` 映射到目标工艺的同步 SRAM BlackBox，增加多 request issue，使 background group 的整组预取能真正与 execute group steady-state 重叠。
+1. 将 TrGT descriptor/cursor/valid 控制面和现有 B group `readSync` memory 映射到目标工艺的同步 SRAM BlackBox，增加多 request issue，使 background group 的整组预取能真正与 execute group steady-state 重叠。
 2. 将当前已能工作的 paper-width 组合式 Benes route solver 进一步拆成真正逐级的 metadata/control pipeline，使图遍历本身也满足 II=1，并对每级 switch control 做综合面积、时序和功耗比较。
 3. 将 PE segmented reduction、TrGS spatial accumulation 和 Gustavson ordered merge 统一成同一棵可配置双模式 MRN node/tree，测量 backpressure 下的 II、面积和关键路径。
 4. 在现有多 MSHR/多 refill channel 上增加同地址 miss coalescing、同 set/bank replay、channel QoS 和真实 DMA burst/channel mapping。

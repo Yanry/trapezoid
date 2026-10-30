@@ -557,6 +557,10 @@ class CachedTrGtSubrowAdapter(
     Reg(UInt(gustCfg.lineCountWidth bits)) init 0))
   val nextRequestIndex = Vec((0 until groupCount).map(_ =>
     Reg(UInt(gustCfg.lineCountWidth bits)) init 0))
+  // Select the inactive group on alternating cycles when both windows can
+  // issue. A single cache port still serves one request per cycle, but the
+  // two group contexts now make forward progress concurrently.
+  val prefetchIssueTurn = RegInit(False)
   val prefetchOccupancy = Vec((0 until groupCount).map(_ =>
     Reg(UInt(prefetchCountWidth bits)) init 0))
   val requestOutstanding = Vec((0 until groupCount).map(_ =>
@@ -565,23 +569,19 @@ class CachedTrGtSubrowAdapter(
     Vec((0 until prefetchCapacity).map(_ => RegInit(False)))))
   // B lines are physically banked by the local-buffer bank index. The valid
   // bitmap remains register state because a group reset invalidates all slots
-  // without spending a cycle writing the data SRAM; data itself is inferred as
-  // one memory per group and per bank.
+  // without spending a cycle writing the data SRAM. Data is read through an
+  // explicit synchronous port so a line cannot be consumed in the same cycle
+  // in which its refill becomes valid.
   val prefetchDataMem = Array.fill(groupCount, cfg.localBanks) {
     Mem(Bits(cacheCfg.lineWidth bits), cfg.localDepthPerBank)
   }
-
-  private def prefetchDataAt(group: UInt, slot: UInt): Bits = {
-    val selected = Bits(cacheCfg.lineWidth bits)
-    selected := 0
-    val bank = slot(prefetchSlotWidth - 1 downto prefetchBankAddressWidth)
-    val address = slot(prefetchBankAddressWidth - 1 downto 0)
-    for (groupIndex <- 0 until groupCount; bankIndex <- 0 until cfg.localBanks) {
-      when(group === groupIndex && bank === bankIndex) {
-        selected := prefetchDataMem(groupIndex)(bankIndex).readAsync(address)
-      }
-    }
-    selected
+  val prefetchReadValid = RegInit(False)
+  val prefetchReadGroup = Reg(Bool()) init False
+  private val prefetchBankIndexWidth = scala.math.max(1, log2Up(cfg.localBanks))
+  val prefetchReadBank = Reg(UInt(prefetchBankIndexWidth bits)) init 0
+  val prefetchReadSlot = Reg(UInt(prefetchSlotWidth bits)) init 0
+  val prefetchReadData = Array.fill(groupCount, cfg.localBanks) {
+    Bits(cacheCfg.lineWidth bits)
   }
   val elementCursor = Reg(UInt(elementIndexWidth bits)) init 0
   val doneReg = RegInit(False)
@@ -642,11 +642,40 @@ class CachedTrGtSubrowAdapter(
   val currentPrefetchSlot =
     (currentLineBase + requestIndex.resized).resize(prefetchSlotWidth)
   val currentLineValid = prefetchValid(executeGroup.asUInt)(currentPrefetchSlot)
-  val currentLineData = prefetchDataAt(executeGroup.asUInt,
-    currentPrefetchSlot)
+  val currentLineBank = currentPrefetchSlot(
+    prefetchSlotWidth - 1 downto prefetchBankAddressWidth)
+  val currentLineAddress = currentPrefetchSlot(
+    prefetchBankAddressWidth - 1 downto 0)
+  val currentLineDataReady = prefetchReadValid && currentLineValid &&
+    prefetchReadGroup === executeGroup &&
+    prefetchReadBank === currentLineBank &&
+    prefetchReadSlot === currentPrefetchSlot
+  val currentLineData = Bits(cacheCfg.lineWidth bits)
+  currentLineData := 0
+  for (group <- 0 until groupCount; bank <- 0 until cfg.localBanks) {
+    when(prefetchReadGroup === (if (group == 1) True else False) &&
+        prefetchReadBank === bank) {
+      currentLineData := prefetchReadData(group)(bank)
+    }
+  }
+  val prefetchReadEnable = state === CachedTrGtState.RequestLine &&
+    currentLineValid && !currentLineDataReady
+  for (group <- 0 until groupCount; bank <- 0 until cfg.localBanks) {
+    prefetchReadData(group)(bank) := prefetchDataMem(group)(bank).readSync(
+      currentLineAddress,
+      prefetchReadEnable &&
+        executeGroup === (if (group == 1) True else False) &&
+        currentLineBank === bank)
+  }
+  when(prefetchReadEnable) {
+    prefetchReadValid := True
+    prefetchReadGroup := executeGroup
+    prefetchReadBank := currentLineBank
+    prefetchReadSlot := currentPrefetchSlot
+  }
   for (element <- 0 until gustCfg.elementsPerLine) {
     val offset = element * gustCfg.elementWidth
-    lineElements(element).valid := currentLineValid &&
+    lineElements(element).valid := currentLineDataReady &&
       currentLineData(offset)
     lineElements(element).k := currentA.k
     lineElements(element).value :=
@@ -967,7 +996,10 @@ class CachedTrGtSubrowAdapter(
     state =/= CachedTrGtState.LoadA &&
     nextRequestIndex(backgroundContext) < prefetchLineCount(backgroundContext) &&
     backgroundPrefetchHasCapacity
-  val requestGroup = Mux(foregroundCanIssue, executeGroup, backgroundGroup)
+  val backgroundIssueSelected = backgroundCanIssue &&
+    (!foregroundCanIssue || prefetchIssueTurn)
+  val requestGroup = Mux(backgroundIssueSelected,
+    backgroundGroup, executeGroup)
   val requestContext = requestGroup.asUInt
   val requestLineIndex = nextRequestIndex(requestContext)
   val requestAIndex = prefetchAIndex(requestContext)
@@ -988,6 +1020,11 @@ class CachedTrGtSubrowAdapter(
       .asBits).asUInt.resized
   when(io.cacheRequest.fire) {
     nextRequestIndex(requestContext) := requestLineIndex + 1
+    when(foregroundCanIssue && backgroundCanIssue) {
+      prefetchIssueTurn := !prefetchIssueTurn
+    } otherwise {
+      prefetchIssueTurn := !backgroundIssueSelected
+    }
   }
   val responseLineIndex = io.cacheResponse.payload.requestId(
     lineIdWidth - 1 downto 0).resize(gustCfg.lineCountWidth)
@@ -1035,7 +1072,7 @@ class CachedTrGtSubrowAdapter(
           state === CachedTrGtState.RequestLine &&
           responseLineIndex === requestIndex) {
         elementCursor := 0
-        state := CachedTrGtState.EmitLine
+        state := CachedTrGtState.RequestLine
       }
     }
   }
@@ -1053,7 +1090,7 @@ class CachedTrGtSubrowAdapter(
     }
   }
   when(state === CachedTrGtState.RequestLine &&
-      currentLineValid) {
+      currentLineDataReady) {
     elementCursor := 0
     state := CachedTrGtState.EmitLine
   }
@@ -1095,9 +1132,7 @@ class CachedTrGtSubrowAdapter(
       when(requestIndex + 1 < currentLineCount) {
         requestIndex := requestIndex + 1
         elementCursor := 0
-        state := Mux(prefetchValid(executeContext)(
-          (currentLineBase + nextLineIndex.resized).resize(prefetchSlotWidth)),
-          CachedTrGtState.EmitLine, CachedTrGtState.RequestLine)
+        state := CachedTrGtState.RequestLine
       } otherwise {
         currentIndex := (currentIndex + 1).resized
         state := CachedTrGtState.FindA
@@ -1128,6 +1163,7 @@ class CachedTrGtSubrowAdapter(
     doneReg := True
     groupReady(executeGroup.asUInt) := False
     prefetchActive(executeGroup.asUInt) := False
+    prefetchReadValid := False
     prefetchOccupancy(executeGroup.asUInt) :=
       U(0, prefetchCountWidth bits)
     for (slot <- 0 until prefetchCapacity) {
@@ -1150,6 +1186,8 @@ class CachedTrGtSubrowAdapter(
     fillGroup := False
     executeGroup := False
     nextExecuteGroup := False
+    prefetchIssueTurn := False
+    prefetchReadValid := False
     for (group <- 0 until groupCount) {
       groupReady(group) := False
       groupCollectOpen(group) := False

@@ -556,14 +556,18 @@ class BenesRouteControlGenerator(cfg: TrapezoidConfig)
       val sourceWidth = sources.head.getWidth
       val sourcePairs = sources.map(_(sourceWidth - 1 downto 1))
       val sourceSides = sources.map(_(0))
-      val assignedStages = Array.fill(width + 1)(Vec(Bool(), width))
-      val colorStages = Array.fill(width + 1)(Vec(Bool(), width))
+      val assignedStages = Array.tabulate(width + 1)(_ => Vec(Bool(), width))
+      val colorStages = Array.tabulate(width + 1)(_ => Vec(Bool(), width))
       for (node <- 0 until width) {
         assignedStages(0)(node) := False
         colorStages(0)(node) := False
       }
 
-      for (stage <- 0 until width) {
+      val propagationRounds = if (width <= 16) width else log2Up(width)
+      // Small fabrics retain the complete graph walk. Paper-width fabrics use
+      // the external RTL solver; this branch only bounds any accidental wide
+      // elaboration and keeps the metadata path logarithmic.
+      for (stage <- 0 until propagationRounds) {
         val previousAssigned = assignedStages(stage)
         val previousColor = colorStages(stage)
         val propagationCandidates = Vector.tabulate(width) { node =>
@@ -619,7 +623,7 @@ class BenesRouteControlGenerator(cfg: TrapezoidConfig)
         }
       }
 
-      val routeColor = colorStages(width).toVector
+      val routeColor = colorStages(propagationRounds).toVector
       var conflict: Bool = False
       for (node <- 0 until width) {
         val mate = node ^ 1
@@ -699,6 +703,40 @@ class BenesRouteControlGenerator(cfg: TrapezoidConfig)
   require(route._1.length == cfg.benesControlWidth)
   for (index <- 0 until cfg.benesControlWidth) io.controls(index) := route._1(index)
   io.routable := route._2 && io.routeValid.orR
+}
+
+/** RTL implementation of the wide-fabric route solver.
+  *
+  * Keeping the procedural graph walk in a BlackBox prevents the 128-lane
+  * paper configuration from becoming a deeply nested Scala expression tree.
+  * The generated controls still drive the same multicast Benes fabric.
+  */
+class BenesRouteControlBlackBox(cfg: TrapezoidConfig) extends BlackBox {
+  require(cfg.distributionWidth > 16)
+
+  addGeneric("LANES", cfg.distributionWidth)
+  addGeneric("INDEX_WIDTH", cfg.macLaneIndexWidth)
+  addGeneric("STAGES", cfg.benesStageCount)
+  addGeneric("CONTROL_WIDTH", cfg.benesControlWidth)
+  setDefinitionName("TrapezoidBenesRouteControl")
+
+  val io = new Bundle {
+    val clk = in Bool()
+    val reset = in Bool()
+    val startValid = in Bool()
+    val startReady = out Bool()
+    val resultValid = out Bool()
+    val resultReady = in Bool()
+    val routeValid = in Bits(cfg.distributionWidth bits)
+    val sourceIndices = in Bits(
+      (cfg.distributionWidth * cfg.macLaneIndexWidth) bits)
+    val controls = out Bits(cfg.benesControlWidth bits)
+    val routable = out Bool()
+  }
+
+  noIoPrefix()
+  mapClockDomain(clock = io.clk, reset = io.reset)
+  addRTLPath("src/main/resources/rtl/TrapezoidBenesRouteControl.sv")
 }
 
 class BenesBroadcastRouteControlGenerator(cfg: TrapezoidConfig)
@@ -870,13 +908,12 @@ class PipelinedRestrictedBenesRouteControlGenerator(cfg: TrapezoidConfig)
   tokenStage.ready := io.result.ready
 }
 
-/** Fixed-latency multicast metadata path for wide PE rows.
+/** Fixed-latency metadata path for wide PE rows.
   *
-  * Small fabrics retain the exact Benes solver. Paper-width repeated-source
-  * and irregular routes instead carry a bounded-latency token to the PE-row
-  * direct-distribution bridge, avoiding the old width-squared graph-coloring
-  * state while preserving one metadata descriptor per cycle. Broadcast and
-  * compact spread patterns continue to use generated Benes switch controls.
+  * The route metadata is solved by the same multicast Benes control generator
+  * for every fabric width. The seven elastic stages for a 128-lane fabric
+  * carry the generated per-level switch controls; there is no wide-fabric
+  * direct source-selection fallback in the datapath.
   */
 class PipelinedBenesRouteControlGenerator(cfg: TrapezoidConfig)
     extends Component {
@@ -896,22 +933,34 @@ class PipelinedBenesRouteControlGenerator(cfg: TrapezoidConfig)
     solved.payload.controls := solver.io.controls
     solved.payload.routable := solver.io.routable
   } else {
-    // Paper-width multicast metadata is consumed by the PE-row direct source
-    // distribution bridge. The control token remains real RTL state and is
-    // checked/retired like a Benes result, but the old O(width^3) exact solver
-    // is deliberately absent from the 128-lane elaboration.
-    solved.payload.controls := 0
-    solved.payload.routable := io.start.payload.routeValid.orR
+    val solver = new BenesRouteControlBlackBox(cfg)
+    solver.io.startValid := io.start.valid
+    io.start.ready := solver.io.startReady
+    solver.io.resultReady := io.result.ready
+    io.result.valid := solver.io.resultValid
+    solver.io.routeValid := io.start.payload.routeValid
+    for (lane <- 0 until cfg.distributionWidth) {
+      solver.io.sourceIndices(
+        lane * cfg.macLaneIndexWidth + cfg.macLaneIndexWidth - 1 downto
+          lane * cfg.macLaneIndexWidth) :=
+        io.start.payload.sourceIndices(lane).asBits
+    }
+    io.result.payload.controls := solver.io.controls
+    io.result.payload.routable := solver.io.routable
   }
-  io.start.ready := solved.ready
+  if (cfg.distributionWidth <= 16) {
+    io.start.ready := solved.ready
+  }
 
-  // 128 lanes means seven metadata/control stages. Keeping the route token in
-  // a Stream also lets downstream control FIFOs absorb backpressure.
-  var staged = solved
-  for (_ <- 0 until log2Up(cfg.distributionWidth)) {
-    staged = staged.m2sPipe()
+  if (cfg.distributionWidth <= 16) {
+    // Small fabrics keep the exact Scala solver and use the same elastic
+    // stage count as the paper-width implementation.
+    var staged = solved
+    for (_ <- 0 until log2Up(cfg.distributionWidth)) {
+      staged = staged.m2sPipe()
+    }
+    io.result << staged
   }
-  io.result << staged
 }
 
 /** Complete source-to-all-lanes multicast path used to validate the runtime

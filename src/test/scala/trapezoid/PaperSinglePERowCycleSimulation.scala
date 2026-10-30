@@ -5,7 +5,7 @@ import spinal.core._
 import trapezoid.model.DenseMatrix
 
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.{Files, Path, Paths, StandardCopyOption}
 import scala.collection.mutable
 import scala.sys.process.Process
 
@@ -115,13 +115,18 @@ object PaperSinglePERowCycleSimulation extends App {
     "TrapezoidPERow.v",
     "MultiFiberIntersection.v",
     "BenesDistributionFabric.v",
-    "PipelinedBenesRouteControlGenerator.v"
+    "PipelinedBenesRouteControlGenerator.v",
+    "TrapezoidBenesRouteControl.sv"
   ).map(kernelDirectory.resolve)
+  private val routeControlSource = Paths.get(
+    "src/main/resources/rtl/TrapezoidBenesRouteControl.sv")
+    .toAbsolutePath.normalize()
   private val kernelInputs = Vector(
     Paths.get("src/main/scala/trapezoid/TrapezoidPERow.scala"),
     Paths.get("src/main/scala/trapezoid/MultiFiberIntersection.scala"),
     Paths.get("src/main/scala/trapezoid/TrapezoidTypes.scala"),
-    Paths.get("src/main/scala/trapezoid/TrapezoidConfig.scala")
+    Paths.get("src/main/scala/trapezoid/TrapezoidConfig.scala"),
+    routeControlSource
   ).map(_.toAbsolutePath.normalize())
 
   private def kernelIsCurrent: Boolean = {
@@ -149,6 +154,9 @@ object PaperSinglePERowCycleSimulation extends App {
     )).!
     require(status == 0,
       s"paper PE-row RTL generation failed with status $status")
+    Files.copy(routeControlSource,
+      kernelDirectory.resolve(routeControlSource.getFileName),
+      StandardCopyOption.REPLACE_EXISTING)
     require(requiredKernelSources.forall(Files.isRegularFile(_)),
       s"paper PE-row RTL is incomplete in $kernelDirectory")
   }
@@ -181,7 +189,8 @@ object PaperSinglePERowCycleSimulation extends App {
     try {
       import scala.collection.JavaConverters._
       stream.iterator().asScala.filter(path =>
-        path.getFileName.toString.endsWith(".v")).toVector
+        path.getFileName.toString.endsWith(".v") ||
+          path.getFileName.toString.endsWith(".sv")).toVector
     } finally stream.close()
   }
 

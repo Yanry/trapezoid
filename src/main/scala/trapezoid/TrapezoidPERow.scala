@@ -204,8 +204,6 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     new BenesBroadcastControlGenerator(cfg) else null
   val aBenesFabric = new BenesDistributionFabric(cfg)
   val bBenesFabric = new BenesDistributionFabric(cfg)
-  val aDirectDistribution = new OperandDistributionNetwork(cfg)
-  val bDirectDistribution = new OperandDistributionNetwork(cfg)
   val input = inputStage.payload
   val fullFiberMask = B((BigInt(1) << cfg.fiberWidth) - 1,
     cfg.fiberWidth bits)
@@ -300,11 +298,9 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val broadcastRouteFastPath = sparseRouteNeedsControl &&
     !aBroadcastMismatch && !bBroadcastMismatch
   val restrictedRouteFastPath = Bool()
-  // Paper-width irregular/repeated-source metadata is currently consumed by
-  // the direct source-selection bridge. Only the broadcast and restricted
-  // Benes paths require a routability proof from the control generator.
-  val directDistributionRoute = sparseRouteNeedsControl &&
-    !broadcastRouteFastPath && !restrictedRouteFastPath
+  // Every sparse route now retires through the programmable Benes fabric.
+  // Broadcast and restricted spread retain their specialized controls, while
+  // all other MFIU metadata uses the general per-level control pipeline.
   for (lane <- 0 until cfg.macLanes) {
     aBenesFabric.io.sources(lane)(0) := mfiu.io.aSourceValid(lane)
     aBenesFabric.io.sources(lane)(cfg.dataWidth downto 1) :=
@@ -312,18 +308,6 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     bBenesFabric.io.sources(lane)(0) := mfiu.io.bSourceValid(lane)
     bBenesFabric.io.sources(lane)(cfg.dataWidth downto 1) :=
       mfiu.io.bSources(lane).asBits
-  }
-  aDirectDistribution.io.sources := mfiu.io.aSources
-  bDirectDistribution.io.sources := mfiu.io.bSources
-  aDirectDistribution.io.sourceValid := mfiu.io.aSourceValid
-  bDirectDistribution.io.sourceValid := mfiu.io.bSourceValid
-  for (lane <- 0 until cfg.macLanes) {
-    aDirectDistribution.io.laneValid(lane) := mfiu.io.routes(lane).valid
-    bDirectDistribution.io.laneValid(lane) := mfiu.io.routes(lane).valid
-    aDirectDistribution.io.sourceIndex(lane) :=
-      mfiu.io.routes(lane).aSourceIndex
-    bDirectDistribution.io.sourceIndex(lane) :=
-      mfiu.io.routes(lane).bSourceIndex
   }
   if (pipelinedBenesControls) {
     aBroadcastBenesControls.io.sourceIndex := aBroadcastSource
@@ -417,13 +401,21 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
           bRestrictedBenesControls.io.start.fire)) {
       controlsStarted := True
     }
+    val benesControlsReady = aControlFifo.io.pop.valid &&
+      bControlFifo.io.pop.valid &&
+      aControlFifo.io.pop.payload.routable &&
+      bControlFifo.io.pop.payload.routable
+    val restrictedControlsReady =
+      aRestrictedBenesControls.io.result.valid &&
+        bRestrictedBenesControls.io.result.valid &&
+        aRestrictedBenesControls.io.result.payload.routable &&
+        bRestrictedBenesControls.io.result.payload.routable
     routeControlsReady := !sparseRouteNeedsControl ||
       broadcastRouteFastPath ||
       controlCacheHit ||
       Mux(restrictedRouteFastPath,
-        aRestrictedBenesControls.io.result.valid &&
-          bRestrictedBenesControls.io.result.valid,
-        aControlFifo.io.pop.valid && bControlFifo.io.pop.valid)
+        restrictedControlsReady,
+        benesControlsReady)
     aRouteRoutable := !sparseRouteNeedsControl ||
       broadcastRouteFastPath ||
       controlCacheHit ||
@@ -501,23 +493,18 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     val benesB = bBenesFabric.io.outputs(lane)
     val benesAOperand = benesA(cfg.dataWidth downto 1).asSInt
     val benesBOperand = benesB(cfg.dataWidth downto 1).asSInt
-    val directAOperand = aDirectDistribution.io.outputs(lane)
-    val directBOperand = bDirectDistribution.io.outputs(lane)
-    val generalMulticastRoute = directDistributionRoute
     if (lane < cfg.fiberWidth) {
       tripValid := Mux(denseFastPath, True, laneRoute.valid)
       tripAFiber := Mux(denseFastPath, denseAFiber, laneRoute.aFiber)
       tripBFiber := Mux(denseFastPath, denseBFiber, laneRoute.bFiber)
-      tripAOperand := Mux(denseFastPath, denseA.values(lane),
-        Mux(generalMulticastRoute, directAOperand, benesAOperand))
-      tripBOperand := Mux(denseFastPath, denseB.values(lane),
-        Mux(generalMulticastRoute, directBOperand, benesBOperand))
+      tripAOperand := Mux(denseFastPath, denseA.values(lane), benesAOperand)
+      tripBOperand := Mux(denseFastPath, denseB.values(lane), benesBOperand)
     } else {
       tripValid := laneRoute.valid
       tripAFiber := laneRoute.aFiber
       tripBFiber := laneRoute.bFiber
-      tripAOperand := Mux(generalMulticastRoute, directAOperand, benesAOperand)
-      tripBOperand := Mux(generalMulticastRoute, directBOperand, benesBOperand)
+      tripAOperand := benesAOperand
+      tripBOperand := benesBOperand
     }
 
     val gustValid = Bool()
@@ -571,7 +558,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   }
   routed.overflow := Mux(denseFastPath, False,
     Mux(inputTripMode, mfiu.io.overflow ||
-      (mfiu.io.count =/= 0 && !directDistributionRoute &&
+      (mfiu.io.count =/= 0 &&
         (!aRouteRoutable || !bRouteRoutable)), gustRouteErrors.orR))
 
   val routeInput = Stream(PERowRoutePayload(cfg))
@@ -615,8 +602,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       controlCacheReplace := 0
     }
   }
-  when(routeInput.valid && useSparseTripRoute && mfiu.io.count =/= 0 &&
-      !directDistributionRoute) {
+  when(routeInput.valid && useSparseTripRoute && mfiu.io.count =/= 0) {
     assert(aRouteRoutable && bRouteRoutable,
       "MFIU emitted a route pattern not supported by the Benes solver")
   }

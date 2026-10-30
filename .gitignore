@@ -33,6 +33,7 @@ verilog/
 vhdl/
 *.v
 *.sv
+!src/main/resources/rtl/TrapezoidBenesRouteControl.sv
 *.vh
 *.vhd
 *.lst

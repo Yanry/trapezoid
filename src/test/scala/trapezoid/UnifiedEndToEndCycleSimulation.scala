@@ -4,7 +4,7 @@ import spinal.core.sim._
 import trapezoid.model.{BitmaskFiber, DenseMatrix, MatrixReference}
 
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.{Files, Path, Paths, StandardCopyOption}
 import scala.collection.mutable
 import scala.sys.process.Process
 import scala.util.Random
@@ -123,13 +123,18 @@ object EndToEndCycleSimulation extends App {
     paperKernelDirectory.resolve("TrapezoidPERow.v"),
     paperKernelDirectory.resolve("MultiFiberIntersection.v"),
     paperKernelDirectory.resolve("DynamicColumnPacker.v"),
-    paperKernelDirectory.resolve("OperandDistributionNetwork.v")
+    paperKernelDirectory.resolve("OperandDistributionNetwork.v"),
+    paperKernelDirectory.resolve("TrapezoidBenesRouteControl.sv")
   )
+  private val routeControlSource = Paths.get(
+    "src/main/resources/rtl/TrapezoidBenesRouteControl.sv")
+    .toAbsolutePath.normalize()
   private val paperKernelInputs = Vector(
     Paths.get("src/main/scala/trapezoid/TrapezoidPERow.scala"),
     Paths.get("src/main/scala/trapezoid/MultiFiberIntersection.scala"),
     Paths.get("src/main/scala/trapezoid/TrapezoidTypes.scala"),
-    Paths.get("src/main/scala/trapezoid/TrapezoidConfig.scala")
+    Paths.get("src/main/scala/trapezoid/TrapezoidConfig.scala"),
+    routeControlSource
   ).map(_.toAbsolutePath.normalize())
 
   private def paperKernelIsCurrent: Boolean = {
@@ -157,6 +162,9 @@ object EndToEndCycleSimulation extends App {
     )).!
     require(status == 0,
       s"paper PE-row RTL generation failed with status $status")
+    Files.copy(routeControlSource,
+      paperKernelDirectory.resolve(routeControlSource.getFileName),
+      StandardCopyOption.REPLACE_EXISTING)
     require(paperKernelSources.forall(Files.isRegularFile(_)),
       s"paper PE-row RTL is incomplete in $paperKernelDirectory")
   }

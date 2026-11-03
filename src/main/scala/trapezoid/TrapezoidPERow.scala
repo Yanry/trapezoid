@@ -760,46 +760,12 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   reductionInput.payload.lanes := orderedProducts
   macStage.ready := reductionInput.ready
 
-  // The paper/SIGMA timing model assigns one cycle to each MRN level. The
-  // segmented prefix operator carries a head flag so additions never cross
-  // an output-coordinate boundary.
-  var reductionStage = reductionInput.m2sPipe()
-  for (level <- 0 until cfg.mrnReductionLevels) {
-    val reductionDistance = 1 << level
-    val levelInput = reductionStage
-    val levelOutput = Stream(PERowReductionPayload(cfg))
-    levelOutput.valid := levelInput.valid
-    levelOutput.payload.mode := levelInput.payload.mode
-    levelOutput.payload.endOfTile := levelInput.payload.endOfTile
-    levelOutput.payload.overflow := levelInput.payload.overflow
-    levelOutput.payload.selectedColumns := levelInput.payload.selectedColumns
-    levelOutput.payload.effectualMacs := levelInput.payload.effectualMacs
-    for (position <- 0 until cfg.macLanes) {
-      val right = levelInput.payload.lanes(position)
-      levelOutput.payload.lanes(position).valid := right.valid
-      levelOutput.payload.lanes(position).row := right.row
-      levelOutput.payload.lanes(position).column := right.column
-      levelOutput.payload.lanes(position).destinationBank :=
-        right.destinationBank
-      levelOutput.payload.lanes(position).destinationWordOffset :=
-        right.destinationWordOffset
-      if (position >= reductionDistance) {
-        val left = levelInput.payload.lanes(position - reductionDistance)
-        val combine = DualModeMrnPolicy.sameCoordinate(
-          left.valid, left.row, left.column,
-          right.valid, right.row, right.column)
-        levelOutput.payload.lanes(position).value := Mux(combine,
-          (left.value + right.value).resize(cfg.accumulatorWidth), right.value)
-        levelOutput.payload.lanes(position).segmentStart := right.valid &&
-          (right.segmentStart || left.segmentStart)
-      } else {
-        levelOutput.payload.lanes(position).value := right.value
-        levelOutput.payload.lanes(position).segmentStart := right.segmentStart
-      }
-    }
-    levelInput.ready := levelOutput.ready
-    reductionStage = levelOutput.m2sPipe()
-  }
+  // The paper assigns one cycle to every MRN level.  The explicit dual-mode
+  // tree keeps comparator, gated adder and mux logic together at each level;
+  // the segment head flag prevents reductions from crossing coordinates.
+  val mrnTree = new DualModeMrnTree(cfg)
+  mrnTree.io.input << reductionInput
+  val reductionStage = mrnTree.io.output
 
   // Final MRN stage: emit only segment tails and compact them to output lanes.
   val reduced = reductionStage.payload

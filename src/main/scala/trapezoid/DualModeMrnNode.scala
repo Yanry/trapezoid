@@ -71,6 +71,11 @@ class DualModeMrnNode(cfg: TrapezoidConfig) extends Component {
     io.input.payload.left.column,
     io.input.payload.right.row,
     io.input.payload.right.column)
+  val gatedLeft = Mux(sameCoordinate, io.input.payload.left.value,
+    S(0, cfg.accumulatorWidth bits))
+  val gatedRight = Mux(sameCoordinate, io.input.payload.right.value,
+    S(0, cfg.accumulatorWidth bits))
+  val reducedValue = (gatedLeft + gatedRight).resize(cfg.accumulatorWidth)
 
   when(io.input.payload.mode === MrnNodeMode.IpReduce) {
     transformed.payload.consumeLeft := io.input.payload.left.valid
@@ -79,8 +84,7 @@ class DualModeMrnNode(cfg: TrapezoidConfig) extends Component {
       transformed.payload.first.valid := True
       transformed.payload.first.row := io.input.payload.left.row
       transformed.payload.first.column := io.input.payload.left.column
-      transformed.payload.first.value :=
-        (io.input.payload.left.value + io.input.payload.right.value).resized
+      transformed.payload.first.value := reducedValue
     } otherwise {
       transformed.payload.first := io.input.payload.left
       transformed.payload.second := io.input.payload.right
@@ -90,8 +94,7 @@ class DualModeMrnNode(cfg: TrapezoidConfig) extends Component {
       transformed.payload.first.valid := True
       transformed.payload.first.row := io.input.payload.left.row
       transformed.payload.first.column := io.input.payload.left.column
-      transformed.payload.first.value :=
-        (io.input.payload.left.value + io.input.payload.right.value).resized
+      transformed.payload.first.value := reducedValue
       transformed.payload.consumeLeft := True
       transformed.payload.consumeRight := True
     } elsewhen(io.input.payload.left.valid &&

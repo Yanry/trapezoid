@@ -275,9 +275,10 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       val fallbackStart = dut.io.controlPrepareCycles.toLong
       issue(dut)
       val fallbackCycles = dut.io.controlPrepareCycles.toLong - fallbackStart
+      val boundedPathCycles = routedCfg.mrnReductionLevels + 4
       assert(fallbackCycles > 0 &&
-        fallbackCycles <= routedCfg.mrnReductionLevels + 2,
-        "a repeated multi-source pattern must use the bounded metadata path")
+        fallbackCycles <= boundedPathCycles,
+        "the bounded metadata path includes descriptor and control FIFO latency")
     }
   }
 

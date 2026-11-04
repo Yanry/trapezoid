@@ -160,6 +160,16 @@ class ModeSharedTileController(
     spatial.io.peCommand.ready := pe.io.command.ready && commandFromTrgs
     trip.io.peCommands(row).ready := pe.io.command.ready &&
       !commandFromTrgt && !commandFromTrgs
+    pe.io.temporalMrnInput.valid := scheduler.io.peTemporalMrnInput.valid &&
+      commandFromTrgt
+    pe.io.temporalMrnInput.payload := scheduler.io.peTemporalMrnInput.payload
+    scheduler.io.peTemporalMrnInput.ready := pe.io.temporalMrnInput.ready &&
+      commandFromTrgt
+    scheduler.io.peTemporalMrnOutput.valid := pe.io.temporalMrnOutput.valid &&
+      commandFromTrgt
+    scheduler.io.peTemporalMrnOutput.payload := pe.io.temporalMrnOutput.payload
+    pe.io.temporalMrnOutput.ready := scheduler.io.peTemporalMrnOutput.ready &&
+      commandFromTrgt
 
     // Response ownership is captured with the command so a clear or mode
     // transition cannot redirect an in-flight PE response to the other client.

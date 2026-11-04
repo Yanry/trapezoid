@@ -123,6 +123,8 @@ object PaperSinglePERowCycleSimulation extends App {
     .toAbsolutePath.normalize()
   private val kernelInputs = Vector(
     Paths.get("src/main/scala/trapezoid/TrapezoidPERow.scala"),
+    Paths.get("src/main/scala/trapezoid/DualModeMrnNode.scala"),
+    Paths.get("src/main/scala/trapezoid/DualModeMrnTree.scala"),
     Paths.get("src/main/scala/trapezoid/MultiFiberIntersection.scala"),
     Paths.get("src/main/scala/trapezoid/TrapezoidTypes.scala"),
     Paths.get("src/main/scala/trapezoid/TrapezoidConfig.scala"),
@@ -203,6 +205,12 @@ object PaperSinglePERowCycleSimulation extends App {
     io.response.valid := core.io.response.valid
     io.response.payload := core.io.response.payload
     core.io.response.ready := io.response.ready
+    core.io.temporalMrnInput.valid := io.temporalMrnInput.valid
+    core.io.temporalMrnInput.payload := io.temporalMrnInput.payload
+    io.temporalMrnInput.ready := core.io.temporalMrnInput.ready
+    io.temporalMrnOutput.valid := core.io.temporalMrnOutput.valid
+    io.temporalMrnOutput.payload := core.io.temporalMrnOutput.payload
+    core.io.temporalMrnOutput.ready := io.temporalMrnOutput.ready
     io.controlPrepareCycles := core.io.controlPrepareCycles
     io.routeCycles := core.io.routeCycles
     io.macCycles := core.io.macCycles
@@ -346,6 +354,8 @@ object PaperSinglePERowCycleSimulation extends App {
       dut.clockDomain.forkStimulus(10)
       dut.io.command.valid #= false
       dut.io.response.ready #= true
+      dut.io.temporalMrnInput.valid #= false
+      dut.io.temporalMrnOutput.ready #= true
       clearPayload(dut)
 
       def step(): Unit = dut.clockDomain.waitSampling()

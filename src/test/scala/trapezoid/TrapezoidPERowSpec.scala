@@ -28,6 +28,17 @@ class TrapezoidPERowSpec extends AnyFunSuite {
     dut.io.command.valid #= false
     dut.io.command.payload.endOfTile #= false
     dut.io.response.ready #= true
+    dut.io.temporalMrnInput.valid #= false
+    dut.io.temporalMrnInput.payload.mode #= MrnNodeMode.GustavsonMerge
+    dut.io.temporalMrnInput.payload.left.valid #= false
+    dut.io.temporalMrnInput.payload.left.row #= 0
+    dut.io.temporalMrnInput.payload.left.column #= 0
+    dut.io.temporalMrnInput.payload.left.value #= 0
+    dut.io.temporalMrnInput.payload.right.valid #= false
+    dut.io.temporalMrnInput.payload.right.row #= 0
+    dut.io.temporalMrnInput.payload.right.column #= 0
+    dut.io.temporalMrnInput.payload.right.value #= 0
+    dut.io.temporalMrnOutput.ready #= true
     for (fiber <- 0 until config.maxFibers) {
       dut.io.command.payload.trip.a(fiber).valid #= false
       dut.io.command.payload.trip.a(fiber).tag #= 0
@@ -52,6 +63,44 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       dut.io.command.payload.gustavson.b(entry).k #= 0
       dut.io.command.payload.gustavson.b(entry).column #= 0
       dut.io.command.payload.gustavson.b(entry).value #= 0
+    }
+  }
+
+  test("PE-row level-zero MRN cell serves temporal Gustavson merges") {
+    simConfig.compile(new TrapezoidPERow(cfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      clearInputs(dut)
+
+      def drive(
+          left: (Boolean, Int, Int, Int),
+          right: (Boolean, Int, Int, Int)): Unit = {
+        dut.io.temporalMrnInput.payload.left.valid #= left._1
+        dut.io.temporalMrnInput.payload.left.row #= left._2
+        dut.io.temporalMrnInput.payload.left.column #= left._3
+        dut.io.temporalMrnInput.payload.left.value #= left._4
+        dut.io.temporalMrnInput.payload.right.valid #= right._1
+        dut.io.temporalMrnInput.payload.right.row #= right._2
+        dut.io.temporalMrnInput.payload.right.column #= right._3
+        dut.io.temporalMrnInput.payload.right.value #= right._4
+        dut.io.temporalMrnInput.valid #= true
+        sleep(1)
+        assert(dut.io.temporalMrnInput.ready.toBoolean)
+        assert(dut.io.temporalMrnOutput.valid.toBoolean)
+      }
+
+      drive((true, 2, 3, 7), (true, 2, 3, 11))
+      assert(dut.io.temporalMrnOutput.payload.first.valid.toBoolean)
+      assert(dut.io.temporalMrnOutput.payload.first.value.toLong == 18)
+      assert(dut.io.temporalMrnOutput.payload.consumeLeft.toBoolean)
+      assert(dut.io.temporalMrnOutput.payload.consumeRight.toBoolean)
+      dut.clockDomain.waitSampling()
+
+      drive((true, 1, 7, 5), (true, 2, 0, 9))
+      assert(dut.io.temporalMrnOutput.payload.first.row.toInt == 1)
+      assert(dut.io.temporalMrnOutput.payload.first.column.toInt == 7)
+      assert(dut.io.temporalMrnOutput.payload.first.value.toLong == 5)
+      assert(dut.io.temporalMrnOutput.payload.consumeLeft.toBoolean)
+      assert(!dut.io.temporalMrnOutput.payload.consumeRight.toBoolean)
     }
   }
 

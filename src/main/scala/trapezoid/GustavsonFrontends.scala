@@ -176,6 +176,10 @@ class TrGtSubrowScheduler(
       master(LocalBufferBus(cfg)) else null
     val peCommand = if (externalPe) master(Stream(PERowCommand(cfg))) else null
     val peResponse = if (externalPe) slave(Stream(PERowResponse(cfg))) else null
+    val peTemporalMrnInput = if (externalPe)
+      master(Stream(DualModeMrnRequest(cfg))) else null
+    val peTemporalMrnOutput = if (externalPe)
+      slave(Stream(DualModeMrnResponse(cfg))) else null
   }
 
   // Keep the stationary A values in the same four logical subrows used by
@@ -240,6 +244,8 @@ class TrGtSubrowScheduler(
     engine.io.peResponse.valid := io.peResponse.valid
     engine.io.peResponse.payload := io.peResponse.payload
     io.peResponse.ready := engine.io.peResponse.ready
+    io.peTemporalMrnInput << engine.io.peTemporalMrnInput
+    engine.io.peTemporalMrnOutput << io.peTemporalMrnOutput
   }
   io.result <> engine.io.result
   io.busy := running || engine.io.busy
@@ -525,6 +531,7 @@ class TrGsSpatialEngine(
     peResponseValid := pe.io.response.valid
     peResponsePayload := pe.io.response.payload
     pe.io.response.ready := peResponseReady
+    TrapezoidPERowComponent.tieOffTemporalMrn(pe, cfg)
   }
   io.command.ready := !io.clear && Mux(supportedMode,
     acceptsSupported && peCommandReady,

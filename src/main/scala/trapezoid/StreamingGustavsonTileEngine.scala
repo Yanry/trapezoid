@@ -11,7 +11,7 @@ case class GustavsonAccumulatorEntry(cfg: TrapezoidConfig) extends Bundle {
 
 object StreamingGustavsonState extends SpinalEnum {
   val Accept, WaitResponse, MergePrepare, MergeLoadOld, MergeCompare,
-      MergeNodeWait, OutputLoad, OutputEmit, AbortDrain = newElement()
+      OutputLoad, OutputEmit, AbortDrain = newElement()
 }
 
 /** Ordered streaming accumulator for TrGT/TrGS PE responses.
@@ -47,6 +47,10 @@ class GustavsonTileEngine(
     val activeEntries = out UInt(tileCfg.entryCountWidth bits)
     val peCommand = if (externalPe) master(Stream(PERowCommand(cfg))) else null
     val peResponse = if (externalPe) slave(Stream(PERowResponse(cfg))) else null
+    val peTemporalMrnInput = if (externalPe)
+      master(Stream(DualModeMrnRequest(cfg))) else null
+    val peTemporalMrnOutput = if (externalPe)
+      slave(Stream(DualModeMrnResponse(cfg))) else null
   }
 
   val state = RegInit(StreamingGustavsonState.Accept)
@@ -65,6 +69,10 @@ class GustavsonTileEngine(
   val outputIndex = Reg(UInt(tileCfg.entryIndexWidth bits)) init 0
   val oldEntry = Reg(GustavsonAccumulatorEntry(cfg))
   val oldEntryValid = RegInit(False)
+  val oldNextEntry = Reg(GustavsonAccumulatorEntry(cfg))
+  val oldNextValid = RegInit(False)
+  val oldFetchIndex = Reg(UInt(tileCfg.entryCountWidth bits)) init 0
+  val oldReadPending = RegInit(False)
   val responseReg = Reg(PERowResponse(cfg))
   val readBankReg = Reg(UInt(bankBits bits)) init 0
   val readBufferReg = RegInit(False)
@@ -77,14 +85,15 @@ class GustavsonTileEngine(
   def logicalAddress(index: UInt): UInt =
     (index >> bankBits).resize(bankAddressWidth)
 
+  val oldReadIssue = Bool()
+  val oldReadArrivalConsumed = Bool()
+  oldReadIssue := False
+  oldReadArrivalConsumed := False
+
   val readEnable = Bool()
   val readIndex = UInt(tileCfg.entryIndexWidth bits)
-  readEnable := False
-  readIndex := oldIndex.resize(tileCfg.entryIndexWidth)
-  when(state === StreamingGustavsonState.MergePrepare && oldCount =/= 0) {
-    readEnable := True
-    readIndex := 0
-  }
+  readEnable := oldReadIssue
+  readIndex := oldFetchIndex.resize(tileCfg.entryIndexWidth)
   when(state === StreamingGustavsonState.OutputLoad) {
     readEnable := True
     readIndex := outputIndex
@@ -132,6 +141,8 @@ class GustavsonTileEngine(
   val peResponseValid = Bool()
   val peResponsePayload = PERowResponse(cfg)
   val peResponseReady = Bool()
+  val temporalMrnInput = Stream(DualModeMrnRequest(cfg))
+  val temporalMrnOutput = Stream(DualModeMrnResponse(cfg))
   val peCommandValid = !io.clear && state === StreamingGustavsonState.Accept &&
     io.command.valid && supportedMode
   if (externalPe) {
@@ -141,6 +152,8 @@ class GustavsonTileEngine(
     peResponseValid := io.peResponse.valid
     peResponsePayload := io.peResponse.payload
     io.peResponse.ready := peResponseReady
+    io.peTemporalMrnInput << temporalMrnInput
+    temporalMrnOutput << io.peTemporalMrnOutput
   } else {
     val pe = peFactory(cfg)
     pe.io.command.valid := peCommandValid
@@ -149,6 +162,8 @@ class GustavsonTileEngine(
     peResponseValid := pe.io.response.valid
     peResponsePayload := pe.io.response.payload
     pe.io.response.ready := peResponseReady
+    pe.io.temporalMrnInput << temporalMrnInput
+    temporalMrnOutput << pe.io.temporalMrnOutput
   }
 
   io.command.ready := !io.clear && state === StreamingGustavsonState.Accept &&
@@ -177,20 +192,24 @@ class GustavsonTileEngine(
   newEntry.row := responseReg.results(selectedNewIndex).row
   newEntry.column := responseReg.results(selectedNewIndex).column
   newEntry.value := responseReg.results(selectedNewIndex).value
-  val mergeNode = new DualModeMrnNode(cfg)
-  val oldAvailable = oldEntryValid && oldIndex < oldCount
-  mergeNode.io.input.valid := state === StreamingGustavsonState.MergeCompare &&
+  val oldAvailable = (oldEntryValid || oldReadPending) && oldIndex < oldCount
+  val oldMergeEntry = GustavsonAccumulatorEntry(cfg)
+  oldMergeEntry := oldEntry
+  when(!oldEntryValid && oldReadPending) {
+    oldMergeEntry := selectedReadEntry
+  }
+  temporalMrnInput.valid := state === StreamingGustavsonState.MergeCompare &&
     (oldAvailable || newAvailable)
-  mergeNode.io.input.payload.mode := MrnNodeMode.GustavsonMerge
-  mergeNode.io.input.payload.left.valid := oldAvailable
-  mergeNode.io.input.payload.left.row := oldEntry.row
-  mergeNode.io.input.payload.left.column := oldEntry.column
-  mergeNode.io.input.payload.left.value := oldEntry.value
-  mergeNode.io.input.payload.right.valid := newAvailable
-  mergeNode.io.input.payload.right.row := newEntry.row
-  mergeNode.io.input.payload.right.column := newEntry.column
-  mergeNode.io.input.payload.right.value := newEntry.value
-  mergeNode.io.output.ready := state === StreamingGustavsonState.MergeNodeWait
+  temporalMrnInput.payload.mode := MrnNodeMode.GustavsonMerge
+  temporalMrnInput.payload.left.valid := oldAvailable
+  temporalMrnInput.payload.left.row := oldMergeEntry.row
+  temporalMrnInput.payload.left.column := oldMergeEntry.column
+  temporalMrnInput.payload.left.value := oldMergeEntry.value
+  temporalMrnInput.payload.right.valid := newAvailable
+  temporalMrnInput.payload.right.row := newEntry.row
+  temporalMrnInput.payload.right.column := newEntry.column
+  temporalMrnInput.payload.right.value := newEntry.value
+  temporalMrnOutput.ready := state === StreamingGustavsonState.MergeCompare
 
   switch(state) {
     is(StreamingGustavsonState.Accept) {
@@ -227,6 +246,9 @@ class GustavsonTileEngine(
         newIndex := 0
         writeIndex := 0
         oldEntryValid := False
+        oldNextValid := False
+        oldFetchIndex := 0
+        oldReadPending := False
         state := StreamingGustavsonState.MergePrepare
       }
     }
@@ -235,6 +257,7 @@ class GustavsonTileEngine(
       when(oldCount === 0) {
         state := StreamingGustavsonState.MergeCompare
       } otherwise {
+        oldReadIssue := True
         state := StreamingGustavsonState.MergeLoadOld
       }
     }
@@ -242,6 +265,10 @@ class GustavsonTileEngine(
     is(StreamingGustavsonState.MergeLoadOld) {
       oldEntry := selectedReadEntry
       oldEntryValid := True
+      oldReadArrivalConsumed := True
+      when(oldFetchIndex < oldCount) {
+        oldReadIssue := True
+      }
       state := StreamingGustavsonState.MergeCompare
     }
 
@@ -261,40 +288,65 @@ class GustavsonTileEngine(
         } otherwise {
           state := StreamingGustavsonState.Accept
         }
-      } elsewhen(mergeNode.io.input.fire) {
-        state := StreamingGustavsonState.MergeNodeWait
-      }
-    }
-
-    is(StreamingGustavsonState.MergeNodeWait) {
-      when(mergeNode.io.output.fire) {
+      } elsewhen(temporalMrnOutput.fire) {
         val canStore = writeIndex < tileCfg.accumulatorEntries
-        writeEnable := canStore && mergeNode.io.output.payload.first.valid
-        writeEntry.row := mergeNode.io.output.payload.first.row
-        writeEntry.column := mergeNode.io.output.payload.first.column
-        writeEntry.value := mergeNode.io.output.payload.first.value
+        writeEnable := canStore && temporalMrnOutput.payload.first.valid
+        writeEntry.row := temporalMrnOutput.payload.first.row
+        writeEntry.column := temporalMrnOutput.payload.first.column
+        writeEntry.value := temporalMrnOutput.payload.first.value
         when(canStore) {
           writeIndex := writeIndex + 1
         } otherwise {
           overflowReg := True
         }
-        when(mergeNode.io.output.payload.consumeRight) {
+        when(temporalMrnOutput.payload.consumeRight) {
           newIndex := newIndex + 1
         }
-        when(mergeNode.io.output.payload.consumeLeft) {
-          oldEntryValid := False
+        when(oldReadPending) {
+          oldReadArrivalConsumed := True
+        }
+        when(temporalMrnOutput.payload.consumeLeft) {
+          when(oldEntryValid) {
+            when(oldNextValid) {
+              oldEntry := oldNextEntry
+              oldEntryValid := True
+              oldNextValid := False
+              when(oldReadPending) {
+                oldNextEntry := selectedReadEntry
+                oldNextValid := True
+              }
+            } elsewhen(oldReadPending) {
+              oldEntry := selectedReadEntry
+              oldEntryValid := True
+            } otherwise {
+              oldEntryValid := False
+            }
+          } otherwise {
+            oldEntryValid := False
+          }
           when(oldIndex + 1 < oldCount) {
             oldIndex := oldIndex + 1
-            readEnable := True
-            readIndex := (oldIndex + 1).resized
-            state := StreamingGustavsonState.MergeLoadOld
           } otherwise {
             oldIndex := oldCount
-            state := StreamingGustavsonState.MergeCompare
+          }
+          when(oldFetchIndex < oldCount) {
+            oldReadIssue := True
           }
         } otherwise {
-          state := StreamingGustavsonState.MergeCompare
+          when(oldReadPending) {
+            when(oldEntryValid) {
+              oldNextEntry := selectedReadEntry
+              oldNextValid := True
+            } otherwise {
+              oldEntry := selectedReadEntry
+              oldEntryValid := True
+              when(oldFetchIndex < oldCount) {
+                oldReadIssue := True
+              }
+            }
+          }
         }
+        state := StreamingGustavsonState.MergeCompare
       }
     }
 
@@ -324,6 +376,13 @@ class GustavsonTileEngine(
     }
   }
 
+  when(oldReadIssue) {
+    oldFetchIndex := oldFetchIndex + 1
+    oldReadPending := True
+  } elsewhen(oldReadArrivalConsumed) {
+    oldReadPending := False
+  }
+
   when(io.clear) {
     entryCount := 0
     tileOpen := False
@@ -331,6 +390,9 @@ class GustavsonTileEngine(
     overflowReg := False
     modeErrorReg := False
     oldEntryValid := False
+    oldNextValid := False
+    oldFetchIndex := 0
+    oldReadPending := False
     when(commandInFlight) { state := StreamingGustavsonState.AbortDrain }
       .otherwise { state := StreamingGustavsonState.Accept }
   }

@@ -123,6 +123,7 @@ class LegacyGustavsonTileEngine(
     peResponseValid := pe.io.response.valid
     peResponsePayload := pe.io.response.payload
     pe.io.response.ready := peResponseReady
+    TrapezoidPERowComponent.tieOffTemporalMrn(pe, cfg)
   }
   io.command.ready := !io.clear && state === GustavsonTileState.Accept &&
     Mux(supportedMode, peCommandReady, True)

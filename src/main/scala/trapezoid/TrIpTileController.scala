@@ -68,6 +68,7 @@ class PackedTrIpPERow(
   io.responseValid := pe.io.response.valid
   pe.io.response.ready := io.responseReady
   io.responsePayload := pe.io.response.payload.asBits
+  TrapezoidPERowComponent.tieOffTemporalMrn(pe, cfg)
 }
 
 /** Packed, reusable hierarchy for all PE rows in the TrIP array. */

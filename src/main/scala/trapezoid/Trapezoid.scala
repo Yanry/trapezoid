@@ -18,6 +18,7 @@ class Trapezoid(cfg: TrapezoidConfig = TrapezoidConfig.small) extends Component 
     val localBuffer = new BankedLocalBuffer(cfg)
     pe.io.command <> io.commands(row)
     pe.io.response <> io.responses(row)
+    TrapezoidPERowComponent.tieOffTemporalMrn(pe, cfg)
     localBuffer.io.bus <> io.localBuffers(row)
   }
 }

@@ -64,6 +64,8 @@ case class PERowReductionPayload(cfg: TrapezoidConfig) extends Bundle {
 case class TrapezoidPERowIo(cfg: TrapezoidConfig) extends Bundle {
   val command = slave(Stream(PERowCommand(cfg)))
   val response = master(Stream(PERowResponse(cfg)))
+  val temporalMrnInput = slave(Stream(DualModeMrnRequest(cfg)))
+  val temporalMrnOutput = master(Stream(DualModeMrnResponse(cfg)))
   val controlPrepareCycles = out UInt(32 bits)
   val routeCycles = out UInt(32 bits)
   val macCycles = out UInt(32 bits)
@@ -73,6 +75,16 @@ case class TrapezoidPERowIo(cfg: TrapezoidConfig) extends Bundle {
 
 trait TrapezoidPERowComponent {
   val io: TrapezoidPERowIo
+}
+
+object TrapezoidPERowComponent {
+  def tieOffTemporalMrn(
+      pe: TrapezoidPERowComponent,
+      cfg: TrapezoidConfig): Unit = {
+    pe.io.temporalMrnInput.valid := False
+    pe.io.temporalMrnInput.payload := DualModeMrnRequest(cfg).getZero
+    pe.io.temporalMrnOutput.ready := True
+  }
 }
 
 /** A pipelined Trapezoid PE row.
@@ -765,6 +777,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   // the segment head flag prevents reductions from crossing coordinates.
   val mrnTree = new DualModeMrnTree(cfg)
   mrnTree.io.input << reductionInput
+  mrnTree.io.temporalInput << io.temporalMrnInput
+  io.temporalMrnOutput << mrnTree.io.temporalOutput
   val reductionStage = mrnTree.io.output
 
   // Final MRN stage: emit only segment tails and compact them to output lanes.

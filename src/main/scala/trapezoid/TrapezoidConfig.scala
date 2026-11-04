@@ -72,7 +72,8 @@ case class TrapezoidConfig(
     }
     levels
   }
-  val pePipelineStages: Int = 4 + mrnReductionLevels + responseFifoDepth
+  /** Baseline command-to-response latency used by the compact PE path. */
+  val pePipelineStages: Int = 3 + mrnReductionLevels + responseFifoDepth
   val aRegisterIndexWidth: Int = math.max(1, log2Up(macLanes))
   val macLanesPerSubrow: Int = macLanes / localBanks
   val matchCountWidth: Int = log2Up(maxFibers * maxFibers * fiberWidth + 1)

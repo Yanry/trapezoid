@@ -14,15 +14,17 @@ import spinal.lib._
 class DualModeMrnLevel(
     cfg: TrapezoidConfig,
     level: Int,
-    supportsTemporalMerge: Boolean = false
+    temporalPortPositions: Map[Int, Int] = Map.empty
 ) extends Component {
   require(level >= 0 && level < cfg.mrnReductionLevels)
 
   val io = new Bundle {
     val input = slave(Stream(PERowReductionPayload(cfg)))
     val output = master(Stream(PERowReductionPayload(cfg)))
-    val temporalInput = slave(Stream(DualModeMrnRequest(cfg)))
-    val temporalOutput = master(Stream(DualModeMrnResponse(cfg)))
+    val temporalInputs = Vec(slave(Stream(DualModeMrnRequest(cfg))),
+      cfg.localBanks)
+    val temporalOutputs = Vec(master(Stream(DualModeMrnResponse(cfg))),
+      cfg.localBanks)
   }
 
   private val reductionDistance = 1 << level
@@ -34,34 +36,10 @@ class DualModeMrnLevel(
   transformed.payload.selectedColumns := io.input.payload.selectedColumns
   transformed.payload.effectualMacs := io.input.payload.effectualMacs
 
-  val useTemporal = if (supportsTemporalMerge) {
-    io.temporalInput.valid && !io.input.valid
-  } else {
-    False
-  }
-  val sharedCell = if (supportsTemporalMerge) {
-    val spatialLeft = io.input.payload.lanes(0)
-    val spatialRight = io.input.payload.lanes(1)
-    val cell = DualModeMrnCell(
-      cfg,
-      Mux(useTemporal, io.temporalInput.payload.left.valid, spatialLeft.valid),
-      Mux(useTemporal, io.temporalInput.payload.left.row, spatialLeft.row),
-      Mux(useTemporal, io.temporalInput.payload.left.column, spatialLeft.column),
-      Mux(useTemporal, io.temporalInput.payload.left.value, spatialLeft.value),
-      Mux(useTemporal, io.temporalInput.payload.right.valid, spatialRight.valid),
-      Mux(useTemporal, io.temporalInput.payload.right.row, spatialRight.row),
-      Mux(useTemporal, io.temporalInput.payload.right.column, spatialRight.column),
-      Mux(useTemporal, io.temporalInput.payload.right.value, spatialRight.value))
-    io.temporalOutput.valid := useTemporal
-    io.temporalOutput.payload := DualModeMrnCell.response(
-      cfg, io.temporalInput.payload, cell)
-    io.temporalInput.ready := !io.input.valid && io.temporalOutput.ready
-    cell
-  } else {
-    io.temporalInput.ready := False
-    io.temporalOutput.valid := False
-    io.temporalOutput.payload := DualModeMrnResponse(cfg).getZero
-    null
+  for (port <- 0 until cfg.localBanks if !temporalPortPositions.contains(port)) {
+    io.temporalInputs(port).ready := False
+    io.temporalOutputs(port).valid := False
+    io.temporalOutputs(port).payload := DualModeMrnResponse(cfg).getZero
   }
 
   val mergeMode = io.input.payload.mode === TrapezoidDataflow.TrGt ||
@@ -79,13 +57,41 @@ class DualModeMrnLevel(
 
     if (position >= reductionDistance) {
       val left = io.input.payload.lanes(position - reductionDistance)
-      val cell = if (supportsTemporalMerge && position == 1) {
-        sharedCell
-      } else {
-        DualModeMrnCell(
-          cfg,
-          left.valid, left.row, left.column, left.value,
-          right.valid, right.row, right.column, right.value)
+      val temporalPort = temporalPortPositions.collectFirst {
+        case (port, mappedPosition) if mappedPosition == position => port
+      }
+      val cell = temporalPort match {
+        case Some(port) =>
+          val useTemporal = io.temporalInputs(port).valid && !io.input.valid
+          val shared = DualModeMrnCell(
+            cfg,
+            Mux(useTemporal, io.temporalInputs(port).payload.left.valid,
+              left.valid),
+            Mux(useTemporal, io.temporalInputs(port).payload.left.row,
+              left.row),
+            Mux(useTemporal, io.temporalInputs(port).payload.left.column,
+              left.column),
+            Mux(useTemporal, io.temporalInputs(port).payload.left.value,
+              left.value),
+            Mux(useTemporal, io.temporalInputs(port).payload.right.valid,
+              right.valid),
+            Mux(useTemporal, io.temporalInputs(port).payload.right.row,
+              right.row),
+            Mux(useTemporal, io.temporalInputs(port).payload.right.column,
+              right.column),
+            Mux(useTemporal, io.temporalInputs(port).payload.right.value,
+              right.value))
+          io.temporalOutputs(port).valid := useTemporal
+          io.temporalOutputs(port).payload := DualModeMrnCell.response(
+            cfg, io.temporalInputs(port).payload, shared)
+          io.temporalInputs(port).ready :=
+            !io.input.valid && io.temporalOutputs(port).ready
+          shared
+        case None =>
+          DualModeMrnCell(
+            cfg,
+            left.valid, left.row, left.column, left.value,
+            right.valid, right.row, right.column, right.value)
       }
 
       output.value := Mux(cell.sameCoordinate, cell.reducedValue, right.value)
@@ -108,30 +114,47 @@ class DualModeMrnLevel(
   *
   * The current PE response format still emits every coordinate segment, so the
   * levels implement a segmented prefix reduction.  Keeping the levels as an
-  * explicit dual-mode component removes the previous fixed inline tree.  Its
-  * level-zero cell is also the physical temporal merge resource used by the
-  * streaming Gustavson engine while the spatial pipeline is idle.
+  * explicit dual-mode component removes the previous fixed inline tree.  Four
+  * existing cells also serve as bank-parallel temporal merge resources while
+  * their spatial levels are idle.
   */
 class DualModeMrnTree(cfg: TrapezoidConfig) extends Component {
   val io = new Bundle {
     val input = slave(Stream(PERowReductionPayload(cfg)))
     val output = master(Stream(PERowReductionPayload(cfg)))
-    val temporalInput = slave(Stream(DualModeMrnRequest(cfg)))
-    val temporalOutput = master(Stream(DualModeMrnResponse(cfg)))
+    val temporalInputs = Vec(slave(Stream(DualModeMrnRequest(cfg))),
+      cfg.localBanks)
+    val temporalOutputs = Vec(master(Stream(DualModeMrnResponse(cfg))),
+      cfg.localBanks)
   }
+
+  private val temporalPlacements = (for {
+    levelIndex <- 0 until cfg.mrnReductionLevels
+    position <- (1 << levelIndex) until cfg.macLanes
+  } yield (levelIndex, position)).take(cfg.localBanks).zipWithIndex.map {
+    case ((levelIndex, position), port) => (port, levelIndex, position)
+  }
+  require(temporalPlacements.size == cfg.localBanks,
+    "MRN must contain one reusable temporal cell per local bank")
 
   var stage = io.input
   for (levelIndex <- 0 until cfg.mrnReductionLevels) {
-    val level = new DualModeMrnLevel(cfg, levelIndex,
-      supportsTemporalMerge = levelIndex == 0)
+    val levelPorts = temporalPlacements.collect {
+      case (port, mappedLevel, position) if mappedLevel == levelIndex =>
+        port -> position
+    }.toMap
+    val level = new DualModeMrnLevel(cfg, levelIndex, levelPorts)
     level.io.input << stage
-    if (levelIndex == 0) {
-      level.io.temporalInput << io.temporalInput
-      io.temporalOutput << level.io.temporalOutput
-    } else {
-      level.io.temporalInput.valid := False
-      level.io.temporalInput.payload := DualModeMrnRequest(cfg).getZero
-      level.io.temporalOutput.ready := True
+    for (port <- 0 until cfg.localBanks) {
+      if (levelPorts.contains(port)) {
+        level.io.temporalInputs(port) << io.temporalInputs(port)
+        io.temporalOutputs(port) << level.io.temporalOutputs(port)
+      } else {
+        level.io.temporalInputs(port).valid := False
+        level.io.temporalInputs(port).payload :=
+          DualModeMrnRequest(cfg).getZero
+        level.io.temporalOutputs(port).ready := True
+      }
     }
     stage = level.io.output
   }

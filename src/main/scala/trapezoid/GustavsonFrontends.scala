@@ -439,6 +439,10 @@ class TrGsSpatialEngine(
     val bankReplayCycles = out UInt(32 bits)
     val peCommand = if (externalPe) master(Stream(PERowCommand(cfg))) else null
     val peResponse = if (externalPe) slave(Stream(PERowResponse(cfg))) else null
+    val peTemporalMrnInputs = if (externalPe)
+      Vec(master(Stream(DualModeMrnRequest(cfg))), cfg.localBanks) else null
+    val peTemporalMrnOutputs = if (externalPe)
+      Vec(slave(Stream(DualModeMrnResponse(cfg))), cfg.localBanks) else null
     val accumulatorStorage = if (externalAccumulatorStorage)
       master(LocalBufferBus(cfg)) else null
   }
@@ -515,6 +519,10 @@ class TrGsSpatialEngine(
   val peResponseValid = Bool()
   val peResponsePayload = PERowResponse(cfg)
   val peResponseReady = Bool()
+  val temporalMrnInputs = if (externalPe)
+    Vec(Stream(DualModeMrnRequest(cfg)), cfg.localBanks) else null
+  val temporalMrnOutputs = if (externalPe)
+    Vec(Stream(DualModeMrnResponse(cfg)), cfg.localBanks) else null
   val peCommandValid = !io.clear && io.command.valid && acceptsSupported
   if (externalPe) {
     io.peCommand.valid := peCommandValid
@@ -523,6 +531,10 @@ class TrGsSpatialEngine(
     peResponseValid := io.peResponse.valid
     peResponsePayload := io.peResponse.payload
     io.peResponse.ready := peResponseReady
+    for (bank <- 0 until cfg.localBanks) {
+      io.peTemporalMrnInputs(bank) << temporalMrnInputs(bank)
+      temporalMrnOutputs(bank) << io.peTemporalMrnOutputs(bank)
+    }
   } else {
     val pe = peFactory(cfg)
     pe.io.command.valid := peCommandValid
@@ -588,6 +600,21 @@ class TrGsSpatialEngine(
     Vec((0 until cfg.localBanks).map(_ =>
       Reg(SInt(cfg.accumulatorWidth bits)) init 0))
   } else null
+  val storageOldValue = if (externalAccumulatorStorage && externalPe) {
+    Vec((0 until cfg.localBanks).map(_ =>
+      Reg(SInt(cfg.accumulatorWidth bits)) init 0))
+  } else null
+  val storageOldValid = if (externalAccumulatorStorage && externalPe) {
+    Vec((0 until cfg.localBanks).map(_ => RegInit(False)))
+  } else null
+  val storageUpdateRow = if (externalAccumulatorStorage && externalPe) {
+    Vec((0 until cfg.localBanks).map(_ =>
+      Reg(UInt(cfg.coordinateWidth bits)) init 0))
+  } else null
+  val storageUpdateColumn = if (externalAccumulatorStorage && externalPe) {
+    Vec((0 until cfg.localBanks).map(_ =>
+      Reg(UInt(cfg.coordinateWidth bits)) init 0))
+  } else null
   val outputFetchPending = if (externalAccumulatorStorage) RegInit(False) else null
   val outputLineLoaded = if (externalAccumulatorStorage) RegInit(False) else null
   val outputLoadedGroup = if (externalAccumulatorStorage) {
@@ -617,69 +644,79 @@ class TrGsSpatialEngine(
             high downto low).asSInt
         }
       }
-      val updatedValue = (oldValue + storageUpdateValue(bank)).resized
       val updateData = Bits(cfg.localLineWidth bits)
       val updateMask = Bits(cfg.localLineBytes bits)
       updateData := 0
       updateMask := 0
       for (word <- 0 until cfg.localWordsPerBank) {
         when(storageUpdateWord(bank) === word) {
-          val dataHigh = (word + 1) * cfg.accumulatorWidth - 1
-          val dataLow = word * cfg.accumulatorWidth
           val maskHigh = (word + 1) * (cfg.accumulatorWidth / 8) - 1
           val maskLow = word * (cfg.accumulatorWidth / 8)
-          updateData(dataHigh downto dataLow) := updatedValue.asBits
           updateMask(maskHigh downto maskLow).setAll()
         }
       }
-      val forwardedDelta = SInt(cfg.accumulatorWidth bits)
-      forwardedDelta := 0
-      var earlierForward: Bool = False
-      for (lane <- 0 until cfg.outputLanes) {
-        val result = responseReg.results(lane)
-        val resultSlot = result.column(tileCfg.entryIndexWidth - 1 downto 0)
-        val resultWordInBank = (resultSlot >> bankIndexWidth)
-          .resize(tileCfg.entryIndexWidth)
-        val resultLineAddress = (resultWordInBank >> cfg.localWordIndexWidth)
-          .resize(cfg.localAddressWidth)
-        val resultWordOffset = resultWordInBank
-          .resize(cfg.localWordIndexWidth)
-        when(pendingResults(lane) && result.valid &&
-            storageBankBusy(bank) &&
-            result.column(bankIndexWidth - 1 downto 0) === bank &&
-            resultLineAddress === storageUpdateAddress(bank) &&
-            resultWordOffset === storageUpdateWord(bank) &&
-            !earlierForward) {
-          forwardedDelta := result.value
+      if (externalPe) {
+        val oldAvailable = storageOldValid(bank) ||
+          io.accumulatorStorage.readResponses(bank).valid
+        temporalMrnInputs(bank).valid := storageBankBusy(bank) && oldAvailable
+        temporalMrnInputs(bank).payload.mode := MrnNodeMode.GustavsonMerge
+        temporalMrnInputs(bank).payload.left.valid := True
+        temporalMrnInputs(bank).payload.left.row := storageUpdateRow(bank)
+        temporalMrnInputs(bank).payload.left.column := storageUpdateColumn(bank)
+        temporalMrnInputs(bank).payload.left.value :=
+          Mux(storageOldValid(bank), storageOldValue(bank), oldValue)
+        temporalMrnInputs(bank).payload.right.valid := True
+        temporalMrnInputs(bank).payload.right.row := storageUpdateRow(bank)
+        temporalMrnInputs(bank).payload.right.column := storageUpdateColumn(bank)
+        temporalMrnInputs(bank).payload.right.value := storageUpdateValue(bank)
+        temporalMrnOutputs(bank).ready := True
+
+        when(io.accumulatorStorage.readResponses(bank).valid &&
+            !temporalMrnOutputs(bank).fire) {
+          storageOldValue(bank) := oldValue
+          storageOldValid(bank) := True
         }
-        earlierForward = earlierForward ||
-          (pendingResults(lane) && result.valid &&
-            storageBankBusy(bank) &&
-            result.column(bankIndexWidth - 1 downto 0) === bank &&
-            resultLineAddress === storageUpdateAddress(bank) &&
-            resultWordOffset === storageUpdateWord(bank))
-      }
-      val updatedValueWithForward =
-        (oldValue + storageUpdateValue(bank) + forwardedDelta).resized
-      when(storageBankBusy(bank) &&
-          io.accumulatorStorage.readResponses(bank).valid) {
-        io.accumulatorStorage.writes(bank).valid := True
-        io.accumulatorStorage.writes(bank).payload.address :=
-          storageUpdateAddress(bank)
-        val writeData = Bits(cfg.localLineWidth bits)
-        writeData := updateData
-        for (word <- 0 until cfg.localWordsPerBank) {
-          when(storageUpdateWord(bank) === word) {
-            val dataHigh = (word + 1) * cfg.accumulatorWidth - 1
-            val dataLow = word * cfg.accumulatorWidth
-            writeData(dataHigh downto dataLow) :=
-              updatedValueWithForward.asBits
+        when(temporalMrnOutputs(bank).fire) {
+          io.accumulatorStorage.writes(bank).valid := True
+          io.accumulatorStorage.writes(bank).payload.address :=
+            storageUpdateAddress(bank)
+          val writeData = Bits(cfg.localLineWidth bits)
+          writeData := updateData
+          for (word <- 0 until cfg.localWordsPerBank) {
+            when(storageUpdateWord(bank) === word) {
+              val dataHigh = (word + 1) * cfg.accumulatorWidth - 1
+              val dataLow = word * cfg.accumulatorWidth
+              writeData(dataHigh downto dataLow) :=
+                temporalMrnOutputs(bank).payload.first.value.asBits
+            }
           }
+          io.accumulatorStorage.writes(bank).payload.data := writeData
+          io.accumulatorStorage.writes(bank).payload.mask := updateMask
+          storageBankBusy(bank) := False
+          storageOldValid(bank) := False
+          completedRmw(bank) := True
         }
-        io.accumulatorStorage.writes(bank).payload.data := writeData
-        io.accumulatorStorage.writes(bank).payload.mask := updateMask
-        storageBankBusy(bank) := False
-        completedRmw(bank) := True
+      } else {
+        val updatedValue = (oldValue + storageUpdateValue(bank)).resized
+        when(storageBankBusy(bank) &&
+            io.accumulatorStorage.readResponses(bank).valid) {
+          io.accumulatorStorage.writes(bank).valid := True
+          io.accumulatorStorage.writes(bank).payload.address :=
+            storageUpdateAddress(bank)
+          val writeData = Bits(cfg.localLineWidth bits)
+          writeData := updateData
+          for (word <- 0 until cfg.localWordsPerBank) {
+            when(storageUpdateWord(bank) === word) {
+              val dataHigh = (word + 1) * cfg.accumulatorWidth - 1
+              val dataLow = word * cfg.accumulatorWidth
+              writeData(dataHigh downto dataLow) := updatedValue.asBits
+            }
+          }
+          io.accumulatorStorage.writes(bank).payload.data := writeData
+          io.accumulatorStorage.writes(bank).payload.mask := updateMask
+          storageBankBusy(bank) := False
+          completedRmw(bank) := True
+        }
       }
     }
   }
@@ -695,7 +732,7 @@ class TrGsSpatialEngine(
       val resultLineAddress = (resultWordInBank >> cfg.localWordIndexWidth)
         .resize(cfg.localAddressWidth)
       val resultWordOffset = resultWordInBank.resize(cfg.localWordIndexWidth)
-      val samePendingSlot = if (externalAccumulatorStorage) {
+      val samePendingSlot = if (externalAccumulatorStorage && !externalPe) {
         storageBankBusy(bank) &&
           resultLineAddress === storageUpdateAddress(bank) &&
           resultWordOffset === storageUpdateWord(bank)
@@ -758,9 +795,11 @@ class TrGsSpatialEngine(
     grantedUpdates(bank) := responseActive && grantFound &&
       !coordinateCollision && !responseReg.overflow &&
       (if (externalAccumulatorStorage) {
-        !selectedSlotValid || storageBankBusy(bank) &&
-          lineAddress === storageUpdateAddress(bank) &&
-          wordOffset === storageUpdateWord(bank)
+        if (externalPe) !selectedSlotValid else {
+          !selectedSlotValid || storageBankBusy(bank) &&
+            lineAddress === storageUpdateAddress(bank) &&
+            wordOffset === storageUpdateWord(bank)
+        }
       } else True)
 
     when(responseActive && grantFound && !responseReg.overflow) {
@@ -769,9 +808,11 @@ class TrGsSpatialEngine(
       } otherwise {
         if (externalAccumulatorStorage) {
           when(selectedSlotValid) {
-            val samePendingSlot = storageBankBusy(bank) &&
-              lineAddress === storageUpdateAddress(bank) &&
-              wordOffset === storageUpdateWord(bank)
+            val samePendingSlot = if (externalPe) False else {
+              storageBankBusy(bank) &&
+                lineAddress === storageUpdateAddress(bank) &&
+                wordOffset === storageUpdateWord(bank)
+            }
             when(samePendingSlot) {
               storageUpdateValue(bank) :=
                 (storageUpdateValue(bank) + result.value).resized
@@ -783,6 +824,11 @@ class TrGsSpatialEngine(
               storageUpdateValue(bank) := result.value
               storageBankBusy(bank) := True
               updateReadsIssued(bank) := True
+              if (externalPe) {
+                storageUpdateRow(bank) := result.row
+                storageUpdateColumn(bank) := result.column
+                storageOldValid(bank) := False
+              }
             }
           } otherwise {
             val directData = Bits(cfg.localLineWidth bits)
@@ -1126,6 +1172,9 @@ class TrGsSpatialEngine(
     pendingResults := 0
     if (externalAccumulatorStorage) {
       for (bank <- 0 until cfg.localBanks) storageBankBusy(bank) := False
+      if (externalPe) {
+        for (bank <- 0 until cfg.localBanks) storageOldValid(bank) := False
+      }
       outputFetchPending := False
       outputLineLoaded := False
     }

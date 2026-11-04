@@ -28,17 +28,19 @@ class TrapezoidPERowSpec extends AnyFunSuite {
     dut.io.command.valid #= false
     dut.io.command.payload.endOfTile #= false
     dut.io.response.ready #= true
-    dut.io.temporalMrnInput.valid #= false
-    dut.io.temporalMrnInput.payload.mode #= MrnNodeMode.GustavsonMerge
-    dut.io.temporalMrnInput.payload.left.valid #= false
-    dut.io.temporalMrnInput.payload.left.row #= 0
-    dut.io.temporalMrnInput.payload.left.column #= 0
-    dut.io.temporalMrnInput.payload.left.value #= 0
-    dut.io.temporalMrnInput.payload.right.valid #= false
-    dut.io.temporalMrnInput.payload.right.row #= 0
-    dut.io.temporalMrnInput.payload.right.column #= 0
-    dut.io.temporalMrnInput.payload.right.value #= 0
-    dut.io.temporalMrnOutput.ready #= true
+    for (port <- 0 until config.localBanks) {
+      dut.io.temporalMrnInputs(port).valid #= false
+      dut.io.temporalMrnInputs(port).payload.mode #= MrnNodeMode.GustavsonMerge
+      dut.io.temporalMrnInputs(port).payload.left.valid #= false
+      dut.io.temporalMrnInputs(port).payload.left.row #= 0
+      dut.io.temporalMrnInputs(port).payload.left.column #= 0
+      dut.io.temporalMrnInputs(port).payload.left.value #= 0
+      dut.io.temporalMrnInputs(port).payload.right.valid #= false
+      dut.io.temporalMrnInputs(port).payload.right.row #= 0
+      dut.io.temporalMrnInputs(port).payload.right.column #= 0
+      dut.io.temporalMrnInputs(port).payload.right.value #= 0
+      dut.io.temporalMrnOutputs(port).ready #= true
+    }
     for (fiber <- 0 until config.maxFibers) {
       dut.io.command.payload.trip.a(fiber).valid #= false
       dut.io.command.payload.trip.a(fiber).tag #= 0
@@ -74,33 +76,33 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       def drive(
           left: (Boolean, Int, Int, Int),
           right: (Boolean, Int, Int, Int)): Unit = {
-        dut.io.temporalMrnInput.payload.left.valid #= left._1
-        dut.io.temporalMrnInput.payload.left.row #= left._2
-        dut.io.temporalMrnInput.payload.left.column #= left._3
-        dut.io.temporalMrnInput.payload.left.value #= left._4
-        dut.io.temporalMrnInput.payload.right.valid #= right._1
-        dut.io.temporalMrnInput.payload.right.row #= right._2
-        dut.io.temporalMrnInput.payload.right.column #= right._3
-        dut.io.temporalMrnInput.payload.right.value #= right._4
-        dut.io.temporalMrnInput.valid #= true
+        dut.io.temporalMrnInputs(0).payload.left.valid #= left._1
+        dut.io.temporalMrnInputs(0).payload.left.row #= left._2
+        dut.io.temporalMrnInputs(0).payload.left.column #= left._3
+        dut.io.temporalMrnInputs(0).payload.left.value #= left._4
+        dut.io.temporalMrnInputs(0).payload.right.valid #= right._1
+        dut.io.temporalMrnInputs(0).payload.right.row #= right._2
+        dut.io.temporalMrnInputs(0).payload.right.column #= right._3
+        dut.io.temporalMrnInputs(0).payload.right.value #= right._4
+        dut.io.temporalMrnInputs(0).valid #= true
         sleep(1)
-        assert(dut.io.temporalMrnInput.ready.toBoolean)
-        assert(dut.io.temporalMrnOutput.valid.toBoolean)
+        assert(dut.io.temporalMrnInputs(0).ready.toBoolean)
+        assert(dut.io.temporalMrnOutputs(0).valid.toBoolean)
       }
 
       drive((true, 2, 3, 7), (true, 2, 3, 11))
-      assert(dut.io.temporalMrnOutput.payload.first.valid.toBoolean)
-      assert(dut.io.temporalMrnOutput.payload.first.value.toLong == 18)
-      assert(dut.io.temporalMrnOutput.payload.consumeLeft.toBoolean)
-      assert(dut.io.temporalMrnOutput.payload.consumeRight.toBoolean)
+      assert(dut.io.temporalMrnOutputs(0).payload.first.valid.toBoolean)
+      assert(dut.io.temporalMrnOutputs(0).payload.first.value.toLong == 18)
+      assert(dut.io.temporalMrnOutputs(0).payload.consumeLeft.toBoolean)
+      assert(dut.io.temporalMrnOutputs(0).payload.consumeRight.toBoolean)
       dut.clockDomain.waitSampling()
 
       drive((true, 1, 7, 5), (true, 2, 0, 9))
-      assert(dut.io.temporalMrnOutput.payload.first.row.toInt == 1)
-      assert(dut.io.temporalMrnOutput.payload.first.column.toInt == 7)
-      assert(dut.io.temporalMrnOutput.payload.first.value.toLong == 5)
-      assert(dut.io.temporalMrnOutput.payload.consumeLeft.toBoolean)
-      assert(!dut.io.temporalMrnOutput.payload.consumeRight.toBoolean)
+      assert(dut.io.temporalMrnOutputs(0).payload.first.row.toInt == 1)
+      assert(dut.io.temporalMrnOutputs(0).payload.first.column.toInt == 7)
+      assert(dut.io.temporalMrnOutputs(0).payload.first.value.toLong == 5)
+      assert(dut.io.temporalMrnOutputs(0).payload.consumeLeft.toBoolean)
+      assert(!dut.io.temporalMrnOutputs(0).payload.consumeRight.toBoolean)
     }
   }
 

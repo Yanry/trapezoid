@@ -160,16 +160,41 @@ class ModeSharedTileController(
     spatial.io.peCommand.ready := pe.io.command.ready && commandFromTrgs
     trip.io.peCommands(row).ready := pe.io.command.ready &&
       !commandFromTrgt && !commandFromTrgs
-    pe.io.temporalMrnInput.valid := scheduler.io.peTemporalMrnInput.valid &&
-      commandFromTrgt
-    pe.io.temporalMrnInput.payload := scheduler.io.peTemporalMrnInput.payload
-    scheduler.io.peTemporalMrnInput.ready := pe.io.temporalMrnInput.ready &&
-      commandFromTrgt
-    scheduler.io.peTemporalMrnOutput.valid := pe.io.temporalMrnOutput.valid &&
-      commandFromTrgt
-    scheduler.io.peTemporalMrnOutput.payload := pe.io.temporalMrnOutput.payload
-    pe.io.temporalMrnOutput.ready := scheduler.io.peTemporalMrnOutput.ready &&
-      commandFromTrgt
+    pe.io.temporalMrnInputs(0).valid := Mux(commandFromTrgt,
+      scheduler.io.peTemporalMrnInput.valid,
+      spatial.io.peTemporalMrnInputs(0).valid && commandFromTrgs)
+    pe.io.temporalMrnInputs(0).payload := Mux(commandFromTrgt,
+      scheduler.io.peTemporalMrnInput.payload,
+      spatial.io.peTemporalMrnInputs(0).payload)
+    scheduler.io.peTemporalMrnInput.ready :=
+      pe.io.temporalMrnInputs(0).ready && commandFromTrgt
+    spatial.io.peTemporalMrnInputs(0).ready :=
+      pe.io.temporalMrnInputs(0).ready && commandFromTrgs && !commandFromTrgt
+    scheduler.io.peTemporalMrnOutput.valid :=
+      pe.io.temporalMrnOutputs(0).valid && commandFromTrgt
+    scheduler.io.peTemporalMrnOutput.payload :=
+      pe.io.temporalMrnOutputs(0).payload
+    spatial.io.peTemporalMrnOutputs(0).valid :=
+      pe.io.temporalMrnOutputs(0).valid && commandFromTrgs && !commandFromTrgt
+    spatial.io.peTemporalMrnOutputs(0).payload :=
+      pe.io.temporalMrnOutputs(0).payload
+    pe.io.temporalMrnOutputs(0).ready := Mux(commandFromTrgt,
+      scheduler.io.peTemporalMrnOutput.ready,
+      spatial.io.peTemporalMrnOutputs(0).ready && commandFromTrgs)
+    for (port <- 1 until cfg.localBanks) {
+      pe.io.temporalMrnInputs(port).valid :=
+        spatial.io.peTemporalMrnInputs(port).valid && commandFromTrgs
+      pe.io.temporalMrnInputs(port).payload :=
+        spatial.io.peTemporalMrnInputs(port).payload
+      spatial.io.peTemporalMrnInputs(port).ready :=
+        pe.io.temporalMrnInputs(port).ready && commandFromTrgs
+      spatial.io.peTemporalMrnOutputs(port).valid :=
+        pe.io.temporalMrnOutputs(port).valid && commandFromTrgs
+      spatial.io.peTemporalMrnOutputs(port).payload :=
+        pe.io.temporalMrnOutputs(port).payload
+      pe.io.temporalMrnOutputs(port).ready :=
+        spatial.io.peTemporalMrnOutputs(port).ready && commandFromTrgs
+    }
 
     // Response ownership is captured with the command so a clear or mode
     // transition cannot redirect an in-flight PE response to the other client.

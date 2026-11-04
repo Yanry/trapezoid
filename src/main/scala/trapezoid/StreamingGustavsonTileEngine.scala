@@ -162,8 +162,13 @@ class GustavsonTileEngine(
     peResponseValid := pe.io.response.valid
     peResponsePayload := pe.io.response.payload
     pe.io.response.ready := peResponseReady
-    pe.io.temporalMrnInput << temporalMrnInput
-    temporalMrnOutput << pe.io.temporalMrnOutput
+    pe.io.temporalMrnInputs(0) << temporalMrnInput
+    temporalMrnOutput << pe.io.temporalMrnOutputs(0)
+    for (port <- 1 until cfg.localBanks) {
+      pe.io.temporalMrnInputs(port).valid := False
+      pe.io.temporalMrnInputs(port).payload := DualModeMrnRequest(cfg).getZero
+      pe.io.temporalMrnOutputs(port).ready := True
+    }
   }
 
   io.command.ready := !io.clear && state === StreamingGustavsonState.Accept &&

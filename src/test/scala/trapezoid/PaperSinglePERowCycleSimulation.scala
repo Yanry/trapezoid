@@ -205,12 +205,14 @@ object PaperSinglePERowCycleSimulation extends App {
     io.response.valid := core.io.response.valid
     io.response.payload := core.io.response.payload
     core.io.response.ready := io.response.ready
-    core.io.temporalMrnInput.valid := io.temporalMrnInput.valid
-    core.io.temporalMrnInput.payload := io.temporalMrnInput.payload
-    io.temporalMrnInput.ready := core.io.temporalMrnInput.ready
-    io.temporalMrnOutput.valid := core.io.temporalMrnOutput.valid
-    io.temporalMrnOutput.payload := core.io.temporalMrnOutput.payload
-    core.io.temporalMrnOutput.ready := io.temporalMrnOutput.ready
+    for (port <- 0 until cfg.localBanks) {
+      core.io.temporalMrnInputs(port).valid := io.temporalMrnInputs(port).valid
+      core.io.temporalMrnInputs(port).payload := io.temporalMrnInputs(port).payload
+      io.temporalMrnInputs(port).ready := core.io.temporalMrnInputs(port).ready
+      io.temporalMrnOutputs(port).valid := core.io.temporalMrnOutputs(port).valid
+      io.temporalMrnOutputs(port).payload := core.io.temporalMrnOutputs(port).payload
+      core.io.temporalMrnOutputs(port).ready := io.temporalMrnOutputs(port).ready
+    }
     io.controlPrepareCycles := core.io.controlPrepareCycles
     io.routeCycles := core.io.routeCycles
     io.macCycles := core.io.macCycles
@@ -354,8 +356,10 @@ object PaperSinglePERowCycleSimulation extends App {
       dut.clockDomain.forkStimulus(10)
       dut.io.command.valid #= false
       dut.io.response.ready #= true
-      dut.io.temporalMrnInput.valid #= false
-      dut.io.temporalMrnOutput.ready #= true
+      for (port <- 0 until cfg.localBanks) {
+        dut.io.temporalMrnInputs(port).valid #= false
+        dut.io.temporalMrnOutputs(port).ready #= true
+      }
       clearPayload(dut)
 
       def step(): Unit = dut.clockDomain.waitSampling()

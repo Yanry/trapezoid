@@ -14,11 +14,14 @@ object EndToEndCycleSimulation extends App {
   args.foreach { argument =>
     val parts = argument.stripPrefix("--").split("=", 2)
     require(parts.length == 2,
-      s"expected --mode=..., --category=..., --samples=..., or --scale=..., got $argument")
+      s"expected --mode=..., --category=..., --samples=..., --sample=..., " +
+        s"--timeout=..., or --scale=..., got $argument")
     parts(0) match {
       case "mode" => System.setProperty("trapezoid.bench.mode", parts(1))
       case "category" => System.setProperty("trapezoid.bench.category", parts(1))
       case "samples" => System.setProperty("trapezoid.bench.samples", parts(1))
+      case "sample" => System.setProperty("trapezoid.bench.sample", parts(1))
+      case "timeout" => System.setProperty("trapezoid.bench.timeout", parts(1))
       case "scale" => System.setProperty("trapezoid.bench.scale", parts(1))
       case other => throw new IllegalArgumentException(s"unknown benchmark option $other")
     }
@@ -29,6 +32,9 @@ object EndToEndCycleSimulation extends App {
   require(Set("small", "scaled-paper", "paper").contains(benchmarkScale),
     s"unknown benchmark scale $benchmarkScale")
   private val modeFilter = sys.props.get("trapezoid.bench.mode")
+  private val sampleFilter = sys.props.get("trapezoid.bench.sample").map(_.toInt)
+  private val timeoutEdges = sys.props.get("trapezoid.bench.timeout")
+    .map(_.toLong).getOrElse(1000000L)
   private val hardwareProfile = if (!paperScale && !scaledPaperWorkload) {
     EndToEndHardwareProfile.Unified
   } else modeFilter match {
@@ -274,6 +280,10 @@ object EndToEndCycleSimulation extends App {
             0x7900 + categoryIndex * 101 + sample))
       }
   }
+  private val selectedWorkloads = workloads.filter(workload =>
+    selectedCategories.contains(workload.category) &&
+      sampleFilter.forall(_ == workload.sample))
+  require(selectedWorkloads.nonEmpty, s"unknown benchmark sample $sampleFilter")
 
   private def encodeFiber(fiber: BitmaskFiber): BigInt = {
     val valueMask = (BigInt(1) << cfg.dataWidth) - 1
@@ -488,8 +498,6 @@ object EndToEndCycleSimulation extends App {
       var writeRequests = 0L
       var readActiveCycles = 0L
       var writeActiveCycles = 0L
-      val timeoutEdges = 1000000L
-
       dut.io.descriptor.payload.mode #= mode
       dut.io.descriptor.payload.rowCount #= dimension
       dut.io.descriptor.payload.columnCount #= dimension
@@ -620,11 +628,28 @@ object EndToEndCycleSimulation extends App {
       }
 
       require(startEdge >= 0, s"$modeName descriptor was not accepted")
+      val trgsRows = (0 until cfg.peRows).map { row =>
+        s"$row:(state=${dut.io.trgsDebugState(row).toInt}," +
+          s"inFlight=${dut.io.trgsDebugInFlight(row).toLong}," +
+          s"response=${dut.io.trgsDebugResponseActive.toBigInt.testBit(row)}," +
+          s"pending=0x${dut.io.trgsDebugPendingResults(row).toBigInt.toString(16)}," +
+          s"storage=0x${dut.io.trgsDebugStorageBusy(row).toBigInt.toString(16)}," +
+          s"issued=0x${dut.io.trgsDebugMergeIssued(row).toBigInt.toString(16)})"
+      }.mkString(";")
       require(finalEdge >= 0,
-        s"$modeName ${workload.category.name} timed out: " +
+        s"$modeName ${workload.category.name} sample ${workload.sample} timed out: " +
           s"trgtPhase=${dut.io.trgtPhase.toInt}, " +
           s"schedulerBusy=${dut.io.trgtSchedulerBusy.toBoolean}, " +
-          s"fifo=${dut.io.trgtFifoOccupancy.toInt}")
+          s"fifo=${dut.io.trgtFifoOccupancy.toInt}, " +
+          s"trgsAssigned=${dut.io.trgsAssignedTiles.toLong}, " +
+          s"trgsCompleted=${dut.io.trgsCompletedTiles.toLong}, " +
+          s"trgsAllocated=0x${dut.io.trgsAllocated.toBigInt.toString(16)}, " +
+          s"trgsBusy=0x${dut.io.trgsBusy.toBigInt.toString(16)}, " +
+          s"trgsDone=0x${dut.io.trgsDone.toBigInt.toString(16)}, " +
+          s"adapterBusy=${dut.io.trgsAdapterBusy.toBoolean}, " +
+          s"issued=${dut.io.gustavsonIssuedTiles.toLong}, " +
+          s"csrDone=${dut.io.gustavsonDescriptorDone.toBoolean}, " +
+          s"writes=$writeRequests/${expected.size}, rows=$trgsRows")
       require(!dut.io.error.toBoolean,
         s"$modeName ${workload.category.name} reported an RTL error")
       val observedMap = observed.toMap
@@ -658,13 +683,12 @@ object EndToEndCycleSimulation extends App {
         usefulMacs(workload), checksum(observed))
     }
 
-    for (workload <- workloads if selectedCategories.contains(workload.category);
-         mode <- selectedModes) {
+    for (workload <- selectedWorkloads; mode <- selectedModes) {
       measurements += run(workload, mode)
     }
   }
 
-  for (workload <- workloads if selectedCategories.contains(workload.category)) {
+  for (workload <- selectedWorkloads) {
     val selected = measurements.filter(measurement =>
       measurement.category == workload.category &&
         measurement.sample == workload.sample)
@@ -680,7 +704,8 @@ object EndToEndCycleSimulation extends App {
                      (select: Measurement => Long): Double = {
     val selected = measurements.filter(measurement =>
       measurement.category == category && measurement.mode == mode)
-    require(selected.size == samplesPerCategory)
+    val expectedSamples = selectedWorkloads.count(_.category == category)
+    require(selected.size == expectedSamples)
     selected.map(select).sum.toDouble / selected.size
   }
 

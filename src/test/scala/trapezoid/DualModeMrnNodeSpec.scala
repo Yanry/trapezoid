@@ -52,4 +52,61 @@ class DualModeMrnNodeSpec extends AnyFunSuite {
       assert(!dut.io.output.payload.consumeRight.toBoolean)
     }
   }
+
+  test("temporal merge can preempt a held spatial payload") {
+    simConfig.compile(new DualModeMrnLevel(cfg, level = 0, Map(0 -> 1)))
+      .doSim { dut =>
+        dut.clockDomain.forkStimulus(10)
+        dut.io.input.valid #= true
+        dut.io.input.payload.mode #= TrapezoidDataflow.TrGs
+        dut.io.input.payload.endOfTile #= false
+        dut.io.input.payload.overflow #= false
+        dut.io.input.payload.selectedColumns #= 0
+        dut.io.input.payload.effectualMacs #= 0
+        dut.io.output.ready #= false
+        for (lane <- 0 until cfg.macLanes) {
+          val entry = dut.io.input.payload.lanes(lane)
+          entry.valid #= false
+          entry.segmentStart #= false
+          entry.row #= 0
+          entry.column #= 0
+          entry.destinationBank #= 0
+          entry.destinationWordOffset #= 0
+          entry.value #= 0
+        }
+        for (port <- 0 until cfg.localBanks) {
+          dut.io.temporalInputs(port).valid #= false
+          dut.io.temporalInputs(port).payload.mode #= MrnNodeMode.GustavsonMerge
+          dut.io.temporalInputs(port).payload.left.valid #= false
+          dut.io.temporalInputs(port).payload.left.row #= 0
+          dut.io.temporalInputs(port).payload.left.column #= 0
+          dut.io.temporalInputs(port).payload.left.value #= 0
+          dut.io.temporalInputs(port).payload.right.valid #= false
+          dut.io.temporalInputs(port).payload.right.row #= 0
+          dut.io.temporalInputs(port).payload.right.column #= 0
+          dut.io.temporalInputs(port).payload.right.value #= 0
+          dut.io.temporalOutputs(port).ready #= true
+        }
+
+        val request = dut.io.temporalInputs(0)
+        request.payload.left.valid #= true
+        request.payload.left.row #= 3
+        request.payload.left.column #= 5
+        request.payload.left.value #= 7
+        request.payload.right.valid #= true
+        request.payload.right.row #= 3
+        request.payload.right.column #= 5
+        request.payload.right.value #= 11
+        request.valid #= true
+        sleep(1)
+        assert(!dut.io.input.ready.toBoolean)
+        assert(request.ready.toBoolean)
+        dut.clockDomain.waitSampling()
+        request.valid #= false
+        while (!dut.io.temporalOutputs(0).valid.toBoolean) {
+          dut.clockDomain.waitSampling()
+        }
+        assert(dut.io.temporalOutputs(0).payload.first.value.toLong == 18)
+      }
+  }
 }

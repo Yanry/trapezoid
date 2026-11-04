@@ -85,9 +85,14 @@ class TrapezoidPERowSpec extends AnyFunSuite {
         dut.io.temporalMrnInputs(0).payload.right.column #= right._3
         dut.io.temporalMrnInputs(0).payload.right.value #= right._4
         dut.io.temporalMrnInputs(0).valid #= true
-        sleep(1)
-        assert(dut.io.temporalMrnInputs(0).ready.toBoolean)
-        assert(dut.io.temporalMrnOutputs(0).valid.toBoolean)
+        while (!dut.io.temporalMrnInputs(0).ready.toBoolean) {
+          dut.clockDomain.waitSampling()
+        }
+        dut.clockDomain.waitSampling()
+        dut.io.temporalMrnInputs(0).valid #= false
+        while (!dut.io.temporalMrnOutputs(0).valid.toBoolean) {
+          dut.clockDomain.waitSampling()
+        }
       }
 
       drive((true, 2, 3, 7), (true, 2, 3, 11))
@@ -482,6 +487,7 @@ class TrapezoidPERowSpec extends AnyFunSuite {
           (result.row.toInt, result.column.toInt) -> result.value.toInt
         }.toMap
         assert(observed == expected.toMap)
+        dut.clockDomain.waitSampling()
       }
     }
   }

@@ -1629,6 +1629,20 @@ class UnifiedEndToEndSystem(
     val trgtFifoOccupancy = out UInt(16 bits)
     val trgtAssignedTiles = out UInt(32 bits)
     val trgtCompletedTiles = out UInt(32 bits)
+    val trgsAssignedTiles = out UInt(32 bits)
+    val trgsCompletedTiles = out UInt(32 bits)
+    val trgsAllocated = out Bits(cfg.peRows bits)
+    val trgsBusy = out Bits(cfg.peRows bits)
+    val trgsDone = out Bits(cfg.peRows bits)
+    val trgsAdapterBusy = out Bool()
+    val gustavsonIssuedTiles = out UInt(32 bits)
+    val gustavsonDescriptorDone = out Bool()
+    val trgsDebugState = out Vec(UInt(3 bits), cfg.peRows)
+    val trgsDebugInFlight = out Vec(UInt(16 bits), cfg.peRows)
+    val trgsDebugResponseActive = out Bits(cfg.peRows bits)
+    val trgsDebugPendingResults = out Vec(Bits(cfg.outputLanes bits), cfg.peRows)
+    val trgsDebugStorageBusy = out Vec(Bits(cfg.localBanks bits), cfg.peRows)
+    val trgsDebugMergeIssued = out Vec(Bits(cfg.localBanks bits), cfg.peRows)
   }
 
   val state = RegInit(UnifiedEndToEndState.Idle)
@@ -1741,6 +1755,48 @@ class UnifiedEndToEndSystem(
     io.trgtFifoOccupancy := 0
     io.trgtAssignedTiles := 0
     io.trgtCompletedTiles := 0
+  }
+  if (includeTrGs) {
+    io.trgsAssignedTiles := trgsScheduler.io.assignedTiles
+    io.trgsCompletedTiles := trgsScheduler.io.completedTiles
+    io.trgsAllocated := trgsScheduler.io.allocated
+    io.trgsBusy := trgsScheduler.io.busy
+    io.trgsAdapterBusy := trgsAdapter.io.busy
+    io.trgsDone := (if (useSharedArray) sharedTile.io.trgsDone
+      else B(0, cfg.peRows bits))
+  } else {
+    io.trgsAssignedTiles := 0
+    io.trgsCompletedTiles := 0
+    io.trgsAllocated := 0
+    io.trgsBusy := 0
+    io.trgsDone := 0
+    io.trgsAdapterBusy := False
+  }
+  if (includeGustavson) {
+    io.gustavsonIssuedTiles := csr.io.issuedTiles
+    io.gustavsonDescriptorDone := csr.io.done
+  } else {
+    io.gustavsonIssuedTiles := 0
+    io.gustavsonDescriptorDone := False
+  }
+  for (row <- 0 until cfg.peRows) {
+    if (useSharedArray) {
+      io.trgsDebugState(row) := sharedTile.io.trgsDebugState(row)
+      io.trgsDebugInFlight(row) := sharedTile.io.trgsDebugInFlight(row)
+      io.trgsDebugPendingResults(row) :=
+        sharedTile.io.trgsDebugPendingResults(row)
+      io.trgsDebugStorageBusy(row) := sharedTile.io.trgsDebugStorageBusy(row)
+      io.trgsDebugMergeIssued(row) := sharedTile.io.trgsDebugMergeIssued(row)
+      io.trgsDebugResponseActive(row) :=
+        sharedTile.io.trgsDebugResponseActive(row)
+    } else {
+      io.trgsDebugState(row) := 0
+      io.trgsDebugInFlight(row) := 0
+      io.trgsDebugPendingResults(row) := 0
+      io.trgsDebugStorageBusy(row) := 0
+      io.trgsDebugMergeIssued(row) := 0
+      io.trgsDebugResponseActive(row) := False
+    }
   }
   doneReg := False
 

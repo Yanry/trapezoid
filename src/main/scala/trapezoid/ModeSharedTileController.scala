@@ -59,6 +59,12 @@ class ModeSharedTileController(
     val trgsAccumulatorCycles = out Vec(UInt(32 bits), cfg.peRows)
     val trgsAccumulatorUpdates = out Vec(UInt(32 bits), cfg.peRows)
     val trgsBankReplayCycles = out Vec(UInt(32 bits), cfg.peRows)
+    val trgsDebugState = out Vec(UInt(3 bits), cfg.peRows)
+    val trgsDebugInFlight = out Vec(UInt(16 bits), cfg.peRows)
+    val trgsDebugResponseActive = out Bits(cfg.peRows bits)
+    val trgsDebugPendingResults = out Vec(Bits(cfg.outputLanes bits), cfg.peRows)
+    val trgsDebugStorageBusy = out Vec(Bits(cfg.localBanks bits), cfg.peRows)
+    val trgsDebugMergeIssued = out Vec(Bits(cfg.localBanks bits), cfg.peRows)
 
     val localBufferOwners = out Vec(LocalBufferOwner(), cfg.peRows)
   }
@@ -147,9 +153,16 @@ class ModeSharedTileController(
     io.trgsAccumulatorCycles(row) := spatial.io.accumulatorCycles
     io.trgsAccumulatorUpdates(row) := spatial.io.accumulatorUpdates
     io.trgsBankReplayCycles(row) := spatial.io.bankReplayCycles
+    io.trgsDebugState(row) := spatial.io.debugState
+    io.trgsDebugInFlight(row) := spatial.io.debugInFlight.resized
+    io.trgsDebugResponseActive(row) := spatial.io.debugResponseActive
+    io.trgsDebugPendingResults(row) := spatial.io.debugPendingResults
+    io.trgsDebugStorageBusy(row) := spatial.io.debugStorageBusy
+    io.trgsDebugMergeIssued(row) := spatial.io.debugMergeIssued
 
     val commandFromTrgt = trgtOwned(row)
     val commandFromTrgs = !commandFromTrgt && trgsSelected
+    val temporalFromTrgs = !commandFromTrgt && trgsOwned(row)
     pe.io.command.valid := Mux(commandFromTrgt,
       scheduler.io.peCommand.valid, Mux(commandFromTrgs,
         spatial.io.peCommand.valid, trip.io.peCommands(row).valid))
@@ -162,38 +175,41 @@ class ModeSharedTileController(
       !commandFromTrgt && !commandFromTrgs
     pe.io.temporalMrnInputs(0).valid := Mux(commandFromTrgt,
       scheduler.io.peTemporalMrnInput.valid,
-      spatial.io.peTemporalMrnInputs(0).valid && commandFromTrgs)
+      spatial.io.peTemporalMrnInputs(0).valid && temporalFromTrgs)
     pe.io.temporalMrnInputs(0).payload := Mux(commandFromTrgt,
       scheduler.io.peTemporalMrnInput.payload,
       spatial.io.peTemporalMrnInputs(0).payload)
     scheduler.io.peTemporalMrnInput.ready :=
       pe.io.temporalMrnInputs(0).ready && commandFromTrgt
     spatial.io.peTemporalMrnInputs(0).ready :=
-      pe.io.temporalMrnInputs(0).ready && commandFromTrgs && !commandFromTrgt
+      pe.io.temporalMrnInputs(0).ready && temporalFromTrgs
     scheduler.io.peTemporalMrnOutput.valid :=
       pe.io.temporalMrnOutputs(0).valid && commandFromTrgt
     scheduler.io.peTemporalMrnOutput.payload :=
       pe.io.temporalMrnOutputs(0).payload
     spatial.io.peTemporalMrnOutputs(0).valid :=
-      pe.io.temporalMrnOutputs(0).valid && commandFromTrgs && !commandFromTrgt
+      pe.io.temporalMrnOutputs(0).valid && temporalFromTrgs
     spatial.io.peTemporalMrnOutputs(0).payload :=
       pe.io.temporalMrnOutputs(0).payload
     pe.io.temporalMrnOutputs(0).ready := Mux(commandFromTrgt,
-      scheduler.io.peTemporalMrnOutput.ready,
-      spatial.io.peTemporalMrnOutputs(0).ready && commandFromTrgs)
+      scheduler.io.peTemporalMrnOutput.ready, Mux(temporalFromTrgs,
+        spatial.io.peTemporalMrnOutputs(0).ready, True))
     for (port <- 1 until cfg.localBanks) {
       pe.io.temporalMrnInputs(port).valid :=
-        spatial.io.peTemporalMrnInputs(port).valid && commandFromTrgs
+        spatial.io.peTemporalMrnInputs(port).valid && temporalFromTrgs
       pe.io.temporalMrnInputs(port).payload :=
         spatial.io.peTemporalMrnInputs(port).payload
       spatial.io.peTemporalMrnInputs(port).ready :=
-        pe.io.temporalMrnInputs(port).ready && commandFromTrgs
+        pe.io.temporalMrnInputs(port).ready && temporalFromTrgs
       spatial.io.peTemporalMrnOutputs(port).valid :=
-        pe.io.temporalMrnOutputs(port).valid && commandFromTrgs
+        pe.io.temporalMrnOutputs(port).valid && temporalFromTrgs
       spatial.io.peTemporalMrnOutputs(port).payload :=
         pe.io.temporalMrnOutputs(port).payload
-      pe.io.temporalMrnOutputs(port).ready :=
-        spatial.io.peTemporalMrnOutputs(port).ready && commandFromTrgs
+      // A clear can release the mode owner while a registered temporal
+      // response is still resident in the PE row.  Drain that stale response
+      // while the row is unowned so it cannot be delivered to the next tile.
+      pe.io.temporalMrnOutputs(port).ready := Mux(temporalFromTrgs,
+        spatial.io.peTemporalMrnOutputs(port).ready, True)
     }
 
     // Response ownership is captured with the command so a clear or mode

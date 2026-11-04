@@ -73,6 +73,7 @@ class GustavsonTileEngine(
   val oldNextValid = RegInit(False)
   val oldFetchIndex = Reg(UInt(tileCfg.entryCountWidth bits)) init 0
   val oldReadPending = RegInit(False)
+  val temporalRequestInFlight = RegInit(False)
   val responseReg = Reg(PERowResponse(cfg))
   val readBankReg = Reg(UInt(bankBits bits)) init 0
   val readBufferReg = RegInit(False)
@@ -204,7 +205,7 @@ class GustavsonTileEngine(
     oldMergeEntry := selectedReadEntry
   }
   temporalMrnInput.valid := state === StreamingGustavsonState.MergeCompare &&
-    (oldAvailable || newAvailable)
+    !temporalRequestInFlight && (oldAvailable || newAvailable)
   temporalMrnInput.payload.mode := MrnNodeMode.GustavsonMerge
   temporalMrnInput.payload.left.valid := oldAvailable
   temporalMrnInput.payload.left.row := oldMergeEntry.row
@@ -215,6 +216,13 @@ class GustavsonTileEngine(
   temporalMrnInput.payload.right.column := newEntry.column
   temporalMrnInput.payload.right.value := newEntry.value
   temporalMrnOutput.ready := state === StreamingGustavsonState.MergeCompare
+
+  when(temporalMrnInput.fire) {
+    temporalRequestInFlight := True
+  }
+  when(temporalMrnOutput.fire) {
+    temporalRequestInFlight := False
+  }
 
   switch(state) {
     is(StreamingGustavsonState.Accept) {
@@ -254,6 +262,7 @@ class GustavsonTileEngine(
         oldNextValid := False
         oldFetchIndex := 0
         oldReadPending := False
+        temporalRequestInFlight := False
         state := StreamingGustavsonState.MergePrepare
       }
     }
@@ -398,6 +407,7 @@ class GustavsonTileEngine(
     oldNextValid := False
     oldFetchIndex := 0
     oldReadPending := False
+    temporalRequestInFlight := False
     when(commandInFlight) { state := StreamingGustavsonState.AbortDrain }
       .otherwise { state := StreamingGustavsonState.Accept }
   }

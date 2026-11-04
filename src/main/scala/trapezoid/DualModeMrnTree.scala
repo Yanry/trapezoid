@@ -28,9 +28,16 @@ class DualModeMrnLevel(
   }
 
   private val reductionDistance = 1 << level
+  private val temporalDemand = temporalPortPositions.keys.toSeq
+    .map(port => io.temporalInputs(port).valid)
+    .foldLeft(False)(_ || _)
   val transformed = Stream(PERowReductionPayload(cfg))
-  transformed.valid := io.input.valid
-  io.input.ready := transformed.ready
+  // A blocked spatial response can keep every MRN level valid while the
+  // accumulator waits for a temporal merge.  Give resident temporal requests
+  // priority and hold the complete spatial payload at this level; otherwise
+  // the two ready/valid paths form a deadlock around the response FIFO.
+  transformed.valid := io.input.valid && !temporalDemand
+  io.input.ready := transformed.ready && !temporalDemand
   transformed.payload.mode := io.input.payload.mode
   transformed.payload.endOfTile := io.input.payload.endOfTile
   transformed.payload.selectedColumns := io.input.payload.selectedColumns
@@ -62,7 +69,7 @@ class DualModeMrnLevel(
       }
       val cell = temporalPort match {
         case Some(port) =>
-          val useTemporal = io.temporalInputs(port).valid && !io.input.valid
+          val useTemporal = io.temporalInputs(port).valid
           val shared = DualModeMrnCell(
             cfg,
             Mux(useTemporal, io.temporalInputs(port).payload.left.valid,
@@ -81,11 +88,16 @@ class DualModeMrnLevel(
               right.column),
             Mux(useTemporal, io.temporalInputs(port).payload.right.value,
               right.value))
-          io.temporalOutputs(port).valid := useTemporal
-          io.temporalOutputs(port).payload := DualModeMrnCell.response(
+          // Temporal traffic uses the same registered MRN boundary as the
+          // spatial tree.  The old direct combinational response made the
+          // SRAM read -> merge -> write path look like a zero-cycle merge and
+          // prevented a real II=1 elastic stream from being formed.
+          val temporalResult = Stream(DualModeMrnResponse(cfg))
+          temporalResult.valid := useTemporal
+          temporalResult.payload := DualModeMrnCell.response(
             cfg, io.temporalInputs(port).payload, shared)
-          io.temporalInputs(port).ready :=
-            !io.input.valid && io.temporalOutputs(port).ready
+          io.temporalInputs(port).ready := temporalResult.ready
+          io.temporalOutputs(port) << temporalResult.m2sPipe()
           shared
         case None =>
           DualModeMrnCell(
@@ -116,7 +128,7 @@ class DualModeMrnLevel(
   * levels implement a segmented prefix reduction.  Keeping the levels as an
   * explicit dual-mode component removes the previous fixed inline tree.  Four
   * existing cells also serve as bank-parallel temporal merge resources while
-  * their spatial levels are idle.
+  * their level holds its spatial payload under temporal arbitration.
   */
 class DualModeMrnTree(cfg: TrapezoidConfig) extends Component {
   val io = new Bundle {

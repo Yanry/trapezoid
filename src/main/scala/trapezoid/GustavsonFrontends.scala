@@ -437,6 +437,12 @@ class TrGsSpatialEngine(
     val accumulatorCycles = out UInt(32 bits)
     val accumulatorUpdates = out UInt(32 bits)
     val bankReplayCycles = out UInt(32 bits)
+    val debugState = out UInt(3 bits)
+    val debugInFlight = out UInt(inFlightWidth bits)
+    val debugResponseActive = out Bool()
+    val debugPendingResults = out Bits(cfg.outputLanes bits)
+    val debugStorageBusy = out Bits(cfg.localBanks bits)
+    val debugMergeIssued = out Bits(cfg.localBanks bits)
     val peCommand = if (externalPe) master(Stream(PERowCommand(cfg))) else null
     val peResponse = if (externalPe) slave(Stream(PERowResponse(cfg))) else null
     val peTemporalMrnInputs = if (externalPe)
@@ -495,6 +501,10 @@ class TrGsSpatialEngine(
   io.accumulatorCycles := accumulatorCycles
   io.accumulatorUpdates := accumulatorUpdates
   io.bankReplayCycles := bankReplayCycles
+  io.debugState := state.asBits.asUInt.resized
+  io.debugInFlight := inFlight
+  io.debugResponseActive := responseActive
+  io.debugPendingResults := pendingResults
 
   val adapted = PERowCommand(cfg)
   adapted.mode := io.command.payload.mode
@@ -607,6 +617,13 @@ class TrGsSpatialEngine(
   val storageOldValid = if (externalAccumulatorStorage && externalPe) {
     Vec((0 until cfg.localBanks).map(_ => RegInit(False)))
   } else null
+  val storageMergeIssued = if (externalAccumulatorStorage && externalPe) {
+    Vec((0 until cfg.localBanks).map(_ => RegInit(False)))
+  } else null
+  io.debugStorageBusy := (if (externalAccumulatorStorage)
+    storageBankBusy.asBits else B(0, cfg.localBanks bits))
+  io.debugMergeIssued := (if (externalAccumulatorStorage && externalPe)
+    storageMergeIssued.asBits else B(0, cfg.localBanks bits))
   val storageUpdateRow = if (externalAccumulatorStorage && externalPe) {
     Vec((0 until cfg.localBanks).map(_ =>
       Reg(UInt(cfg.coordinateWidth bits)) init 0))
@@ -658,7 +675,8 @@ class TrGsSpatialEngine(
       if (externalPe) {
         val oldAvailable = storageOldValid(bank) ||
           io.accumulatorStorage.readResponses(bank).valid
-        temporalMrnInputs(bank).valid := storageBankBusy(bank) && oldAvailable
+        temporalMrnInputs(bank).valid := storageBankBusy(bank) && oldAvailable &&
+          !storageMergeIssued(bank)
         temporalMrnInputs(bank).payload.mode := MrnNodeMode.GustavsonMerge
         temporalMrnInputs(bank).payload.left.valid := True
         temporalMrnInputs(bank).payload.left.row := storageUpdateRow(bank)
@@ -670,6 +688,10 @@ class TrGsSpatialEngine(
         temporalMrnInputs(bank).payload.right.column := storageUpdateColumn(bank)
         temporalMrnInputs(bank).payload.right.value := storageUpdateValue(bank)
         temporalMrnOutputs(bank).ready := True
+
+        when(temporalMrnInputs(bank).fire) {
+          storageMergeIssued(bank) := True
+        }
 
         when(io.accumulatorStorage.readResponses(bank).valid &&
             !temporalMrnOutputs(bank).fire) {
@@ -694,6 +716,7 @@ class TrGsSpatialEngine(
           io.accumulatorStorage.writes(bank).payload.mask := updateMask
           storageBankBusy(bank) := False
           storageOldValid(bank) := False
+          storageMergeIssued(bank) := False
           completedRmw(bank) := True
         }
       } else {
@@ -828,6 +851,7 @@ class TrGsSpatialEngine(
                 storageUpdateRow(bank) := result.row
                 storageUpdateColumn(bank) := result.column
                 storageOldValid(bank) := False
+                storageMergeIssued(bank) := False
               }
             }
           } otherwise {
@@ -1173,7 +1197,10 @@ class TrGsSpatialEngine(
     if (externalAccumulatorStorage) {
       for (bank <- 0 until cfg.localBanks) storageBankBusy(bank) := False
       if (externalPe) {
-        for (bank <- 0 until cfg.localBanks) storageOldValid(bank) := False
+        for (bank <- 0 until cfg.localBanks) {
+          storageOldValid(bank) := False
+          storageMergeIssued(bank) := False
+        }
       }
       outputFetchPending := False
       outputLineLoaded := False

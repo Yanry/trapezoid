@@ -1,6 +1,7 @@
 package trapezoid
 
 import org.scalatest.funsuite.AnyFunSuite
+import spinal.core._
 import spinal.core.sim._
 
 import scala.collection.mutable
@@ -157,6 +158,56 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
         a = Seq((4, 0, 1)), b = Seq((0, 0, 0, 1)))
       collect(dut)
       assert(dut.io.overflow.toBoolean)
+    }
+  }
+
+  test("TrGT temporal merge accepts one ordered decision per cycle") {
+    simConfig.compile {
+      val dut = new GustavsonTileEngine(tileCfg)
+      dut.temporalMrnInput.valid.simPublic()
+      dut.temporalMrnInput.ready.simPublic()
+      dut.temporalMrnInput.payload.left.valid.simPublic()
+      dut.temporalMrnInput.payload.right.valid.simPublic()
+      dut
+    }.doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.result.ready #= true
+      clearPayload(dut)
+
+      val pairedRequestCycles = mutable.ArrayBuffer.empty[Long]
+      var cycle = 0L
+      val monitor = fork {
+        while (pairedRequestCycles.size < 4 && cycle < 500) {
+          sleep(1)
+          if (dut.temporalMrnInput.valid.toBoolean &&
+              dut.temporalMrnInput.ready.toBoolean &&
+              dut.temporalMrnInput.payload.left.valid.toBoolean &&
+              dut.temporalMrnInput.payload.right.valid.toBoolean) {
+            pairedRequestCycles += cycle
+          }
+          dut.clockDomain.waitSampling()
+          cycle += 1
+        }
+      }
+
+      issue(dut, TrapezoidDataflow.TrGt, endOfTile = false,
+        a = (0 until 4).map(k => (0, k, 2)),
+        b = (0 until 4).map(k => (k, k, k, k + 1)))
+      while (!dut.io.command.ready.toBoolean) dut.clockDomain.waitSampling()
+      issue(dut, TrapezoidDataflow.TrGt, endOfTile = true,
+        a = (0 until 4).map(k => (0, k, 2)),
+        b = (0 until 4).map(k => (k, k, k, k + 1)))
+      val observed = collect(dut)
+      monitor.join()
+
+      assert(observed.map(x => (x._2, x._3)) ==
+        Seq((0, 4L), (1, 8L), (2, 12L), (3, 16L)))
+      assert(pairedRequestCycles.size == 4)
+      assert(pairedRequestCycles.sliding(2).forall {
+        case Seq(left, right) => right == left + 1
+        case _ => true
+      }, s"temporal merge was not II=1: ${pairedRequestCycles.mkString(",")}")
     }
   }
 

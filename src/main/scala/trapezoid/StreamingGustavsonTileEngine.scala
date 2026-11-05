@@ -73,7 +73,10 @@ class GustavsonTileEngine(
   val oldNextValid = RegInit(False)
   val oldFetchIndex = Reg(UInt(tileCfg.entryCountWidth bits)) init 0
   val oldReadPending = RegInit(False)
-  val temporalRequestInFlight = RegInit(False)
+  // The temporal MRN response owns one elastic stage.  Track accepted merge
+  // decisions independently from committed SRAM writes so the next pair of
+  // stream heads can enter while the previous result is written back.
+  val temporalOutstanding = Reg(UInt(2 bits)) init 0
   val responseReg = Reg(PERowResponse(cfg))
   val readBankReg = Reg(UInt(bankBits bits)) init 0
   val readBufferReg = RegInit(False)
@@ -204,8 +207,18 @@ class GustavsonTileEngine(
   when(!oldEntryValid && oldReadPending) {
     oldMergeEntry := selectedReadEntry
   }
-  temporalMrnInput.valid := state === StreamingGustavsonState.MergeCompare &&
-    !temporalRequestInFlight && (oldAvailable || newAvailable)
+  val sameCoordinate = DualModeMrnPolicy.sameCoordinate(
+    oldAvailable, oldMergeEntry.row, oldMergeEntry.column,
+    newAvailable, newEntry.row, newEntry.column)
+  val oldBeforeNew = oldAvailable && newAvailable &&
+    DualModeMrnPolicy.leftBefore(
+      oldMergeEntry.row, oldMergeEntry.column, newEntry.row, newEntry.column)
+  val consumeOld = sameCoordinate ||
+    (oldAvailable && (!newAvailable || oldBeforeNew))
+  val consumeNew = sameCoordinate || (!consumeOld && newAvailable)
+  val mergeActive = state === StreamingGustavsonState.MergeCompare
+  temporalMrnInput.valid := mergeActive &&
+    (oldAvailable || newAvailable)
   temporalMrnInput.payload.mode := MrnNodeMode.GustavsonMerge
   temporalMrnInput.payload.left.valid := oldAvailable
   temporalMrnInput.payload.left.row := oldMergeEntry.row
@@ -215,13 +228,14 @@ class GustavsonTileEngine(
   temporalMrnInput.payload.right.row := newEntry.row
   temporalMrnInput.payload.right.column := newEntry.column
   temporalMrnInput.payload.right.value := newEntry.value
-  temporalMrnOutput.ready := state === StreamingGustavsonState.MergeCompare
+  temporalMrnOutput.ready := mergeActive || io.clear ||
+    state === StreamingGustavsonState.AbortDrain
 
-  when(temporalMrnInput.fire) {
-    temporalRequestInFlight := True
-  }
-  when(temporalMrnOutput.fire) {
-    temporalRequestInFlight := False
+  when(mergeActive) {
+    switch(temporalMrnInput.fire ## temporalMrnOutput.fire) {
+      is(B"10") { temporalOutstanding := temporalOutstanding + 1 }
+      is(B"01") { temporalOutstanding := temporalOutstanding - 1 }
+    }
   }
 
   switch(state) {
@@ -262,7 +276,7 @@ class GustavsonTileEngine(
         oldNextValid := False
         oldFetchIndex := 0
         oldReadPending := False
-        temporalRequestInFlight := False
+        temporalOutstanding := 0
         state := StreamingGustavsonState.MergePrepare
       }
     }
@@ -287,7 +301,7 @@ class GustavsonTileEngine(
     }
 
     is(StreamingGustavsonState.MergeCompare) {
-      when(!oldAvailable && !newAvailable) {
+      when(!oldAvailable && !newAvailable && temporalOutstanding === 0) {
         entryCount := writeIndex
         activeBuffer := !activeBuffer
         when(finalCommand) {
@@ -302,65 +316,72 @@ class GustavsonTileEngine(
         } otherwise {
           state := StreamingGustavsonState.Accept
         }
-      } elsewhen(temporalMrnOutput.fire) {
-        val canStore = writeIndex < tileCfg.accumulatorEntries
-        writeEnable := canStore && temporalMrnOutput.payload.first.valid
-        writeEntry.row := temporalMrnOutput.payload.first.row
-        writeEntry.column := temporalMrnOutput.payload.first.column
-        writeEntry.value := temporalMrnOutput.payload.first.value
-        when(canStore) {
-          writeIndex := writeIndex + 1
-        } otherwise {
-          overflowReg := True
+      } otherwise {
+        when(temporalMrnOutput.fire) {
+          val canStore = writeIndex < tileCfg.accumulatorEntries
+          writeEnable := canStore && temporalMrnOutput.payload.first.valid
+          writeEntry.row := temporalMrnOutput.payload.first.row
+          writeEntry.column := temporalMrnOutput.payload.first.column
+          writeEntry.value := temporalMrnOutput.payload.first.value
+          when(canStore) {
+            writeIndex := writeIndex + 1
+          } otherwise {
+            overflowReg := True
+          }
         }
-        when(temporalMrnOutput.payload.consumeRight) {
-          newIndex := newIndex + 1
-        }
-        when(oldReadPending) {
-          oldReadArrivalConsumed := True
-        }
-        when(temporalMrnOutput.payload.consumeLeft) {
-          when(oldEntryValid) {
-            when(oldNextValid) {
-              oldEntry := oldNextEntry
-              oldEntryValid := True
-              oldNextValid := False
-              when(oldReadPending) {
-                oldNextEntry := selectedReadEntry
-                oldNextValid := True
+
+        // The comparator decision is a control lookahead for the registered
+        // MRN result.  Advancing on request acceptance, instead of waiting for
+        // the response, allows one ordered merge decision per cycle.
+        when(temporalMrnInput.fire) {
+          when(consumeNew) {
+            newIndex := newIndex + 1
+          }
+          when(oldReadPending) {
+            oldReadArrivalConsumed := True
+          }
+          when(consumeOld) {
+            when(oldEntryValid) {
+              when(oldNextValid) {
+                oldEntry := oldNextEntry
+                oldEntryValid := True
+                oldNextValid := False
+                when(oldReadPending) {
+                  oldNextEntry := selectedReadEntry
+                  oldNextValid := True
+                }
+              } elsewhen(oldReadPending) {
+                oldEntry := selectedReadEntry
+                oldEntryValid := True
+              } otherwise {
+                oldEntryValid := False
               }
-            } elsewhen(oldReadPending) {
-              oldEntry := selectedReadEntry
-              oldEntryValid := True
             } otherwise {
               oldEntryValid := False
             }
-          } otherwise {
-            oldEntryValid := False
-          }
-          when(oldIndex + 1 < oldCount) {
-            oldIndex := oldIndex + 1
-          } otherwise {
-            oldIndex := oldCount
-          }
-          when(oldFetchIndex < oldCount) {
-            oldReadIssue := True
-          }
-        } otherwise {
-          when(oldReadPending) {
-            when(oldEntryValid) {
-              oldNextEntry := selectedReadEntry
-              oldNextValid := True
+            when(oldIndex + 1 < oldCount) {
+              oldIndex := oldIndex + 1
             } otherwise {
-              oldEntry := selectedReadEntry
-              oldEntryValid := True
-              when(oldFetchIndex < oldCount) {
-                oldReadIssue := True
+              oldIndex := oldCount
+            }
+            when(oldFetchIndex < oldCount) {
+              oldReadIssue := True
+            }
+          } otherwise {
+            when(oldReadPending) {
+              when(oldEntryValid) {
+                oldNextEntry := selectedReadEntry
+                oldNextValid := True
+              } otherwise {
+                oldEntry := selectedReadEntry
+                oldEntryValid := True
+                when(oldFetchIndex < oldCount) {
+                  oldReadIssue := True
+                }
               }
             }
           }
         }
-        state := StreamingGustavsonState.MergeCompare
       }
     }
 
@@ -407,7 +428,7 @@ class GustavsonTileEngine(
     oldNextValid := False
     oldFetchIndex := 0
     oldReadPending := False
-    temporalRequestInFlight := False
+    temporalOutstanding := 0
     when(commandInFlight) { state := StreamingGustavsonState.AbortDrain }
       .otherwise { state := StreamingGustavsonState.Accept }
   }

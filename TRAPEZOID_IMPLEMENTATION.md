@@ -199,7 +199,7 @@ IP operation 使用这些 level 做 segmented reduction。TrGt/TrGs 当前命令
 
 `ModeSharedTileController` 在 TrGT 拥有 PE row 时把 streaming ordered merge 接到 port 0；TrGS 拥有 PE row 时把四个 accumulator bank 分别接到四个 temporal port。TrGT 使用同一 comparator/adder/mux 比较旧 partial 与新 PE response；TrGS 从同步 local SRAM 取得 old partial 后，通过对应 MRN cell 完成 `old + delta`。SRAM response 遇到 spatial backpressure 时先锁存，直到 temporal request 真正握手，因此不会丢失单周期 read response。TrIP、DenseIp 和裸 PE array 明确 tie-off 这些端口。
 
-TrGT temporal response 由 `newIndex/oldIndex`、inactive-buffer write port 和状态寄存器构成流水边界；旧的 `MergeNodeWait` 和 production 中的独立 `DualModeMrnNode` 实例均已删除。旧 partial stream 使用 `head + lookahead` 两项预取队列，能够隐藏同步 SRAM 读延迟；但当前 merge decision 有数据相关反馈，并且 controller 只允许一个 temporal request outstanding，因此加上真实 response register 后还没有达到论文式 steady-state II=1。TrGS 仍保留 slot-valid、bank replay、SRAM read/write 和输出扫描 FSM，但 shared 主路径中已有 slot 的 RMW 加法不再由外围独立 adder 完成；同 bank 后续更新等待前一个 temporal merge 写回，四个 bank 仍可并行。`DualModeMrnNode` 类只保留为单 cell 独立测试 wrapper。没有综合数据时不能把物理复用直接宣称为已验证的面积或功耗下降。
+TrGT temporal merge 已把 request decision 和 response commit 解耦：request 握手时使用与 MRN cell 相同的坐标 policy 推进 `newIndex/oldIndex` 和 `head + lookahead` 旧流，下一拍寄存 response 按序写 inactive SRAM。这样上一项提交与下一项发射可以同拍发生；直接回归验证了旧流和新流同时有效时连续 4 拍接受 4 个 merge decision，即 steady-state request II=1。`temporalOutstanding` 保证最后一个寄存 response 提交后才切换 ping-pong buffer，clear/abort 也会排空旧 response。当前 control lookahead 仍在 controller 复制一份坐标比较，而不是由有状态 MRN node 直接管理 K 路 stream head，因此面积和控制结构还不等同于论文原生 merge tree。TrGS 仍保留 slot-valid、bank replay、SRAM read/write 和输出扫描 FSM，但 shared 主路径中已有 slot 的 RMW 加法不再由外围独立 adder 完成；同 bank 后续更新等待前一个 temporal merge 写回，四个 bank 仍可并行。`DualModeMrnNode` 类只保留为单 cell 独立测试 wrapper。没有综合数据时不能把物理复用直接宣称为已验证的面积或功耗下降。
 
 这不是一个为每个输出 column 配置的完整 Gustavson accumulator。跨命令、跨 tile 的保留和写回由 Gustavson 前端、local buffer 或系统级结果路径负责。
 
@@ -391,22 +391,22 @@ final C write response consumed
 - 论文原始 FPGA/ASIC 的频率、NoC 和功耗；
 - 128-row full paper array 的已完成周期结果，除非确实完成对应仿真。
 
-2026-11-04 在 TrGT/TrGS 共享四端口 temporal MRN、寄存 temporal response 和 temporal-priority level 仲裁上重新完成真实 Verilator 验证。72 个 case（6 类 x 4 mode x 3 samples）的结果、write 数和 checksum 全部通过；小规模 RTL 使用 2 个 refill channel 和每 bank 2 个 MSHR。仲裁版 RTL 的一次冷编译约 523 秒；最终全量运行命中缓存，72-case RTL 仿真约 202 秒，含 RTL 生成和缓存加载的完整命令约 229 秒。这些主机时间不计入硬件周期。下面是本轮 3 个 sample 的平均周期结果：
+2026-11-05 在 TrGT/TrGS 共享四端口 temporal MRN、寄存 temporal response、temporal-priority level 仲裁以及 TrGT request/commit 重叠控制上重新完成真实 Verilator 验证。72 个 case（6 类 x 4 mode x 3 samples）的结果、write 数和 checksum 全部通过；小规模 RTL 使用 2 个 refill channel 和每 bank 2 个 MSHR。本轮 Unified RTL 冷编译约 540 秒，72-case RTL 仿真约 155 秒，包含 RTL 生成、编译和仿真的完整命令约 719 秒。这些主机时间不计入硬件周期。下面是本轮 3 个 sample 的平均周期结果：
 
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
 | HS x HS | 1050.0 | 730.0 | 402.0 | 350.0 |
-| HS x MS | 1063.7 | 743.7 | 492.7 | 350.0 |
-| HS x D | 1095.0 | 775.0 | 897.0 | 350.0 |
-| MS x MS | 1470.7 | 1148.0 | 2515.7 | 1884.3 |
-| MS x D | 1836.0 | 1500.0 | 17332.3 | 2420.3 |
-| D x D | 1852.0 | 1916.0 | 43997.0 | 7328.0 |
+| HS x MS | 1063.7 | 743.7 | 481.3 | 350.0 |
+| HS x D | 1095.0 | 775.0 | 777.0 | 350.0 |
+| MS x MS | 1470.7 | 1148.0 | 2292.7 | 1884.3 |
+| MS x D | 1836.0 | 1500.0 | 10865.3 | 2420.3 |
+| D x D | 1852.0 | 1916.0 | 30560.0 | 7328.0 |
 
 这些数字来自同一个共享 `ModeSharedTileController`、同一套 PE row/local storage、cluster ROB、双 refill channel 和 cold-cache 模型。`HS x MS/D` 下 TrGS 最快，`MS x MS/D` 下 TrIP 最快，`D x D` 下 DenseIp 最快；这三组推荐方向与论文一致。`HS x HS` 仍是 TrGS 的 350 cycle 小于 TrGT 的 402 cycle，原因是 16x16、0.39% A 只有一个非零，TrGT 的 subrow packing 没有第二条短 row 可合并，却仍要完成 CSR 扫描、同步 local-buffer 读和 packed-group close。其 first C write 为 393 cycle，而 TrGS 为 109 cycle。
 
-DenseIp 和 TrIp 周期与上一轮完全一致，因为它们不使用 temporal MRN。TrGS 的四 bank RMW 可并行，只有包含重复 accumulator 更新的类别增加约 1 cycle。TrGT 的周期明显增加，尤其是 `MS x D` 和 `D x D`：旧实现把 temporal response 当作同周期组合结果，当前实现加入真实寄存边界后，单 outstanding、反馈相关的 ordered merge 暴露出吞吐瓶颈。这个结果比零周期旁路更接近可综合时序，但还没有达到论文的 merge-control II=1，应作为下一步优化重点。
+DenseIp、TrIp 和 TrGS 与上一轮完全一致，因为本轮只修改 TrGT ordered merge 控制。与寄存 response 但逐项等待的上一版相比，TrGT 的 `HS x MS` 从 492.7 降到 481.3，`HS x D` 从 897.0 降到 777.0，`MS x MS` 从 2515.7 降到 2292.7，`MS x D` 从 17332.3 降到 10865.3，`D x D` 从 43997.0 降到 30560.0。高密度类别改善最大，因为它们有更多 old/new merge decision 可与 response commit 重叠。当前仍慢于论文推荐 mode：TrGT 前端还是每 subrow 一个混合 B FIFO，加上跨 command ping-pong partial stream；尚未实现论文中每个 TrGT subrow 按 K 个 A nonzero 划分 K 路 B stream、由有状态 radix-K merge subtree 直接选择 head 的结构。
 
-完整双 group B-window、双 refill channel、cache 计数和最终 C checksum 仍全部通过。调试过程中新增 `--sample=<index>` 和 `--timeout=<cycles>`，超时时会报告 TrGS assigned/completed/allocated、各 row state、PE in-flight、pending result 和 SRAM merge 状态。本次 7.1 命令为 `sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation --scale=small --samples=3'`，完整输出保存在 `/tmp/trapezoid-e2e-small-20261104-mrn-arbitrated-final.log`。
+完整双 group B-window、双 refill channel、cache 计数和最终 C checksum 仍全部通过。调试参数 `--sample=<index>` 和 `--timeout=<cycles>` 可在超时时报告 TrGS assigned/completed/allocated、各 row state、PE in-flight、pending result 和 SRAM merge 状态。本次 7.1 命令为 `sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation --scale=small --samples=3'`，完整输出保存在 `/tmp/trapezoid-e2e-small-20261104-mrn-ii1.log`。
 
 ### 7.2 `PaperSinglePERowCycleSimulation`
 
@@ -438,7 +438,7 @@ scripts/run-paper-single-perow.sh
 - `TrGs`：一个 A nonzero 配合最多一个 B cache line；
 - `TrGt`：一个 B column 配合 local bank 分组的 A K indices。
 
-真实 RTL 结果于 2026-11-04 在带四个寄存 temporal 复用端口、temporal-priority 仲裁、无额外 ingress 的 7-level `DualModeMrnTree` 上重新验证，全部 24 个 mode/category case 的 checksum、command/response 数、output coordinate 数和 useful MAC 数一致。结果如下，单元为 cycle：
+真实 RTL 结果于 2026-11-05 在带四个寄存 temporal 复用端口、temporal-priority 仲裁、无额外 ingress 的 7-level `DualModeMrnTree` 上重新验证，全部 24 个 mode/category case 的 checksum、command/response 数、output coordinate 数和 useful MAC 数一致。结果如下，单元为 cycle：
 
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
@@ -459,7 +459,7 @@ scripts/run-paper-single-perow.sh
 
 测试还输出 `controlPrepareCycles`、`route`、`MAC`、`MRN`、`response` 五个 counter，以及 `commandCount`、`responseCount`、`usefulMacs`、`laneSlots` 和 checksum。`controlPrepareCycles` 表示 cold route 阻塞；其余四个是各 stage 持有 valid payload 的 occupancy delta，不是互斥阶段延迟，也不包含 CSR/DMA/cache/C write。完整端到端周期仍以 7.1 的最终 C write response 为准。
 
-本轮脚本重新生成并编译 paper RTL：独立 RTL 生成约 299 秒，Verilator 编译约 581 秒，RTL 仿真约 120 秒，完整命令实际耗时约 1004 秒。运行时间不属于表中的硬件 cycle。生成的 RTL 中正好有 7 个串联的 `DualModeMrnLevel`，没有 tree ingress register，也没有 production `DualModeMrnNode` 实例；paper 配置的四个 temporal port 都连接 level-0 不同 cell。detailed table 中每个 workload 的 `mrnCycles` 仍等于有效 command occupancy，说明 temporal 仲裁空闲时不改变空间路径的 II=1 和 backpressure 语义。完整输出保存在 `/tmp/trapezoid-paper-single-perow-20261104-mrn-arbitrated.log`。
+本轮脚本重新生成并编译 paper RTL：RTL 生成约 1 秒，Verilator 编译约 626 秒，RTL 仿真约 120 秒，完整命令实际耗时约 749 秒。运行时间不属于表中的硬件 cycle。生成的 RTL 中正好有 7 个串联的 `DualModeMrnLevel`，没有 tree ingress register，也没有 production `DualModeMrnNode` 实例；paper 配置的四个 temporal port 都连接 level-0 不同 cell。detailed table 中每个 workload 的 `mrnCycles` 仍等于有效 command occupancy，说明 temporal 仲裁空闲时不改变空间路径的 II=1 和 backpressure 语义。7.2 不经过 `GustavsonTileEngine` 的跨 command temporal merge，因此本轮 24 个周期与上一轮一致。完整输出保存在 `/tmp/trapezoid-paper-single-perow-20261105-mrn-ii1.log`。
 
 ### 7.3 Full paper array 的状态
 
@@ -499,7 +499,7 @@ TrIP 已有两级 descriptor elastic FIFO、独立 route metadata FIFO、A/B con
 
 PE row 已使用精确 `log2(macLanes)` 深度的 `DualModeMrnTree`，没有额外全宽 ingress register；每一级包含 comparator、门控 adder、mux 和 elastic register。TrGT ordered merge 使用 port 0；TrGS 四 bank SRAM RMW 使用四个 temporal port，shared 主路径不再为 old+delta 复制独立 adder。temporal response 现在有真实 elastic register，level 仲裁可以在空间 pipeline 被 response backpressure 填满时暂停空间 payload 并完成 temporal RMW，避免环形死锁；无 owner 时还会 drain clear 前遗留的 temporal response。
 
-仍有差异：TrGS 的 slot 管理、bank replay、SRAM 控制和输出扫描保留在外围 FSM，standalone legacy 配置也仍保留本地 accumulator arithmetic；当前 temporal 端口是从已有 tree cell 中静态选取，并非论文 RTL 的已知逐级 merge-control 实现。TrGT ordered merge 只有一个 temporal request outstanding，compare/consume 反馈要等寄存 response 返回，所以 7.1 高密度类别还没有论文式 II=1。SRAM BlackBox 尚未映射目标工艺 macro 并验证真实端口、读延迟和功耗，MRN 复用的真实面积、关键路径和动态功耗也仍需综合与 activity-based power analysis。
+仍有差异：TrGS 的 slot 管理、bank replay、SRAM 控制和输出扫描保留在外围 FSM，standalone legacy 配置也仍保留本地 accumulator arithmetic；当前 temporal 端口是从已有 tree cell 中静态选取，并非论文 RTL 的已知逐级 merge-control 实现。TrGT 已能让 request decision 与上一拍 response commit 重叠并达到 request II=1，但 controller 为提前推进 head 复制了坐标比较，且只合并“旧 ping-pong partial stream + 当前 PE response”两路流；它还不是论文中每个 subrow 的 K 路 B FIFO head 直接进入 radix-K merge subtree 的结构。SRAM BlackBox 尚未映射目标工艺 macro 并验证真实端口、读延迟和功耗，MRN 复用的真实面积、关键路径和动态功耗也仍需综合与 activity-based power analysis。
 
 cache cluster 已有 client credit、cache 内 request ordering、跨 cluster client ROB、每 bank 多个 MSHR（small 为 2、paper 为 4）、多个 refill channels（small 为 2、paper 为 4）以及 bank/way SRAM。它仍缺少同地址 miss coalescing、同 set 冲突 replay、真实 HBM channel mapping 和论文内存网络时序。
 
@@ -534,7 +534,7 @@ utilization = usefulMacs / laneSlots
 
 1. 将 TrGT descriptor/cursor/valid 控制面和现有 B group `readSync` memory 映射到目标工艺的同步 SRAM BlackBox，增加多 request issue，使 background group 的整组预取能真正与 execute group steady-state 重叠。
 2. 将当前已能工作的 paper-width 组合式 Benes route solver 进一步拆成真正逐级的 metadata/control pipeline，使图遍历本身也满足 II=1，并对每级 switch control 做综合面积、时序和功耗比较。
-3. 在已完成四端口 MRN 算术复用、寄存 response 和无死锁 level 仲裁的基础上，先把 TrGT compare/consume 反馈改成带 request tag/context FIFO 的多 outstanding merge-control，恢复 steady-state II=1；再把 TrGS 的 slot/replay/output 控制统一到同一套 merge-control，并统一 standalone 与 mode-shared 路径。随后综合比较复用前后的面积、关键路径和 switching activity。
+3. 在已完成四端口 MRN 算术复用、寄存 response、无死锁 level 仲裁和 TrGT request II=1 的基础上，把 TrGT 每个 subrow 的单一混合 FIFO 拆成按 A nonzero/K coordinate 索引的多 stream head buffer；让 stateful radix-K MRN node 自己完成 head compare/consume，删除 controller 中复制的 lookahead comparator 和跨 command 全流 ping-pong merge。再把 TrGS 的 slot/replay/output 控制统一到同一套 merge-control，并统一 standalone 与 mode-shared 路径。随后综合比较复用前后的面积、关键路径和 switching activity。
 4. 在现有多 MSHR/多 refill channel 上增加同地址 miss coalescing、同 set/bank replay、channel QoS 和真实 DMA burst/channel mapping。
 5. 将 cache replacement、Gustavson partial buffers 等剩余 inferred memory 也绑定为目标工艺/FPGA memory macro，验证端口数、读延迟、write mask、冲突与初始化语义。
 6. 为 7.2 增加可选的连续 warm-tile 模式，与当前默认 cold-tile 结果并列输出，量化 control cache 在真实 tile sequence 中的命中收益。

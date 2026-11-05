@@ -196,6 +196,7 @@ class GustavsonBRowCacheAdapter(
     adapted.mode := commandReg.mode
     adapted.endOfTile := abortingTile ||
       (lastLine && commandReg.endOfTile && (!trGtMode || trGtLineComplete))
+    adapted.responseTag := 0
     adapted.trip := TrIpPayload(cfg).getZero
     for (index <- 0 until cfg.macLanes) {
       adapted.gustavson.a(index).valid := !abortingTile && commandReg.a.valid &&

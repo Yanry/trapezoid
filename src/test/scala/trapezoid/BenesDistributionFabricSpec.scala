@@ -188,10 +188,18 @@ class BenesDistributionFabricSpec extends AnyFunSuite {
             expected(output) = payload(60 + source)
           }
           dut.io.start.valid #= true
-          while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
-          dut.clockDomain.waitSampling()
+          var accepted = false
+          while (!accepted) {
+            sleep(1)
+            accepted = dut.io.start.ready.toBoolean
+            dut.clockDomain.waitSampling()
+          }
+          sleep(1)
           dut.io.start.valid #= false
-          while (!dut.io.result.valid.toBoolean) dut.clockDomain.waitSampling()
+          while (!dut.io.result.valid.toBoolean) {
+            dut.clockDomain.waitSampling()
+            sleep(1)
+          }
           assert(dut.io.result.payload.routable.toBoolean,
             s"pipelined mapping $mapping was reported unroutable")
           for (output <- 0 until cfg.macLanes) {

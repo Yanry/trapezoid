@@ -96,6 +96,190 @@ class BankedGustavsonBFifoCore(cfg: TrapezoidConfig, depth: Int)
   }
 }
 
+/** K independent B-row streams packed into each physical local-buffer bank.
+  *
+  * Every stationary A value owns a virtual FIFO.  One elastic head register
+  * per virtual FIFO exposes all K candidates to a minimum-coordinate selector,
+  * while the remaining entries share the bank SRAM.  The physical bank still
+  * performs at most one read and one write per cycle.
+  */
+class BankedGustavsonBMergeFifoCore(cfg: TrapezoidConfig) extends Component {
+  private val sourcesPerBank = cfg.macLanesPerSubrow
+  private val sourceIndexWidth = scala.math.max(1, log2Up(sourcesPerBank))
+  private val depthPerSource = cfg.localDepthPerBank / sourcesPerBank
+  private val pointerWidth = scala.math.max(1, log2Up(depthPerSource))
+  private val sourceCountWidth = log2Up(depthPerSource + 1)
+  private val bankCountWidth = log2Up(cfg.localDepthPerBank + 1)
+  private val recordWidth = GustavsonB(cfg).getBitsWidth
+  require((sourcesPerBank & (sourcesPerBank - 1)) == 0,
+    "TrGT virtual source count must be a power of two")
+  require(cfg.localDepthPerBank % sourcesPerBank == 0)
+  require(depthPerSource >= 2,
+    "each TrGT B-row stream needs at least two local-buffer entries")
+  require(recordWidth <= cfg.localLineWidth)
+
+  val io = new Bundle {
+    val clear = in Bool()
+    val active = in Bool()
+    val sourcesClosed = in Bool()
+    val sourceActive = in Vec(Bits(sourcesPerBank bits), cfg.localBanks)
+    val storage = master(LocalBufferBus(cfg))
+    val pushes = Vec(slave(Stream(GustavsonB(cfg))), cfg.localBanks)
+    val pops = Vec(master(Stream(GustavsonB(cfg))), cfg.localBanks)
+    val occupancy = out Vec(UInt(bankCountWidth bits), cfg.localBanks)
+  }
+
+  val readPointers = Vec((0 until cfg.localBanks).map(_ =>
+    Vec((0 until sourcesPerBank).map(_ =>
+      Reg(UInt(pointerWidth bits)) init 0))))
+  val writePointers = Vec((0 until cfg.localBanks).map(_ =>
+    Vec((0 until sourcesPerBank).map(_ =>
+      Reg(UInt(pointerWidth bits)) init 0))))
+  val storedCounts = Vec((0 until cfg.localBanks).map(_ =>
+    Vec((0 until sourcesPerBank).map(_ =>
+      Reg(UInt(sourceCountWidth bits)) init 0))))
+  val totalCounts = Vec((0 until cfg.localBanks).map(_ =>
+    Vec((0 until sourcesPerBank).map(_ =>
+      Reg(UInt(sourceCountWidth bits)) init 0))))
+  val headValids = Vec((0 until cfg.localBanks).map(_ =>
+    Vec((0 until sourcesPerBank).map(_ => RegInit(False)))))
+  val headPayloads = Vec((0 until cfg.localBanks).map(_ =>
+    Vec((0 until sourcesPerBank).map(_ => Reg(GustavsonB(cfg))))))
+  val readPending = Vec((0 until cfg.localBanks).map(_ => RegInit(False)))
+  val readSource = Vec((0 until cfg.localBanks).map(_ =>
+    Reg(UInt(sourceIndexWidth bits)) init 0))
+  val previousActive = RegNext(io.active) init True
+  val deactivated = previousActive && !io.active
+
+  def physicalAddress(source: UInt, pointer: UInt): UInt =
+    (source.resize(cfg.localAddressWidth) * depthPerSource +
+      pointer.resize(cfg.localAddressWidth)).resized
+
+  for (bank <- 0 until cfg.localBanks) {
+    val pushSource = io.pushes(bank).payload.aIndex(
+      sourceIndexWidth - 1 downto 0)
+    val pushHasSpace = totalCounts(bank)(pushSource) =/=
+      U(depthPerSource, sourceCountWidth bits)
+    io.pushes(bank).ready := !io.clear && io.active && pushHasSpace
+
+    val selectedValid = Bool()
+    val selectedSource = UInt(sourceIndexWidth bits)
+    val selectedPayload = GustavsonB(cfg)
+    selectedValid := False
+    selectedSource := 0
+    selectedPayload := GustavsonB(cfg).getZero
+    for (source <- 0 until sourcesPerBank) {
+      val candidate = io.sourceActive(bank)(source) && headValids(bank)(source)
+      val lowerCoordinate = headPayloads(bank)(source).column <
+        selectedPayload.column
+      when(candidate && (!selectedValid || lowerCoordinate)) {
+        selectedValid := True
+        selectedSource := source
+        selectedPayload := headPayloads(bank)(source)
+      }
+    }
+
+    val everySourceReady = (0 until sourcesPerBank).map { source =>
+      !io.sourceActive(bank)(source) || headValids(bank)(source) ||
+        io.sourcesClosed
+    }.reduce(_ && _)
+    io.pops(bank).valid := !io.clear && io.active && everySourceReady &&
+      selectedValid
+    io.pops(bank).payload := selectedPayload
+    val popFire = io.pops(bank).fire
+
+    val refillValid = Bool()
+    val refillSource = UInt(sourceIndexWidth bits)
+    refillValid := False
+    refillSource := 0
+    for (source <- 0 until sourcesPerBank) {
+      when(!refillValid && !headValids(bank)(source) &&
+          storedCounts(bank)(source) =/= 0) {
+        refillValid := True
+        refillSource := source
+      }
+    }
+    val issueRead = !io.clear && io.active && !readPending(bank) &&
+      refillValid
+    io.storage.readCommands(bank).valid := issueRead
+    io.storage.readCommands(bank).payload :=
+      physicalAddress(refillSource, readPointers(bank)(refillSource))
+
+    val writeData = Bits(cfg.localLineWidth bits)
+    writeData := 0
+    writeData(recordWidth - 1 downto 0) := io.pushes(bank).payload.asBits
+    io.storage.writes(bank).valid := io.pushes(bank).fire
+    io.storage.writes(bank).payload.address :=
+      physicalAddress(pushSource, writePointers(bank)(pushSource))
+    io.storage.writes(bank).payload.data := writeData
+    io.storage.writes(bank).payload.mask.setAll()
+
+    when(io.pushes(bank).fire) {
+      assert(io.pushes(bank).payload.aIndex /
+        U(sourcesPerBank, cfg.aRegisterIndexWidth bits) === bank,
+        "TrGT B stream was pushed into the wrong subrow bank")
+      when(writePointers(bank)(pushSource) === depthPerSource - 1) {
+        writePointers(bank)(pushSource) := 0
+      } otherwise {
+        writePointers(bank)(pushSource) :=
+          writePointers(bank)(pushSource) + 1
+      }
+    }
+    when(issueRead) {
+      readPending(bank) := True
+      readSource(bank) := refillSource
+      when(readPointers(bank)(refillSource) === depthPerSource - 1) {
+        readPointers(bank)(refillSource) := 0
+      } otherwise {
+        readPointers(bank)(refillSource) :=
+          readPointers(bank)(refillSource) + 1
+      }
+    }
+    when(io.storage.readResponses(bank).valid && readPending(bank)) {
+      headPayloads(bank)(readSource(bank)).assignFromBits(
+        io.storage.readResponses(bank).payload(recordWidth - 1 downto 0))
+      headValids(bank)(readSource(bank)) := True
+      readPending(bank) := False
+    }
+    when(popFire) {
+      headValids(bank)(selectedSource) := False
+    }
+
+    for (source <- 0 until sourcesPerBank) {
+      val pushesSource = io.pushes(bank).fire && pushSource === source
+      val readsSource = issueRead && refillSource === source
+      val popsSource = popFire && selectedSource === source
+      switch(pushesSource ## readsSource) {
+        is(B"10") { storedCounts(bank)(source) :=
+          storedCounts(bank)(source) + 1 }
+        is(B"01") { storedCounts(bank)(source) :=
+          storedCounts(bank)(source) - 1 }
+      }
+      switch(pushesSource ## popsSource) {
+        is(B"10") { totalCounts(bank)(source) :=
+          totalCounts(bank)(source) + 1 }
+        is(B"01") { totalCounts(bank)(source) :=
+          totalCounts(bank)(source) - 1 }
+      }
+    }
+
+    io.occupancy(bank) := (0 until sourcesPerBank)
+      .map(source => totalCounts(bank)(source).resize(bankCountWidth))
+      .reduce(_ + _).resized
+
+    when(io.clear || deactivated) {
+      readPending(bank) := False
+      for (source <- 0 until sourcesPerBank) {
+        readPointers(bank)(source) := 0
+        writePointers(bank)(source) := 0
+        storedCounts(bank)(source) := 0
+        totalCounts(bank)(source) := 0
+        headValids(bank)(source) := False
+      }
+    }
+  }
+}
+
 /** Backward-compatible standalone FIFO with an internally shared SRAM.
   *
   * TrIP can own the SRAM through `tripBuffer`; TrGT queue state is discarded
@@ -142,10 +326,9 @@ class BankedGustavsonBFifo(cfg: TrapezoidConfig, depth: Int) extends Component {
 
 /** Four-subrow TrGT front end.
   *
-  * Each local-buffer bank is represented by an independent B FIFO.  At most
-  * one FIFO head per subrow is issued in a command, matching the paper's four
-  * temporal gather streams.  Lane population may range from zero to four and
-  * is unrelated to whether TrGT is selected.
+  * Each stationary A value owns a B-row FIFO inside its subrow's physical
+  * local-buffer bank.  A radix-K head selector merges those virtual streams
+  * and issues at most one ordered head per subrow and cycle.
   */
 class TrGtSubrowScheduler(
     tileCfg: GustavsonTileConfig,
@@ -205,9 +388,15 @@ class TrGtSubrowScheduler(
   io.acceptedBElements := acceptedBElements
   io.issuedBElements := issuedBElements
 
-  val fifos = new BankedGustavsonBFifoCore(cfg, tileCfg.fifoDepthPerSubrow)
+  val fifos = new BankedGustavsonBMergeFifoCore(cfg)
   fifos.io.clear := io.clear
   fifos.io.active := (if (externalFifoStorage) io.fifoStorageActive else True)
+  fifos.io.sourcesClosed := finishSeen
+  for (subrow <- 0 until subrows; source <- 0 until cfg.macLanesPerSubrow) {
+    fifos.io.sourceActive(subrow)(source) :=
+      aLoaded(runningContext.asUInt)(subrow)(source) &&
+        aStorage(runningContext.asUInt)(subrow)(source).valid
+  }
   if (externalFifoStorage) {
     for (bank <- 0 until cfg.localBanks) {
       io.fifoStorage.writes(bank) := fifos.io.storage.writes(bank)
@@ -231,7 +420,10 @@ class TrGtSubrowScheduler(
     fifos.io.pushes(subrow).valid := io.bPush(subrow).valid && acceptingPushes
     fifos.io.pushes(subrow).payload := io.bPush(subrow).payload
     io.bPush(subrow).ready := fifos.io.pushes(subrow).ready && acceptingPushes
-    io.fifoOccupancy(subrow) := fifos.io.occupancy(subrow)
+    io.fifoOccupancy(subrow) := Mux(
+      fifos.io.occupancy(subrow) > tileCfg.fifoDepthPerSubrow,
+      U(tileCfg.fifoDepthPerSubrow, tileCfg.fifoCountWidth bits),
+      fifos.io.occupancy(subrow).resized)
   }
 
   val engine = new GustavsonTileEngine(tileCfg, peFactory,
@@ -322,13 +514,18 @@ class TrGtSubrowScheduler(
   val visibleBElements = CountOne(fifos.io.pops.map(_.valid).asBits).resize(32)
   val allPendingBElementsVisible = pendingBElements === visibleBElements
   // The finish marker is attached to the last non-empty temporal issue when
-  // possible.  An empty terminal command is only needed for an empty tile.
+  // possible. Do not close the group in a cycle that also accepts new B
+  // elements: the registered accepted count does not include those pushes
+  // until the next cycle, and closing here would strand them in the FIFOs.
+  // An empty terminal command is only needed for an empty tile.
   val issueFinal = running && finishSeen &&
+    acceptedThisCycle === 0 &&
     ((!anyFifoValid && pendingBElements === 0) ||
       (anyFifoValid && allPendingBElementsVisible))
   val scheduledCommand = PERowCommand(cfg)
   scheduledCommand.mode := TrapezoidDataflow.TrGt
   scheduledCommand.endOfTile := issueFinal
+  scheduledCommand.responseTag := 0
   scheduledCommand.trip := TrIpPayload(cfg).getZero
   for (subrow <- 0 until subrows;
        offset <- 0 until cfg.macLanesPerSubrow) {
@@ -509,6 +706,7 @@ class TrGsSpatialEngine(
   val adapted = PERowCommand(cfg)
   adapted.mode := io.command.payload.mode
   adapted.endOfTile := io.command.payload.endOfTile
+  adapted.responseTag := 0
   adapted.trip := TrIpPayload(cfg).getZero
   for (index <- 0 until cfg.macLanes) {
     if (index == 0) adapted.gustavson.a(index) := io.command.payload.a

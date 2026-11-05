@@ -40,6 +40,7 @@ class DualModeMrnLevel(
   io.input.ready := transformed.ready && !temporalDemand
   transformed.payload.mode := io.input.payload.mode
   transformed.payload.endOfTile := io.input.payload.endOfTile
+  transformed.payload.responseTag := io.input.payload.responseTag
   transformed.payload.selectedColumns := io.input.payload.selectedColumns
   transformed.payload.effectualMacs := io.input.payload.effectualMacs
 

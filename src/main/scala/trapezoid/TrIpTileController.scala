@@ -45,6 +45,7 @@ class PackedTrIpPERow(
   val command = PERowCommand(cfg)
   command.mode := io.mode
   command.endOfTile := io.endOfTile
+  command.responseTag := 0
   command.gustavson := GustavsonPayload(cfg).getZero
   for (fiber <- 0 until cfg.maxFibers) {
     command.trip.a(fiber).valid := io.a(fiber).valid
@@ -328,6 +329,7 @@ class TrIpTileController(
     for (pe <- 0 until cfg.peRows) {
       io.peCommands(pe).payload.mode := modeReg
       io.peCommands(pe).payload.endOfTile := False
+      io.peCommands(pe).payload.responseTag := 0
       io.peCommands(pe).payload.trip.a := commandA(pe)
       io.peCommands(pe).payload.trip.b := commandB
       io.peCommands(pe).payload.gustavson := GustavsonPayload(cfg).getZero

@@ -26,6 +26,8 @@ import scala.sys.process.Process
   *   --samples=1
   */
 object PaperSinglePERowCycleSimulation extends App {
+  private val workerEnvironment = "TRAPEZOID_PAPER_PEROW_RTL_WORKER"
+  private val isWorker = sys.env.contains(workerEnvironment)
   private val cfg = TrapezoidConfig.paper.copy(peRows = 1)
   private val dimension = cfg.fiberWidth
   private val samples = args.collectFirst {
@@ -179,7 +181,7 @@ object PaperSinglePERowCycleSimulation extends App {
     Files.write(path, annotated.getBytes(StandardCharsets.UTF_8))
   }
 
-  if (!kernelIsCurrent) generateKernel()
+  if (isWorker && !kernelIsCurrent) generateKernel()
   markHierarchical(kernelDirectory.resolve("TrapezoidPERow.v"),
     "TrapezoidPERow")
   markHierarchical(kernelDirectory.resolve(
@@ -566,5 +568,38 @@ object PaperSinglePERowCycleSimulation extends App {
     }
   }
 
-  runSimulation()
+  if (!isWorker) {
+    val root = Paths.get("simWorkspace", "verilator-root")
+      .toAbsolutePath.normalize()
+    val bin = root.resolve("bin")
+    Files.createDirectories(bin)
+
+    def ensureLink(link: Path, target: Path): Unit = {
+      if (!Files.exists(link)) Files.createSymbolicLink(link, target)
+    }
+
+    ensureLink(root.resolve("include"), Paths.get("/usr/share/verilator/include"))
+    ensureLink(bin.resolve("verilator_bin"), Paths.get("/usr/bin/verilator_bin"))
+    for (tool <- Seq("verilator_includer", "verilator_ccache_report",
+        "verilator_difftree")) {
+      ensureLink(bin.resolve(tool), Paths.get("/usr/share/verilator/bin", tool))
+    }
+
+    val java = Paths.get(System.getProperty("java.home"), "bin", "java").toString
+    val status = Process(Seq(
+      java,
+      "-Xms1G",
+      "-Xmx16G",
+      "-XX:+UseG1GC",
+      "-cp",
+      System.getProperty("java.class.path"),
+      "trapezoid.PaperSinglePERowCycleSimulation"
+    ) ++ args, None,
+      workerEnvironment -> "1",
+      "VERILATOR_ROOT" -> root.toString).!
+    require(status == 0,
+      s"paper single-PE-row RTL worker failed with status $status")
+  } else {
+    runSimulation()
+  }
 }

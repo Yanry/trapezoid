@@ -7,6 +7,7 @@ import spinal.lib._
 case class PERowRoutePayload(cfg: TrapezoidConfig) extends Bundle {
   val mode = TrapezoidDataflow()
   val endOfTile = Bool()
+  val responseTag = UInt(cfg.responseTagWidth bits)
   val overflow = Bool()
   val selectedColumns = UInt(log2Up(cfg.maxFibers + 1) bits)
   val effectualMacs = UInt(cfg.matchCountWidth bits)
@@ -26,6 +27,7 @@ case class PERowRoutePayload(cfg: TrapezoidConfig) extends Bundle {
 case class PERowMacPayload(cfg: TrapezoidConfig) extends Bundle {
   val mode = TrapezoidDataflow()
   val endOfTile = Bool()
+  val responseTag = UInt(cfg.responseTagWidth bits)
   val overflow = Bool()
   val selectedColumns = UInt(log2Up(cfg.maxFibers + 1) bits)
   val effectualMacs = UInt(cfg.matchCountWidth bits)
@@ -55,6 +57,7 @@ case class PERowReducedProduct(cfg: TrapezoidConfig) extends Bundle {
 case class PERowReductionPayload(cfg: TrapezoidConfig) extends Bundle {
   val mode = TrapezoidDataflow()
   val endOfTile = Bool()
+  val responseTag = UInt(cfg.responseTagWidth bits)
   val overflow = Bool()
   val selectedColumns = UInt(log2Up(cfg.maxFibers + 1) bits)
   val effectualMacs = UInt(cfg.matchCountWidth bits)
@@ -481,6 +484,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val routed = PERowRoutePayload(cfg)
   routed.mode := input.mode
   routed.endOfTile := input.endOfTile
+  routed.responseTag := input.responseTag
   routed.selectedColumns := Mux(denseFastPath,
     U(1, routed.selectedColumns.getWidth bits),
     Mux(mfiu.io.overflow,
@@ -636,6 +640,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val multiplied = PERowMacPayload(cfg)
   multiplied.mode := route.mode
   multiplied.endOfTile := route.endOfTile
+  multiplied.responseTag := route.responseTag
   multiplied.overflow := route.overflow
   multiplied.selectedColumns := route.selectedColumns
   multiplied.effectualMacs := route.effectualMacs
@@ -777,6 +782,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   reductionInput.valid := macStage.valid
   reductionInput.payload.mode := mac.mode
   reductionInput.payload.endOfTile := mac.endOfTile
+  reductionInput.payload.responseTag := mac.responseTag
   reductionInput.payload.overflow := Mux(tripMode, mac.overflow, gustOrderError)
   reductionInput.payload.selectedColumns := Mux(tripMode,
     mac.selectedColumns, U(0))
@@ -818,6 +824,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
 
   val nextResponse = PERowResponse(cfg)
   nextResponse.mode := reduced.mode
+  nextResponse.responseTag := reduced.responseTag
   nextResponse.overflow := reduced.overflow
   nextResponse.selectedColumns := reduced.selectedColumns
   nextResponse.effectualMacs := reduced.effectualMacs

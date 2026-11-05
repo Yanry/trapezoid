@@ -231,4 +231,96 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
       assert(ownerPosition == LocalBufferOwner.TrIp.position)
     }
   }
+
+  test("TrGT keeps multiple tagged PE responses in flight through the shared row") {
+    val multiOutstandingCfg = gustavsonCfg.copy(
+      accumulatorEntries = 16, fifoDepthPerSubrow = 8)
+    simConfig.compile(new ModeSharedTileController(
+      tripCfg, multiOutstandingCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= true
+      dut.io.tripALoad.valid #= false
+      dut.io.tripBLoad.valid #= false
+      dut.io.tripStart.valid #= false
+      dut.io.tripResult.ready #= false
+      dut.io.trgtALoad(0).valid #= false
+      dut.io.trgtStart(0).valid #= false
+      dut.io.trgtFinish #= 0
+      dut.io.trgtResult(0).ready #= true
+      dut.io.trgsCommand(0).valid #= false
+      dut.io.trgsResult(0).ready #= false
+      dut.io.trgsResultLine(0).ready #= false
+      for (subrow <- 0 until cfg.localBanks) {
+        dut.io.trgtBPush(0)(subrow).valid #= false
+      }
+      dut.clockDomain.waitSampling()
+      dut.io.clear #= false
+      dut.clockDomain.waitSampling()
+
+      dut.io.trgtALoad(0).payload.index #= 0
+      dut.io.trgtALoad(0).payload.groupId #= false
+      dut.io.trgtALoad(0).payload.element.valid #= true
+      dut.io.trgtALoad(0).payload.element.row #= 6
+      dut.io.trgtALoad(0).payload.element.k #= 0
+      dut.io.trgtALoad(0).payload.element.value #= 3
+      dut.io.trgtALoad(0).valid #= true
+      while (!dut.io.trgtALoad(0).ready.toBoolean) {
+        dut.clockDomain.waitSampling()
+      }
+      dut.clockDomain.waitSampling()
+      dut.io.trgtALoad(0).valid #= false
+
+      dut.io.trgtStart(0).payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.trgtStart(0).payload.groupId #= false
+      dut.io.trgtStart(0).valid #= true
+      while (!dut.io.trgtStart(0).ready.toBoolean) {
+        dut.clockDomain.waitSampling()
+      }
+      dut.clockDomain.waitSampling()
+      dut.io.trgtStart(0).valid #= false
+
+      val b = dut.io.trgtBPush(0)(0)
+      b.payload.valid #= true
+      b.payload.aIndex #= 0
+      b.payload.k #= 0
+      for (column <- 0 until 12) {
+        b.payload.column #= column
+        b.payload.value #= column + 1
+        b.valid #= true
+        var accepted = false
+        while (!accepted) {
+          sleep(1)
+          accepted = b.ready.toBoolean
+          dut.clockDomain.waitSampling()
+        }
+        sleep(1)
+        b.valid #= false
+      }
+      dut.io.trgtFinish #= 1
+      dut.clockDomain.waitSampling()
+      dut.io.trgtFinish #= 0
+
+      val results = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      var timeout = 0
+      while ((dut.io.trgtDone.toBigInt & 1) == 0 && timeout < 1000) {
+        sleep(1)
+        if (dut.io.trgtResult(0).valid.toBoolean &&
+            dut.io.trgtResult(0).ready.toBoolean) {
+          results += ((dut.io.trgtResult(0).payload.row.toInt,
+            dut.io.trgtResult(0).payload.column.toInt,
+            dut.io.trgtResult(0).payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+
+      assert((dut.io.trgtDone.toBigInt & 1) != 0,
+        s"TrGT did not drain multiple responses; occupancy=" +
+          (0 until cfg.localBanks).map(
+            dut.io.trgtFifoOccupancy(0)(_).toInt).mkString(","))
+      assert(results == (0 until 12).map(column =>
+        (6, column, 3L * (column + 1))))
+      assert((dut.io.trgtOverflow.toBigInt & 1) == 0)
+    }
+  }
 }

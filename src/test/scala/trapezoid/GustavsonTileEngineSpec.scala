@@ -23,7 +23,7 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
   )
   private val tileCfg = GustavsonTileConfig(cfg, accumulatorEntries = 4)
   private val headFifoTileCfg =
-    GustavsonTileConfig(cfg, accumulatorEntries = 8)
+    GustavsonTileConfig(cfg, accumulatorEntries = 16)
 
   private def simConfig = SimConfig.withVerilator
     .addSimulatorFlag("-CFLAGS -std=c++14")
@@ -206,21 +206,19 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
       dut.io.result.ready #= true
       clearPayload(dut)
 
-      val pairedRequestCycles = mutable.ArrayBuffer.empty[Long]
+      val requestCycles = mutable.ArrayBuffer.empty[Long]
       val responseCycles = mutable.ArrayBuffer.empty[Long]
       val dequeueCycles = mutable.ArrayBuffer.empty[Long]
       var cycle = 0L
       val monitor = fork {
-        while ((pairedRequestCycles.size < 4 || responseCycles.size < 2 ||
+        while ((requestCycles.size < 8 || responseCycles.size < 2 ||
             dequeueCycles.size < 8) && cycle < 500) {
           sleep(1)
           if (dut.trGtResponseFire.toBoolean) responseCycles += cycle
           if (dut.trGtDequeue.toBoolean) dequeueCycles += cycle
           if (dut.temporalMrnInput.valid.toBoolean &&
-              dut.temporalMrnInput.ready.toBoolean &&
-              dut.temporalMrnInput.payload.left.valid.toBoolean &&
-              dut.temporalMrnInput.payload.right.valid.toBoolean) {
-            pairedRequestCycles += cycle
+              dut.temporalMrnInput.ready.toBoolean) {
+            requestCycles += cycle
           }
           dut.clockDomain.waitSampling()
           cycle += 1
@@ -239,13 +237,41 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
 
       assert(observed.map(x => (x._2, x._3)) ==
         Seq((0, 4L), (1, 8L), (2, 12L), (3, 16L)))
-      assert(pairedRequestCycles.size == 4)
-      assert(pairedRequestCycles.sliding(2).forall {
+      assert(requestCycles.size == 8)
+      // The first head may run before the next PE response arrives. Once that
+      // response fills the long-lived source queues, the radix-K MRN remains
+      // at II=1 for the rest of the packed group.
+      assert(requestCycles.drop(1).sliding(2).forall {
         case Seq(left, right) => right == left + 1
         case _ => true
-      }, s"temporal merge was not II=1: ${pairedRequestCycles.mkString(",")}")
+      }, s"steady-state temporal merge was not II=1: " +
+        requestCycles.mkString(","))
       assert(responseCycles.size == 2)
       assert(dequeueCycles.size == 8)
+    }
+  }
+
+  test("TrGT starts a new ordered epoch when a subrow changes B stream") {
+    simConfig.compile(new GustavsonTileEngine(headFifoTileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.result.ready #= true
+      clearPayload(dut)
+
+      val a = (0 until cfg.localBanks).map(k => (0, k, 2))
+      issue(dut, TrapezoidDataflow.TrGt, endOfTile = false,
+        a = a,
+        b = (0 until cfg.localBanks).map(source =>
+          (source, source, source + 8, 1)))
+      issue(dut, TrapezoidDataflow.TrGt, endOfTile = true,
+        a = a,
+        b = (0 until cfg.localBanks).map(source =>
+          (source, source, source, 1)))
+
+      val observed = collect(dut)
+      assert(observed.map(x => (x._2, x._3)) ==
+        ((0 until 4) ++ (8 until 12)).map(column => (column, 2L)))
+      assert(!dut.io.overflow.toBoolean)
     }
   }
 
@@ -254,6 +280,11 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
       val dut = new HeadFifoHarness
       dut.engine.io.flatten.foreach(_.simPublic())
       dut.engine.trGtHeadFifoCounts.foreach(_.simPublic())
+      dut.engine.trGtHeadStoredCounts.foreach(_.simPublic())
+      dut.engine.trGtHeadValids.foreach(_.simPublic())
+      dut.engine.trGtCommandTagCount.simPublic()
+      dut.engine.temporalOutstanding.simPublic()
+      dut.engine.mergeCommitValid.simPublic()
       dut
     }.doSim { dut =>
       val engine = dut.engine
@@ -270,8 +301,10 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
         dut.io.command.payload.endOfTile #= endOfTile
         dut.io.command.valid #= true
         var timeout = 0
+        sleep(1)
         while (!dut.io.command.ready.toBoolean && timeout < 100) {
           dut.clockDomain.waitSampling()
+          sleep(1)
           timeout += 1
         }
         assert(dut.io.command.ready.toBoolean,
@@ -280,8 +313,9 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
         dut.io.command.valid #= false
       }
 
-      def sendResponse(columns: Seq[Int]): Unit = {
+      def sendResponse(tag: Int, columns: Seq[Int]): Unit = {
         dut.io.peResponse.payload.mode #= TrapezoidDataflow.TrGt
+        dut.io.peResponse.payload.responseTag #= tag
         dut.io.peResponse.payload.overflow #= false
         dut.io.peResponse.payload.selectedColumns #= cfg.maxFibers
         dut.io.peResponse.payload.effectualMacs #= columns.size
@@ -300,8 +334,10 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
         }
         dut.io.peResponse.valid #= true
         var timeout = 0
+        sleep(1)
         while (!dut.io.peResponse.ready.toBoolean && timeout < 100) {
           dut.clockDomain.waitSampling()
+          sleep(1)
           timeout += 1
         }
         assert(dut.io.peResponse.ready.toBoolean,
@@ -311,13 +347,17 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
       }
 
       issueExternal(endOfTile = false)
-      sendResponse(Seq(1, 3, 5, 7))
+      sendResponse(0, Seq(1, 2, 3, 4))
+      issueExternal(endOfTile = false)
+      issueExternal(endOfTile = false)
       issueExternal(endOfTile = true)
-      sendResponse(Seq(2, 4, 6, 8))
+      sendResponse(1, Seq(1, 2, 3, 4))
+      sendResponse(2, Seq(1, 2, 3, 4))
+      sendResponse(3, Seq(1, 2, 3, 4))
       dut.clockDomain.waitSampling()
 
-      assert(engine.trGtHeadFifoCounts.map(_.toInt).sum == 8,
-        "both PE responses must reside in the four source FIFOs")
+      assert(engine.trGtHeadFifoCounts.map(_.toInt).sum == 16,
+        "four tagged PE responses must reside in the source FIFOs")
       dut.io.allowMerge #= true
       val observed = mutable.ArrayBuffer.empty[(Int, Int, Long, Boolean)]
       var timeout = 0
@@ -332,9 +372,16 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
         dut.clockDomain.waitSampling()
         timeout += 1
       }
-      assert(dut.io.done.toBoolean, "cross-response merge timed out")
+      assert(dut.io.done.toBoolean,
+        s"cross-response merge timed out: " +
+          s"tags=${engine.trGtCommandTagCount.toInt}, " +
+          s"counts=${engine.trGtHeadFifoCounts.map(_.toInt).mkString(",")}, " +
+          s"stored=${engine.trGtHeadStoredCounts.map(_.toInt).mkString(",")}, " +
+          s"heads=${engine.trGtHeadValids.map(_.toBoolean).mkString(",")}, " +
+          s"temporal=${engine.temporalOutstanding.toInt}, " +
+          s"commit=${engine.mergeCommitValid.toBoolean}")
       assert(observed.map(x => (x._2, x._3)) ==
-        (1 to 8).map(value => (value, value.toLong)))
+        (1 to 4).map(value => (value, value.toLong * 4)))
     }
   }
 

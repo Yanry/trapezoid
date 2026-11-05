@@ -43,6 +43,9 @@ case class GustavsonPayload(cfg: TrapezoidConfig) extends Bundle {
 case class PERowCommand(cfg: TrapezoidConfig) extends Bundle {
   val mode = TrapezoidDataflow()
   val endOfTile = Bool()
+  /** Preserved through the PE row so outer Gustavson clients can reorder
+    * multiple responses without relying on response timing. */
+  val responseTag = UInt(cfg.responseTagWidth bits)
   val trip = TrIpPayload(cfg)
   val gustavson = GustavsonPayload(cfg)
 }
@@ -64,6 +67,7 @@ case class MatrixResultLine(cfg: TrapezoidConfig) extends Bundle {
 
 case class PERowResponse(cfg: TrapezoidConfig) extends Bundle {
   val mode = TrapezoidDataflow()
+  val responseTag = UInt(cfg.responseTagWidth bits)
   val overflow = Bool()
   val selectedColumns = UInt(log2Up(cfg.maxFibers + 1) bits)
   val effectualMacs = UInt(cfg.matchCountWidth bits)

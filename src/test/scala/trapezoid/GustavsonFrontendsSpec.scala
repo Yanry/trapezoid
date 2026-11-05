@@ -245,9 +245,12 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     stream.payload.column #= column
     stream.payload.value #= value
     stream.valid #= true
-    sleep(1)
-    while (!stream.ready.toBoolean) dut.clockDomain.waitSampling()
-    dut.clockDomain.waitSampling()
+    var accepted = false
+    while (!accepted) {
+      sleep(1)
+      accepted = stream.ready.toBoolean
+      dut.clockDomain.waitSampling()
+    }
     sleep(1)
     stream.valid #= false
   }
@@ -273,9 +276,9 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
 
       // Four entries exceed the two-entry FIFO unless the scheduler drains it.
       pushB(dut, 0, 0, 0, 0, 5)
+      pushB(dut, 0, 0, 0, 1, 2)
       pushB(dut, 0, 0, 0, 2, 7)
       pushB(dut, 0, 0, 0, 3, 9)
-      pushB(dut, 0, 0, 0, 1, 2)
       pushB(dut, 1, 1, 1, 0, 11)
       pushB(dut, 2, 2, 2, 1, 13)
       pushB(dut, 3, 3, 3, 0, 17)

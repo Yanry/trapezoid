@@ -211,6 +211,35 @@ class GustavsonTileEngineSpec extends AnyFunSuite {
     }
   }
 
+  test("radix-K MRN control selects the minimum head and coalesces matches") {
+    simConfig.compile(new GustavsonRadixKMrnControl(cfg, cfg.localBanks))
+      .doSim { dut =>
+        dut.io.request.ready #= true
+        dut.io.oldHead.valid #= true
+        dut.io.oldHead.row #= 0
+        dut.io.oldHead.column #= 5
+        dut.io.oldHead.value #= 11
+        val columns = Seq(7, 3, 9, 4)
+        for ((column, source) <- columns.zipWithIndex) {
+          dut.io.rightHeads(source).valid #= true
+          dut.io.rightHeads(source).row #= 0
+          dut.io.rightHeads(source).column #= column
+          dut.io.rightHeads(source).value #= column
+        }
+
+        sleep(1)
+        assert(dut.io.selectedRightIndex.toInt == 1)
+        assert(dut.io.request.payload.right.column.toInt == 3)
+        assert(!dut.io.consumeLeft.toBoolean)
+        assert(dut.io.consumeRight.toBoolean)
+
+        dut.io.oldHead.column #= 3
+        sleep(1)
+        assert(dut.io.consumeLeft.toBoolean)
+        assert(dut.io.consumeRight.toBoolean)
+      }
+  }
+
   test("Gustavson engine rejects IP modes and safely aborts an active command") {
     simConfig.compile(new GustavsonTileEngine(tileCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)

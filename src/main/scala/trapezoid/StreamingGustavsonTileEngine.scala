@@ -195,39 +195,39 @@ class GustavsonTileEngine(
     outputIndex.resize(tileCfg.entryCountWidth) + 1 === entryCount
 
   val newAvailable = newIndex.resize(cfg.outputCountWidth) < responseReg.count
-  val newEntry = GustavsonAccumulatorEntry(cfg)
-  val selectedNewIndex = newIndex.resize(
-    scala.math.max(1, log2Up(cfg.outputLanes)))
-  newEntry.row := responseReg.results(selectedNewIndex).row
-  newEntry.column := responseReg.results(selectedNewIndex).column
-  newEntry.value := responseReg.results(selectedNewIndex).value
   val oldAvailable = (oldEntryValid || oldReadPending) && oldIndex < oldCount
   val oldMergeEntry = GustavsonAccumulatorEntry(cfg)
   oldMergeEntry := oldEntry
   when(!oldEntryValid && oldReadPending) {
     oldMergeEntry := selectedReadEntry
   }
-  val sameCoordinate = DualModeMrnPolicy.sameCoordinate(
-    oldAvailable, oldMergeEntry.row, oldMergeEntry.column,
-    newAvailable, newEntry.row, newEntry.column)
-  val oldBeforeNew = oldAvailable && newAvailable &&
-    DualModeMrnPolicy.leftBefore(
-      oldMergeEntry.row, oldMergeEntry.column, newEntry.row, newEntry.column)
-  val consumeOld = sameCoordinate ||
-    (oldAvailable && (!newAvailable || oldBeforeNew))
-  val consumeNew = sameCoordinate || (!consumeOld && newAvailable)
   val mergeActive = state === StreamingGustavsonState.MergeCompare
-  temporalMrnInput.valid := mergeActive &&
-    (oldAvailable || newAvailable)
-  temporalMrnInput.payload.mode := MrnNodeMode.GustavsonMerge
-  temporalMrnInput.payload.left.valid := oldAvailable
-  temporalMrnInput.payload.left.row := oldMergeEntry.row
-  temporalMrnInput.payload.left.column := oldMergeEntry.column
-  temporalMrnInput.payload.left.value := oldMergeEntry.value
-  temporalMrnInput.payload.right.valid := newAvailable
-  temporalMrnInput.payload.right.row := newEntry.row
-  temporalMrnInput.payload.right.column := newEntry.column
-  temporalMrnInput.payload.right.value := newEntry.value
+
+  // The merge control sees up to four unconsumed PE response entries as
+  // candidate heads. They are already sorted by the PE-row MRN, so the
+  // selected source is the next response entry, but the K-way selector keeps
+  // that policy in one MRN control block rather than duplicating it here.
+  private val mergeSourceCount = cfg.localBanks
+  val mergeControl = new GustavsonRadixKMrnControl(cfg, mergeSourceCount)
+  mergeControl.io.oldHead.valid := oldAvailable && mergeActive
+  mergeControl.io.oldHead.row := oldMergeEntry.row
+  mergeControl.io.oldHead.column := oldMergeEntry.column
+  mergeControl.io.oldHead.value := oldMergeEntry.value
+  for (source <- 0 until mergeSourceCount) {
+    val sourcePositionWide = newIndex.resize(cfg.outputCountWidth) +
+      U(source, cfg.outputCountWidth bits)
+    val sourcePosition = sourcePositionWide.resize(
+      scala.math.max(1, log2Up(cfg.outputLanes)))
+    mergeControl.io.rightHeads(source).valid :=
+      mergeActive && sourcePositionWide < responseReg.count
+    mergeControl.io.rightHeads(source).row :=
+      responseReg.results(sourcePosition).row
+    mergeControl.io.rightHeads(source).column :=
+      responseReg.results(sourcePosition).column
+    mergeControl.io.rightHeads(source).value :=
+      responseReg.results(sourcePosition).value
+  }
+  temporalMrnInput << mergeControl.io.request
   temporalMrnOutput.ready := mergeActive || io.clear ||
     state === StreamingGustavsonState.AbortDrain
 
@@ -334,13 +334,15 @@ class GustavsonTileEngine(
         // MRN result.  Advancing on request acceptance, instead of waiting for
         // the response, allows one ordered merge decision per cycle.
         when(temporalMrnInput.fire) {
-          when(consumeNew) {
-            newIndex := newIndex + 1
+          when(mergeControl.io.consumeRight) {
+            newIndex := (newIndex +
+              mergeControl.io.selectedRightIndex.resize(responseIndexWidth) +
+              1).resized
           }
           when(oldReadPending) {
             oldReadArrivalConsumed := True
           }
-          when(consumeOld) {
+          when(mergeControl.io.consumeLeft) {
             when(oldEntryValid) {
               when(oldNextValid) {
                 oldEntry := oldNextEntry

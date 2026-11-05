@@ -6,12 +6,11 @@ import spinal.lib._
 /**
   * Head-selection and consume control for a Gustavson merge.
   *
-  * The PE response is already coordinate ordered. Exposing up to K remaining
-  * response entries as candidate heads makes the control path a radix-K
-  * selector instead of embedding a second old-vs-new comparator in the tile
-  * engine.  The temporal MRN arithmetic still receives one old head and one
-  * selected new head per cycle; equal-coordinate accumulation remains in the
-  * shared PE-row MRN cell.
+  * The owner presents one independently stateful head per TrGT subrow. This
+  * block selects the minimum of those K heads instead of embedding another
+  * old-vs-new comparator in the tile engine. The temporal MRN arithmetic still
+  * receives one old head and one selected new head per cycle;
+  * equal-coordinate accumulation remains in the shared PE-row MRN cell.
   *
   * `request.fire` is the commit point for head consumption.  This keeps the
   * control decision aligned with ready/valid backpressure while allowing the

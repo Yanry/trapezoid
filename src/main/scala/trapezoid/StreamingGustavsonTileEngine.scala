@@ -33,6 +33,9 @@ class GustavsonTileEngine(
   private val entriesPerBank = tileCfg.accumulatorEntries / bankCount
   private val bankAddressWidth = scala.math.max(1, log2Up(entriesPerBank))
   private val responseIndexWidth = cfg.outputCountWidth
+  private val trGtHeadFifoDepth = scala.math.max(8, cfg.outputLanes * 2)
+  private val trGtHeadPtrWidth = scala.math.max(1, log2Up(trGtHeadFifoDepth))
+  private val trGtHeadCountWidth = log2Up(trGtHeadFifoDepth + 1)
   require(tileCfg.accumulatorEntries % bankCount == 0,
     "streaming accumulator entries must divide across local banks")
 
@@ -59,7 +62,8 @@ class GustavsonTileEngine(
   val overflowReg = RegInit(False)
   val modeErrorReg = RegInit(False)
   val commandInFlight = RegInit(False)
-  val finalCommand = RegInit(False)
+  val inputDone = RegInit(False)
+  val mergingTrGt = RegInit(False)
   val activeBuffer = RegInit(False)
   val entryCount = Reg(UInt(tileCfg.entryCountWidth bits)) init 0
   val oldCount = Reg(UInt(tileCfg.entryCountWidth bits)) init 0
@@ -78,6 +82,18 @@ class GustavsonTileEngine(
   // stream heads can enter while the previous result is written back.
   val temporalOutstanding = Reg(UInt(2 bits)) init 0
   val responseReg = Reg(PERowResponse(cfg))
+  // One small FIFO per TrGT subrow extends head lifetime across multiple PE
+  // responses. Payloads are distributed by destinationBank at response time;
+  // the MRN selector then consumes only the selected source FIFO.
+  val trGtHeadFifos = (0 until bankCount).map(_ =>
+    Vec((0 until trGtHeadFifoDepth).map(_ =>
+      Reg(GustavsonAccumulatorEntry(cfg)))))
+  val trGtHeadFifoHeads = Vec((0 until bankCount).map(_ =>
+    Reg(UInt(trGtHeadPtrWidth bits)) init 0))
+  val trGtHeadFifoTails = Vec((0 until bankCount).map(_ =>
+    Reg(UInt(trGtHeadPtrWidth bits)) init 0))
+  val trGtHeadFifoCounts = Vec((0 until bankCount).map(_ =>
+    Reg(UInt(trGtHeadCountWidth bits)) init 0))
   val readBankReg = Reg(UInt(bankBits bits)) init 0
   val readBufferReg = RegInit(False)
 
@@ -145,9 +161,15 @@ class GustavsonTileEngine(
   val peResponseValid = Bool()
   val peResponsePayload = PERowResponse(cfg)
   val peResponseReady = Bool()
+  val mergeResponseWindow = Bool()
   val temporalMrnInput = Stream(DualModeMrnRequest(cfg))
   val temporalMrnOutput = Stream(DualModeMrnResponse(cfg))
-  val peCommandValid = !io.clear && state === StreamingGustavsonState.Accept &&
+  val trGtCommandWindow = state === StreamingGustavsonState.MergeCompare &&
+    mergingTrGt && !commandInFlight && io.command.payload.mode ===
+      TrapezoidDataflow.TrGt
+  val commandWindow = state === StreamingGustavsonState.Accept ||
+    trGtCommandWindow
+  val peCommandValid = !io.clear && commandWindow &&
     io.command.valid && supportedMode
   if (externalPe) {
     io.peCommand.valid := peCommandValid
@@ -175,11 +197,25 @@ class GustavsonTileEngine(
     }
   }
 
-  io.command.ready := !io.clear && state === StreamingGustavsonState.Accept &&
+  io.command.ready := !io.clear && commandWindow && !commandInFlight &&
     Mux(supportedMode, peCommandReady, True)
+  val trGtResponseSpace = Bool()
+  var trGtResponseSpaceExpr: Bool = True
+  for (source <- 0 until bankCount) {
+    val sourceMatches = Bits(cfg.outputLanes bits)
+    for (result <- 0 until cfg.outputLanes) {
+      sourceMatches(result) := peResponsePayload.results(result).valid &&
+        peResponsePayload.destinationBank(result) === source
+    }
+    val enqueueCount = CountOne(sourceMatches).resize(trGtHeadCountWidth)
+    trGtResponseSpaceExpr = trGtResponseSpaceExpr &&
+      (trGtHeadFifoCounts(source) + enqueueCount <=
+        U(trGtHeadFifoDepth, trGtHeadCountWidth bits))
+  }
+  trGtResponseSpace := trGtResponseSpaceExpr
   peResponseReady := !io.clear &&
     (state === StreamingGustavsonState.WaitResponse ||
-      state === StreamingGustavsonState.AbortDrain)
+      mergeResponseWindow || state === StreamingGustavsonState.AbortDrain)
 
   io.busy := tileOpen || state =/= StreamingGustavsonState.Accept
   io.done := doneReg
@@ -194,8 +230,15 @@ class GustavsonTileEngine(
   io.result.payload.endOfTile :=
     outputIndex.resize(tileCfg.entryCountWidth) + 1 === entryCount
 
-  val newAvailable = newIndex.resize(cfg.outputCountWidth) < responseReg.count
+  val trGtMerge = mergingTrGt
+  val sequentialNewAvailable =
+    newIndex.resize(cfg.outputCountWidth) < responseReg.count
+  val newAvailable = Mux(trGtMerge,
+    trGtHeadFifoCounts.map(_ =/= 0).reduce(_ || _), sequentialNewAvailable)
   val oldAvailable = (oldEntryValid || oldReadPending) && oldIndex < oldCount
+  mergeResponseWindow := state === StreamingGustavsonState.MergeCompare &&
+    mergingTrGt && trGtResponseSpace &&
+    (oldAvailable || newAvailable || temporalOutstanding =/= 0)
   val oldMergeEntry = GustavsonAccumulatorEntry(cfg)
   oldMergeEntry := oldEntry
   when(!oldEntryValid && oldReadPending) {
@@ -203,10 +246,9 @@ class GustavsonTileEngine(
   }
   val mergeActive = state === StreamingGustavsonState.MergeCompare
 
-  // The merge control sees up to four unconsumed PE response entries as
-  // candidate heads. They are already sorted by the PE-row MRN, so the
-  // selected source is the next response entry, but the K-way selector keeps
-  // that policy in one MRN control block rather than duplicating it here.
+  // TrGT candidates are four independently stateful subrow heads. TrGS keeps
+  // the ordered response-window path because one cache line may produce more
+  // than one result per local bank.
   private val mergeSourceCount = cfg.localBanks
   val mergeControl = new GustavsonRadixKMrnControl(cfg, mergeSourceCount)
   mergeControl.io.oldHead.valid := oldAvailable && mergeActive
@@ -218,14 +260,17 @@ class GustavsonTileEngine(
       U(source, cfg.outputCountWidth bits)
     val sourcePosition = sourcePositionWide.resize(
       scala.math.max(1, log2Up(cfg.outputLanes)))
-    mergeControl.io.rightHeads(source).valid :=
-      mergeActive && sourcePositionWide < responseReg.count
-    mergeControl.io.rightHeads(source).row :=
-      responseReg.results(sourcePosition).row
-    mergeControl.io.rightHeads(source).column :=
-      responseReg.results(sourcePosition).column
-    mergeControl.io.rightHeads(source).value :=
-      responseReg.results(sourcePosition).value
+    val trGtHeadEntry = GustavsonAccumulatorEntry(cfg)
+    trGtHeadEntry := trGtHeadFifos(source)(trGtHeadFifoHeads(source))
+    val sequentialResult = responseReg.results(sourcePosition)
+    mergeControl.io.rightHeads(source).valid := mergeActive && Mux(trGtMerge,
+      trGtHeadFifoCounts(source) =/= 0, sourcePositionWide < responseReg.count)
+    mergeControl.io.rightHeads(source).row := Mux(trGtMerge,
+      trGtHeadEntry.row, sequentialResult.row)
+    mergeControl.io.rightHeads(source).column := Mux(trGtMerge,
+      trGtHeadEntry.column, sequentialResult.column)
+    mergeControl.io.rightHeads(source).value := Mux(trGtMerge,
+      trGtHeadEntry.value, sequentialResult.value)
   }
   temporalMrnInput << mergeControl.io.request
   temporalMrnOutput.ready := mergeActive || io.clear ||
@@ -238,6 +283,68 @@ class GustavsonTileEngine(
     }
   }
 
+  val trGtResponseFire = peResponseValid && peResponseReady &&
+    peResponsePayload.mode === TrapezoidDataflow.TrGt
+  val trGtDequeue = mergeActive && trGtMerge && temporalMrnInput.fire &&
+    mergeControl.io.consumeRight
+
+  // A response is a packed batch, so compute a stable per-source write
+  // position for every lane before updating each FIFO tail. Each source is
+  // consumed independently; a packed response is admitted atomically only
+  // when every destination FIFO has enough capacity.
+  for (source <- 0 until bankCount) {
+    val sourceMatches = Bits(cfg.outputLanes bits)
+    for (result <- 0 until cfg.outputLanes) {
+      sourceMatches(result) := trGtResponseFire &&
+        peResponsePayload.results(result).valid &&
+        peResponsePayload.destinationBank(result) === source
+    }
+    val enqueueCount = CountOne(sourceMatches).resize(trGtHeadCountWidth)
+    val enqueueBase = trGtHeadFifoTails(source)
+    var prefixMatches: UInt = U(0, trGtHeadCountWidth bits)
+    for (result <- 0 until cfg.outputLanes) {
+      val rawIndex = (enqueueBase.resize(trGtHeadCountWidth) +
+        prefixMatches).resize(trGtHeadCountWidth)
+      val wrappedIndex = Mux(
+        rawIndex >= U(trGtHeadFifoDepth, trGtHeadCountWidth bits),
+        (rawIndex - U(trGtHeadFifoDepth, trGtHeadCountWidth bits)).resize(
+          trGtHeadPtrWidth),
+        rawIndex.resize(trGtHeadPtrWidth))
+      when(sourceMatches(result)) {
+        val entry = GustavsonAccumulatorEntry(cfg)
+        entry.row := peResponsePayload.results(result).row
+        entry.column := peResponsePayload.results(result).column
+        entry.value := peResponsePayload.results(result).value
+        trGtHeadFifos(source)(wrappedIndex) := entry
+      }
+      prefixMatches = (prefixMatches + sourceMatches(result).asUInt).resized
+    }
+    val dequeueSource = trGtDequeue &&
+      mergeControl.io.selectedRightIndex === source
+    when(trGtResponseFire || dequeueSource) {
+      val nextCount = trGtHeadFifoCounts(source).resize(trGtHeadCountWidth) +
+        Mux(trGtResponseFire, enqueueCount, U(0, trGtHeadCountWidth bits)) -
+        Mux(dequeueSource, U(1, trGtHeadCountWidth bits),
+          U(0, trGtHeadCountWidth bits))
+      trGtHeadFifoCounts(source) := nextCount.resized
+    }
+    when(trGtResponseFire) {
+      val rawTail = trGtHeadFifoTails(source).resize(trGtHeadCountWidth) +
+        enqueueCount
+      trGtHeadFifoTails(source) := Mux(
+        rawTail >= U(trGtHeadFifoDepth, trGtHeadCountWidth bits),
+        (rawTail - U(trGtHeadFifoDepth, trGtHeadCountWidth bits)).resize(
+          trGtHeadPtrWidth),
+        rawTail.resize(trGtHeadPtrWidth))
+    }
+    when(dequeueSource) {
+      val nextHead = trGtHeadFifoHeads(source).resize(trGtHeadCountWidth) + 1
+      trGtHeadFifoHeads(source) := Mux(
+        nextHead >= U(trGtHeadFifoDepth, trGtHeadCountWidth bits),
+        U(0, trGtHeadPtrWidth bits), nextHead.resize(trGtHeadPtrWidth))
+    }
+  }
+
   switch(state) {
     is(StreamingGustavsonState.Accept) {
       when(io.command.fire) {
@@ -245,7 +352,7 @@ class GustavsonTileEngine(
         when(supportedMode) {
           modeErrorReg := False
           commandInFlight := True
-          finalCommand := io.command.payload.endOfTile
+          inputDone := io.command.payload.endOfTile
           when(!tileOpen) {
             entryCount := 0
             overflowReg := False
@@ -267,6 +374,7 @@ class GustavsonTileEngine(
       when(peResponseValid && peResponseReady) {
         responseReg := peResponsePayload
         commandInFlight := False
+        mergingTrGt := peResponsePayload.mode === TrapezoidDataflow.TrGt
         overflowReg := overflowReg || peResponsePayload.overflow
         oldCount := entryCount
         oldIndex := 0
@@ -301,10 +409,20 @@ class GustavsonTileEngine(
     }
 
     is(StreamingGustavsonState.MergeCompare) {
+      when(io.command.fire) {
+        commandInFlight := True
+        inputDone := io.command.payload.endOfTile
+      }
+      when(trGtResponseFire) {
+        commandInFlight := False
+        overflowReg := overflowReg || peResponsePayload.overflow
+      }
       when(!oldAvailable && !newAvailable && temporalOutstanding === 0) {
         entryCount := writeIndex
         activeBuffer := !activeBuffer
-        when(finalCommand) {
+        when(commandInFlight || io.command.fire) {
+          state := StreamingGustavsonState.WaitResponse
+        } elsewhen(inputDone) {
           when(writeIndex === 0) {
             tileOpen := False
             doneReg := True
@@ -335,9 +453,11 @@ class GustavsonTileEngine(
         // the response, allows one ordered merge decision per cycle.
         when(temporalMrnInput.fire) {
           when(mergeControl.io.consumeRight) {
-            newIndex := (newIndex +
-              mergeControl.io.selectedRightIndex.resize(responseIndexWidth) +
-              1).resized
+            when(!trGtMerge) {
+              newIndex := (newIndex +
+                mergeControl.io.selectedRightIndex.resize(responseIndexWidth) +
+                1).resized
+            }
           }
           when(oldReadPending) {
             oldReadArrivalConsumed := True
@@ -431,6 +551,13 @@ class GustavsonTileEngine(
     oldFetchIndex := 0
     oldReadPending := False
     temporalOutstanding := 0
+    inputDone := False
+    mergingTrGt := False
+    for (source <- 0 until bankCount) {
+      trGtHeadFifoHeads(source) := 0
+      trGtHeadFifoTails(source) := 0
+      trGtHeadFifoCounts(source) := 0
+    }
     when(commandInFlight) { state := StreamingGustavsonState.AbortDrain }
       .otherwise { state := StreamingGustavsonState.Accept }
   }

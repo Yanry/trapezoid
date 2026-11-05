@@ -684,7 +684,16 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     leaf.segmentStart := False
     leaf.row := mac.gustRow(lane)
     leaf.column := mac.gustColumn(lane)
-    leaf.destinationBank := 0
+    if (lane < cfg.localBanks) {
+      // In TrGT each input lane is the head of one temporal subrow. Preserve
+      // that identity through sorting and spatial reduction so the temporal
+      // radix-K merge can maintain four independent stream heads.
+      leaf.destinationBank := Mux(mac.mode === TrapezoidDataflow.TrGt,
+        U(lane, cfg.localBankIndexWidth bits),
+        U(0, cfg.localBankIndexWidth bits))
+    } else {
+      leaf.destinationBank := 0
+    }
     leaf.destinationWordOffset := 0
     leaf.value := mac.product(lane)
     leaf

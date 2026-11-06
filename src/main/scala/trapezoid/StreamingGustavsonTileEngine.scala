@@ -51,6 +51,7 @@ class GustavsonTileEngine(
     val done = out Bool()
     val overflow = out Bool()
     val unsupportedMode = out Bool()
+    val trGtDrainActive = out Bool()
     val activeEntries = out UInt(tileCfg.entryCountWidth bits)
     val peCommand = if (externalPe) master(Stream(PERowCommand(cfg))) else null
     val peResponse = if (externalPe) slave(Stream(PERowResponse(cfg))) else null
@@ -61,6 +62,8 @@ class GustavsonTileEngine(
   }
 
   val state = RegInit(StreamingGustavsonState.Accept)
+  val debugState = UInt(4 bits)
+  debugState := state.asBits.asUInt.resize(4)
   val tileOpen = RegInit(False)
   val doneReg = RegInit(False)
   val overflowReg = RegInit(False)
@@ -212,9 +215,15 @@ class GustavsonTileEngine(
         (a.row === trGtLastIssuedRow(source) &&
           b.column < trGtLastIssuedColumn(source)))
   }
+  // Direct PE clients may still present an unordered stream. Keep a
+  // correctness fallback for those clients; the array-level TrGT scheduler is
+  // expected to keep this condition false by merging its K virtual B FIFOs.
+  val trGtCommandStartsNewEpoch =
+    io.command.payload.mode === TrapezoidDataflow.TrGt &&
+      trGtCommandOrderRegresses.orR
   val trGtCommandWindow = state === StreamingGustavsonState.MergeCompare &&
     mergingTrGt && !inputDone && !trGtDrainEpoch &&
-    trGtHeadReservationAvailable &&
+    trGtHeadReservationAvailable && !trGtCommandStartsNewEpoch &&
     io.command.payload.mode === TrapezoidDataflow.TrGt &&
     trGtCommandTagCount < U(trGtOutstandingDepth,
       trGtOutstandingCountWidth bits)
@@ -286,6 +295,7 @@ class GustavsonTileEngine(
   io.done := doneReg
   io.overflow := overflowReg
   io.unsupportedMode := modeErrorReg
+  io.trGtDrainActive := trGtDrainEpoch
   io.activeEntries := entryCount
   io.result.valid := state === StreamingGustavsonState.OutputEmit
   io.result.payload.valid := True
@@ -386,10 +396,6 @@ class GustavsonTileEngine(
     mergeControl.io.consumeRight
 
   when(trGtCommandFire) {
-    when(state === StreamingGustavsonState.MergeCompare) {
-      assert(!trGtCommandOrderRegresses.orR,
-        "array-level TrGT radix-K scheduler emitted a regressing subrow stream")
-    }
     trGtCommandTags(trGtCommandTagTail) :=
       trGtCommandTagTail.resize(cfg.responseTagWidth)
     when(trGtCommandTagTail === trGtOutstandingDepth - 1) {
@@ -422,6 +428,10 @@ class GustavsonTileEngine(
     is(B"01") { trGtCommandTagCount := trGtCommandTagCount - 1 }
   }
   when(mergingTrGt && !trGtHeadReservationAvailable) {
+    trGtDrainEpoch := True
+  }
+  when(state === StreamingGustavsonState.MergeCompare && mergingTrGt &&
+      io.command.valid && trGtCommandStartsNewEpoch) {
     trGtDrainEpoch := True
   }
   when(state === StreamingGustavsonState.Accept) {

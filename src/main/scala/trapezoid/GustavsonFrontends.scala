@@ -121,7 +121,10 @@ class BankedGustavsonBMergeFifoCore(cfg: TrapezoidConfig) extends Component {
   val io = new Bundle {
     val clear = in Bool()
     val active = in Bool()
-    val sourcesClosed = in Bool()
+    // A short B stream must be allowed to drain before the whole packed group
+    // closes, otherwise a longer sibling can fill its SRAM partition while the
+    // radix-K selector waits forever for the already exhausted source.
+    val sourceClosed = in Vec(Bits(sourcesPerBank bits), cfg.localBanks)
     val sourceActive = in Vec(Bits(sourcesPerBank bits), cfg.localBanks)
     val storage = master(LocalBufferBus(cfg))
     val pushes = Vec(slave(Stream(GustavsonB(cfg))), cfg.localBanks)
@@ -156,10 +159,24 @@ class BankedGustavsonBMergeFifoCore(cfg: TrapezoidConfig) extends Component {
       pointer.resize(cfg.localAddressWidth)).resized
 
   for (bank <- 0 until cfg.localBanks) {
-    val pushSource = io.pushes(bank).payload.aIndex(
-      sourceIndexWidth - 1 downto 0)
-    val pushHasSpace = totalCounts(bank)(pushSource) =/=
-      U(depthPerSource, sourceCountWidth bits)
+    val pushSource = UInt(sourceIndexWidth bits)
+    if (sourcesPerBank == 1) {
+      pushSource := 0
+    } else {
+      pushSource := io.pushes(bank).payload.aIndex(
+        sourceIndexWidth - 1 downto 0)
+    }
+    val pushHasSpace = Bool()
+    val pushWritePointer = UInt(pointerWidth bits)
+    pushHasSpace := False
+    pushWritePointer := 0
+    for (source <- 0 until sourcesPerBank) {
+      when(pushSource === source) {
+        pushHasSpace := totalCounts(bank)(source) =/=
+          U(depthPerSource, sourceCountWidth bits)
+        pushWritePointer := writePointers(bank)(source)
+      }
+    }
     io.pushes(bank).ready := !io.clear && io.active && pushHasSpace
 
     val selectedValid = Bool()
@@ -168,11 +185,20 @@ class BankedGustavsonBMergeFifoCore(cfg: TrapezoidConfig) extends Component {
     selectedValid := False
     selectedSource := 0
     selectedPayload := GustavsonB(cfg).getZero
+    val sourceWins = Vec(Bool(), sourcesPerBank)
     for (source <- 0 until sourcesPerBank) {
       val candidate = io.sourceActive(bank)(source) && headValids(bank)(source)
-      val lowerCoordinate = headPayloads(bank)(source).column <
-        selectedPayload.column
-      when(candidate && (!selectedValid || lowerCoordinate)) {
+      val earlierCandidate = (0 until sourcesPerBank).map { other =>
+        val lower = headPayloads(bank)(other).column <
+          headPayloads(bank)(source).column
+        val sameEarlier = if (other < source)
+          headPayloads(bank)(other).column === headPayloads(bank)(source).column
+        else False
+        io.sourceActive(bank)(other) && headValids(bank)(other) &&
+          (lower || sameEarlier)
+      }.reduce(_ || _)
+      sourceWins(source) := candidate && !earlierCandidate
+      when(sourceWins(source)) {
         selectedValid := True
         selectedSource := source
         selectedPayload := headPayloads(bank)(source)
@@ -181,7 +207,8 @@ class BankedGustavsonBMergeFifoCore(cfg: TrapezoidConfig) extends Component {
 
     val everySourceReady = (0 until sourcesPerBank).map { source =>
       !io.sourceActive(bank)(source) || headValids(bank)(source) ||
-        io.sourcesClosed
+        (io.sourceClosed(bank)(source) &&
+          totalCounts(bank)(source) === 0)
     }.reduce(_ && _)
     io.pops(bank).valid := !io.clear && io.active && everySourceReady &&
       selectedValid
@@ -190,59 +217,80 @@ class BankedGustavsonBMergeFifoCore(cfg: TrapezoidConfig) extends Component {
 
     val refillValid = Bool()
     val refillSource = UInt(sourceIndexWidth bits)
-    refillValid := False
+    val refillChoices = Vec(Bool(), sourcesPerBank)
+    for (source <- 0 until sourcesPerBank) {
+      val earlierMissing = if (source == 0) False else
+        (0 until source).map { earlier =>
+          !headValids(bank)(earlier) && storedCounts(bank)(earlier) =/= 0
+        }.reduce(_ || _)
+      refillChoices(source) := !headValids(bank)(source) &&
+        storedCounts(bank)(source) =/= 0 && !earlierMissing
+    }
+    refillValid := refillChoices.asBits.orR
     refillSource := 0
     for (source <- 0 until sourcesPerBank) {
-      when(!refillValid && !headValids(bank)(source) &&
-          storedCounts(bank)(source) =/= 0) {
-        refillValid := True
-        refillSource := source
-      }
+      when(refillChoices(source)) { refillSource := source }
     }
     val issueRead = !io.clear && io.active && !readPending(bank) &&
       refillValid
+    val refillReadPointer = UInt(pointerWidth bits)
+    refillReadPointer := 0
+    for (source <- 0 until sourcesPerBank) {
+      when(refillSource === source) {
+        refillReadPointer := readPointers(bank)(source)
+      }
+    }
     io.storage.readCommands(bank).valid := issueRead
     io.storage.readCommands(bank).payload :=
-      physicalAddress(refillSource, readPointers(bank)(refillSource))
+      physicalAddress(refillSource, refillReadPointer)
 
     val writeData = Bits(cfg.localLineWidth bits)
     writeData := 0
     writeData(recordWidth - 1 downto 0) := io.pushes(bank).payload.asBits
     io.storage.writes(bank).valid := io.pushes(bank).fire
     io.storage.writes(bank).payload.address :=
-      physicalAddress(pushSource, writePointers(bank)(pushSource))
+      physicalAddress(pushSource, pushWritePointer)
     io.storage.writes(bank).payload.data := writeData
     io.storage.writes(bank).payload.mask.setAll()
 
     when(io.pushes(bank).fire) {
-      assert(io.pushes(bank).payload.aIndex /
-        U(sourcesPerBank, cfg.aRegisterIndexWidth bits) === bank,
-        "TrGT B stream was pushed into the wrong subrow bank")
-      when(writePointers(bank)(pushSource) === depthPerSource - 1) {
-        writePointers(bank)(pushSource) := 0
-      } otherwise {
-        writePointers(bank)(pushSource) :=
-          writePointers(bank)(pushSource) + 1
+      for (source <- 0 until sourcesPerBank) {
+        when(pushSource === source) {
+          when(writePointers(bank)(source) === depthPerSource - 1) {
+            writePointers(bank)(source) := 0
+          } otherwise {
+            writePointers(bank)(source) := writePointers(bank)(source) + 1
+          }
+        }
       }
     }
     when(issueRead) {
       readPending(bank) := True
       readSource(bank) := refillSource
-      when(readPointers(bank)(refillSource) === depthPerSource - 1) {
-        readPointers(bank)(refillSource) := 0
-      } otherwise {
-        readPointers(bank)(refillSource) :=
-          readPointers(bank)(refillSource) + 1
+      for (source <- 0 until sourcesPerBank) {
+        when(refillSource === source) {
+          when(readPointers(bank)(source) === depthPerSource - 1) {
+            readPointers(bank)(source) := 0
+          } otherwise {
+            readPointers(bank)(source) := readPointers(bank)(source) + 1
+          }
+        }
       }
     }
     when(io.storage.readResponses(bank).valid && readPending(bank)) {
-      headPayloads(bank)(readSource(bank)).assignFromBits(
-        io.storage.readResponses(bank).payload(recordWidth - 1 downto 0))
-      headValids(bank)(readSource(bank)) := True
+      for (source <- 0 until sourcesPerBank) {
+        when(readSource(bank) === source) {
+          headPayloads(bank)(source).assignFromBits(
+            io.storage.readResponses(bank).payload(recordWidth - 1 downto 0))
+          headValids(bank)(source) := True
+        }
+      }
       readPending(bank) := False
     }
     when(popFire) {
-      headValids(bank)(selectedSource) := False
+      for (source <- 0 until sourcesPerBank) {
+        when(selectedSource === source) { headValids(bank)(source) := False }
+      }
     }
 
     for (source <- 0 until sourcesPerBank) {
@@ -345,12 +393,16 @@ class TrGtSubrowScheduler(
     val aLoad = slave(Stream(IndexedGustavsonA(cfg)))
     val start = slave(Stream(GustavsonStart()))
     val bPush = Vec(slave(Stream(GustavsonB(cfg))), subrows)
+    // sourceId is the flattened stationary-A index. groupId is carried by the
+    // active GustavsonStart context, so these bits close streams in that group.
+    val sourceFinish = in Bits(cfg.macLanes bits)
     val finish = in Bool()
     val result = master(Stream(MatrixResult(cfg)))
     val busy = out Bool()
     val done = out Bool()
     val overflow = out Bool()
     val unsupportedMode = out Bool()
+    val trGtDrainActive = out Bool()
     val fifoOccupancy = out Vec(UInt(tileCfg.fifoCountWidth bits), subrows)
     val acceptedBElements = out UInt(32 bits)
     val issuedBElements = out UInt(32 bits)
@@ -385,17 +437,24 @@ class TrGtSubrowScheduler(
   val controlDone = RegInit(False)
   val acceptedBElements = Reg(UInt(32 bits)) init 0
   val issuedBElements = Reg(UInt(32 bits)) init 0
+  val lastIssuedValid = Vec((0 until subrows).map(_ => RegInit(False)))
+  val lastIssuedRow = Vec((0 until subrows).map(_ =>
+    Reg(UInt(cfg.coordinateWidth bits)) init 0))
+  val lastIssuedColumn = Vec((0 until subrows).map(_ =>
+    Reg(UInt(cfg.coordinateWidth bits)) init 0))
   io.acceptedBElements := acceptedBElements
   io.issuedBElements := issuedBElements
 
   val fifos = new BankedGustavsonBMergeFifoCore(cfg)
   fifos.io.clear := io.clear
   fifos.io.active := (if (externalFifoStorage) io.fifoStorageActive else True)
-  fifos.io.sourcesClosed := finishSeen
   for (subrow <- 0 until subrows; source <- 0 until cfg.macLanesPerSubrow) {
+    val index = subrow * cfg.macLanesPerSubrow + source
     fifos.io.sourceActive(subrow)(source) :=
       aLoaded(runningContext.asUInt)(subrow)(source) &&
         aStorage(runningContext.asUInt)(subrow)(source).valid
+    fifos.io.sourceClosed(subrow)(source) :=
+      io.sourceFinish(index) || finishSeen
   }
   if (externalFifoStorage) {
     for (bank <- 0 until cfg.localBanks) {
@@ -444,6 +503,7 @@ class TrGtSubrowScheduler(
   io.done := controlDone || (!running && engine.io.done)
   io.overflow := engine.io.overflow
   io.unsupportedMode := modeError || engine.io.unsupportedMode
+  io.trGtDrainActive := engine.io.trGtDrainActive
 
   val aLoadTargetsInactiveContext =
     io.aLoad.payload.groupId =/= runningContext
@@ -477,6 +537,7 @@ class TrGtSubrowScheduler(
     controlDone := False
     acceptedBElements := 0
     issuedBElements := 0
+    lastIssuedValid.foreach(_ := False)
     runningContext := io.start.payload.groupId
     when(!aContextPrepared(io.start.payload.groupId.asUInt)) {
       for (group <- 0 until groupCount;
@@ -509,19 +570,83 @@ class TrGtSubrowScheduler(
     acceptedBElements := acceptedBElements + acceptedThisCycle
   }
 
+  val subrowActive = Vec(Bool(), subrows)
+  val subrowClosed = Vec(Bool(), subrows)
+  val subrowBaseRow = Vec(UInt(cfg.coordinateWidth bits), subrows)
+  val subrowHeadRow = Vec(UInt(cfg.coordinateWidth bits), subrows)
+  for (subrow <- 0 until subrows) {
+    val activeSources = (0 until cfg.macLanesPerSubrow).map { source =>
+      aLoaded(runningContext.asUInt)(subrow)(source) &&
+        aStorage(runningContext.asUInt)(subrow)(source).valid
+    }
+    subrowActive(subrow) := activeSources.reduce(_ || _)
+    subrowBaseRow(subrow) := 0
+    for (source <- (0 until cfg.macLanesPerSubrow).reverse) {
+      when(activeSources(source)) {
+        subrowBaseRow(subrow) :=
+          aStorage(runningContext.asUInt)(subrow)(source).row
+      }
+    }
+    subrowClosed(subrow) := (0 until cfg.macLanesPerSubrow).map { source =>
+      val index = subrow * cfg.macLanesPerSubrow + source
+      !activeSources(source) || io.sourceFinish(index) || finishSeen
+    }.reduce(_ && _) && fifos.io.occupancy(subrow) === 0
+    subrowHeadRow(subrow) := 0
+    for (source <- 0 until cfg.macLanesPerSubrow) {
+      when(fifos.io.pops(subrow).payload.aIndex ===
+          subrow * cfg.macLanesPerSubrow + source) {
+        subrowHeadRow(subrow) :=
+          aStorage(runningContext.asUInt)(subrow)(source).row
+      }
+    }
+  }
+
   val anyFifoValid = fifos.io.pops.map(_.valid).reduce(_ || _)
+  val selectedRow = UInt(cfg.coordinateWidth bits)
+  val selectedColumn = UInt(cfg.coordinateWidth bits)
+  val selectedValid = Bool()
+  selectedRow := 0
+  selectedColumn := 0
+  selectedValid := False
+  for (subrow <- 0 until subrows) {
+    val earlierHead = (0 until subrows).map { other =>
+      val earlierCoordinate = subrowHeadRow(other) < subrowHeadRow(subrow) ||
+        (subrowHeadRow(other) === subrowHeadRow(subrow) &&
+          fifos.io.pops(other).payload.column <
+            fifos.io.pops(subrow).payload.column)
+      val sameEarlier = if (other < subrow)
+        subrowHeadRow(other) === subrowHeadRow(subrow) &&
+          fifos.io.pops(other).payload.column ===
+            fifos.io.pops(subrow).payload.column
+      else False
+      fifos.io.pops(other).valid && (earlierCoordinate || sameEarlier)
+    }.reduce(_ || _)
+    when(fifos.io.pops(subrow).valid && !earlierHead) {
+      selectedValid := True
+      selectedRow := subrowHeadRow(subrow)
+      selectedColumn := fifos.io.pops(subrow).payload.column
+    }
+  }
+  val selectedSubrows = Vec(Bool(), subrows)
+  val everySubrowSafe = (0 until subrows).map { subrow =>
+    selectedSubrows(subrow) := fifos.io.pops(subrow).valid &&
+      subrowHeadRow(subrow) === selectedRow &&
+      fifos.io.pops(subrow).payload.column === selectedColumn
+    val lowerBoundSafe = lastIssuedValid(subrow) &&
+      (lastIssuedRow(subrow) > selectedRow ||
+        (lastIssuedRow(subrow) === selectedRow &&
+          lastIssuedColumn(subrow) >= selectedColumn))
+    val unopenedHigherRow = !lastIssuedValid(subrow) &&
+      subrowActive(subrow) && subrowBaseRow(subrow) > selectedRow
+    !subrowActive(subrow) || fifos.io.pops(subrow).valid ||
+      subrowClosed(subrow) || lowerBoundSafe || unopenedHigherRow
+  }.reduce(_ && _)
   val pendingBElements = acceptedBElements - issuedBElements
-  val visibleBElements = CountOne(fifos.io.pops.map(_.valid).asBits).resize(32)
-  val allPendingBElementsVisible = pendingBElements === visibleBElements
-  // The finish marker is attached to the last non-empty temporal issue when
-  // possible. Do not close the group in a cycle that also accepts new B
-  // elements: the registered accepted count does not include those pushes
-  // until the next cycle, and closing here would strand them in the FIFOs.
-  // An empty terminal command is only needed for an empty tile.
+  // Use an explicit empty terminal command.  A visible head may share neither
+  // row nor column with another visible head, so attaching finish to a partial
+  // coordinate batch could close the temporal merge too early.
   val issueFinal = running && finishSeen &&
-    acceptedThisCycle === 0 &&
-    ((!anyFifoValid && pendingBElements === 0) ||
-      (anyFifoValid && allPendingBElementsVisible))
+    acceptedThisCycle === 0 && !anyFifoValid && pendingBElements === 0
   val scheduledCommand = PERowCommand(cfg)
   scheduledCommand.mode := TrapezoidDataflow.TrGt
   scheduledCommand.endOfTile := issueFinal
@@ -542,7 +667,7 @@ class TrGtSubrowScheduler(
   }
   for (lane <- 0 until cfg.cacheLineWords) {
     if (lane < subrows) {
-      scheduledCommand.gustavson.b(lane).valid := fifos.io.pops(lane).valid
+      scheduledCommand.gustavson.b(lane).valid := selectedSubrows(lane)
       scheduledCommand.gustavson.b(lane).aIndex := fifos.io.pops(lane).payload.aIndex
       scheduledCommand.gustavson.b(lane).k := fifos.io.pops(lane).payload.k
       scheduledCommand.gustavson.b(lane).column := fifos.io.pops(lane).payload.column
@@ -552,10 +677,17 @@ class TrGtSubrowScheduler(
     }
   }
 
-  engine.io.command.valid := !io.clear && running && (anyFifoValid || issueFinal)
+  engine.io.command.valid := !io.clear && running &&
+    ((selectedValid && everySubrowSafe) || issueFinal)
   engine.io.command.payload := scheduledCommand
   for (subrow <- 0 until subrows) {
-    fifos.io.pops(subrow).ready := engine.io.command.fire && anyFifoValid
+    fifos.io.pops(subrow).ready := engine.io.command.fire &&
+      selectedSubrows(subrow)
+    when(fifos.io.pops(subrow).fire) {
+      lastIssuedValid(subrow) := True
+      lastIssuedRow(subrow) := subrowHeadRow(subrow)
+      lastIssuedColumn(subrow) := fifos.io.pops(subrow).payload.column
+    }
   }
   val issuedThisCycle = CountOne(issuedBits).resize(32)
   when(issuedThisCycle =/= 0) {
@@ -581,6 +713,7 @@ class TrGtSubrowScheduler(
     controlDone := False
     acceptedBElements := 0
     issuedBElements := 0
+    lastIssuedValid.foreach(_ := False)
   }
 }
 

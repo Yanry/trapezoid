@@ -40,6 +40,7 @@ class ModeSharedTileController(
     val trgtStart = Vec(slave(Stream(GustavsonStart())), cfg.peRows)
     val trgtBPush = Vec(
       Vec(slave(Stream(GustavsonB(cfg))), cfg.localBanks), cfg.peRows)
+    val trgtSourceFinish = in Vec(Bits(cfg.macLanes bits), cfg.peRows)
     val trgtFinish = in Bits(cfg.peRows bits)
     val trgtResult = Vec(master(Stream(MatrixResult(cfg))), cfg.peRows)
     val trgtBusy = out Bits(cfg.peRows bits)
@@ -121,6 +122,7 @@ class ModeSharedTileController(
     scheduler.io.start.valid := io.trgtStart(row).valid && trgtMayStart
     scheduler.io.start.payload := io.trgtStart(row).payload
     io.trgtStart(row).ready := scheduler.io.start.ready && trgtMayStart
+    scheduler.io.sourceFinish := io.trgtSourceFinish(row)
     scheduler.io.finish := io.trgtFinish(row)
     for (subrow <- 0 until cfg.localBanks) {
       scheduler.io.bPush(subrow).valid := io.trgtBPush(row)(subrow).valid

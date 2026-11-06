@@ -31,7 +31,7 @@ class UnifiedEndToEndSystemSpec extends AnyFunSuite {
     bankCount = 4,
     setsPerBank = 8,
     clientCount = 2 * cfg.localBanks + cfg.peRows + 2,
-    requestIdWidth = 3
+    requestIdWidth = 4
   )
   private val gustCfg = GustavsonCacheConfig(
     GustavsonTileConfig(cfg, accumulatorEntries = 4,
@@ -152,7 +152,19 @@ class UnifiedEndToEndSystemSpec extends AnyFunSuite {
   }
 
   test("one descriptor covers CSR DMA, cache clusters, compute, and C write responses") {
-    simConfig.compile(new UnifiedEndToEndSystem(systemCfg)).doSim { dut =>
+    simConfig.compile {
+      val dut = new UnifiedEndToEndSystem(systemCfg)
+      dut.sharedTile.trgt(0).engine.debugState.simPublic()
+      dut.sharedTile.trgt(0).engine.io.result.valid.simPublic()
+      dut.sharedTile.trgt(0).engine.io.result.ready.simPublic()
+      dut.sharedTile.trgt(0).acceptedBElements.simPublic()
+      dut.sharedTile.trgt(0).issuedBElements.simPublic()
+      dut.trgtScheduler.io.result.valid.simPublic()
+      dut.trgtScheduler.io.result.ready.simPublic()
+      dut.writeback.io.input.valid.simPublic()
+      dut.writeback.io.input.ready.simPublic()
+      dut
+    }.doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       dut.io.clear #= false
       dut.io.descriptor.valid #= false
@@ -268,7 +280,16 @@ class UnifiedEndToEndSystemSpec extends AnyFunSuite {
             s"schedulerBusy=${dut.io.trgtSchedulerBusy.toBoolean} " +
             s"fifo=${dut.io.trgtFifoOccupancy.toLong} " +
             s"assigned=${dut.io.trgtAssignedTiles.toLong} " +
-            s"completed=${dut.io.trgtCompletedTiles.toLong}")
+            s"completed=${dut.io.trgtCompletedTiles.toLong} " +
+            s"engineState=${dut.sharedTile.trgt(0).engine.debugState.toInt} " +
+            s"engineResult=${dut.sharedTile.trgt(0).engine.io.result.valid.toBoolean}/" +
+              s"${dut.sharedTile.trgt(0).engine.io.result.ready.toBoolean} " +
+            s"accepted=${dut.sharedTile.trgt(0).acceptedBElements.toLong} " +
+            s"issued=${dut.sharedTile.trgt(0).issuedBElements.toLong} " +
+            s"rowResult=${dut.trgtScheduler.io.result.valid.toBoolean}/" +
+              s"${dut.trgtScheduler.io.result.ready.toBoolean} " +
+            s"writeback=${dut.writeback.io.input.valid.toBoolean}/" +
+              s"${dut.writeback.io.input.ready.toBoolean}")
         val doneEdge = edge
         assert(!dut.io.error.toBoolean, s"mode $mode reported an error")
         assert(writes.map(_._1) == (cBase until cBase + expected.size))

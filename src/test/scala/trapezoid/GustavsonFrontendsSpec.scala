@@ -17,6 +17,7 @@ class ExternalBufferedTrGtHarness(tileCfg: GustavsonTileConfig)
     val aLoad = slave(Stream(IndexedGustavsonA(cfg)))
     val start = slave(Stream(GustavsonStart()))
     val bPush = Vec(slave(Stream(GustavsonB(cfg))), cfg.localBanks)
+    val sourceFinish = in Bits(cfg.macLanes bits)
     val finish = in Bool()
     val result = master(Stream(MatrixResult(cfg)))
     val done = out Bool()
@@ -38,6 +39,7 @@ class ExternalBufferedTrGtHarness(tileCfg: GustavsonTileConfig)
   scheduler.io.start.valid := io.start.valid
   scheduler.io.start.payload := io.start.payload
   io.start.ready := scheduler.io.start.ready
+  scheduler.io.sourceFinish := io.sourceFinish
   scheduler.io.finish := io.finish
   for (bank <- 0 until cfg.localBanks) {
     scheduler.io.bPush(bank).valid := io.bPush(bank).valid
@@ -214,6 +216,7 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     dut.io.clear #= false
     dut.io.aLoad.valid #= false
     dut.io.start.valid #= false
+    dut.io.sourceFinish #= 0
     dut.io.finish #= false
     dut.io.result.ready #= false
     for (subrow <- 0 until cfg.localBanks) dut.io.bPush(subrow).valid #= false
@@ -255,10 +258,49 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
     stream.valid #= false
   }
 
+  private def loadA(dut: ExternalBufferedTrGtHarness, index: Int,
+                    row: Int, k: Int, value: Int): Unit = {
+    dut.io.aLoad.payload.groupId #= false
+    dut.io.aLoad.payload.index #= index
+    dut.io.aLoad.payload.element.valid #= true
+    dut.io.aLoad.payload.element.row #= row
+    dut.io.aLoad.payload.element.k #= k
+    dut.io.aLoad.payload.element.value #= value
+    dut.io.aLoad.valid #= true
+    sleep(1)
+    while (!dut.io.aLoad.ready.toBoolean) {
+      dut.clockDomain.waitSampling()
+      sleep(1)
+    }
+    dut.clockDomain.waitSampling()
+    sleep(1)
+    dut.io.aLoad.valid #= false
+  }
+
+  private def pushB(dut: ExternalBufferedTrGtHarness, subrow: Int,
+                    aIndex: Int, k: Int, column: Int, value: Int): Unit = {
+    val stream = dut.io.bPush(subrow)
+    stream.payload.valid #= true
+    stream.payload.aIndex #= aIndex
+    stream.payload.k #= k
+    stream.payload.column #= column
+    stream.payload.value #= value
+    stream.valid #= true
+    sleep(1)
+    while (!stream.ready.toBoolean) {
+      dut.clockDomain.waitSampling()
+      sleep(1)
+    }
+    dut.clockDomain.waitSampling()
+    sleep(1)
+    stream.valid #= false
+  }
+
   test("TrGT subrows drain independent B FIFOs with backpressure") {
     simConfig.compile(new TrGtSubrowScheduler(tileCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       initializeTrGt(dut)
+      dut.io.result.ready #= true
 
       loadA(dut, 0, row = 2, k = 0, value = 2)
       loadA(dut, 1, row = 2, k = 1, value = 3)
@@ -311,6 +353,300 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
         s"accepted=${dut.io.acceptedBElements.toLong}, " +
           s"issued=${dut.io.issuedBElements.toLong}")
       assert(observed.map(_._4) == Seq(false, false, false, false, false, true))
+    }
+  }
+
+  test("TrGT merges independent B rows inside one subrow without an order epoch") {
+    val multiSourceCfg = cfg.copy(macLanes = 8, localDepthPerBank = 16)
+    val multiSourceTileCfg = GustavsonTileConfig(multiSourceCfg,
+      accumulatorEntries = 8, fifoDepthPerSubrow = 4)
+    simConfig.compile(new TrGtSubrowScheduler(multiSourceTileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.aLoad.valid #= false
+      dut.io.start.valid #= false
+      dut.io.sourceFinish #= 0
+      dut.io.finish #= false
+      dut.io.result.ready #= true
+      for (subrow <- 0 until multiSourceCfg.localBanks) {
+        dut.io.bPush(subrow).valid #= false
+      }
+
+      loadA(dut, 0, row = 2, k = 0, value = 2)
+      loadA(dut, 1, row = 2, k = 1, value = 3)
+      dut.io.start.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.start.payload.groupId #= false
+      dut.io.start.valid #= true
+      while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      dut.io.start.valid #= false
+
+      // Arrival order regresses from column 5 to column 1 at the B-row
+      // boundary. The virtual source FIFOs must hide that boundary from the
+      // downstream four-stream MRN.
+      pushB(dut, 0, aIndex = 0, k = 0, column = 2, value = 11)
+      pushB(dut, 0, aIndex = 0, k = 0, column = 5, value = 13)
+      pushB(dut, 0, aIndex = 1, k = 1, column = 1, value = 7)
+      pushB(dut, 0, aIndex = 1, k = 1, column = 5, value = 17)
+      dut.io.finish #= true
+      dut.clockDomain.waitSampling()
+      dut.io.finish #= false
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      var sawOrderEpoch = false
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 500) {
+        sawOrderEpoch = sawOrderEpoch || dut.io.trGtDrainActive.toBoolean
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+
+      assert(dut.io.done.toBoolean)
+      assert(!sawOrderEpoch)
+      assert(observed == Seq((2, 1, 21L), (2, 2, 22L), (2, 5, 77L)))
+    }
+  }
+
+  test("TrGT closes a short source while a longer sibling keeps streaming") {
+    val multiSourceCfg = cfg.copy(macLanes = 8, localDepthPerBank = 16)
+    val multiSourceTileCfg = GustavsonTileConfig(multiSourceCfg,
+      accumulatorEntries = 16, fifoDepthPerSubrow = 4)
+    simConfig.compile(new TrGtSubrowScheduler(multiSourceTileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.aLoad.valid #= false
+      dut.io.start.valid #= false
+      dut.io.sourceFinish #= 0
+      dut.io.finish #= false
+      dut.io.result.ready #= true
+      for (subrow <- 0 until multiSourceCfg.localBanks) {
+        dut.io.bPush(subrow).valid #= false
+      }
+
+      loadA(dut, 0, row = 3, k = 0, value = 1)
+      loadA(dut, 1, row = 3, k = 1, value = 1)
+      dut.io.start.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.start.payload.groupId #= false
+      dut.io.start.valid #= true
+      while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      dut.io.start.valid #= false
+
+      pushB(dut, 0, aIndex = 0, k = 0, column = 0, value = 1)
+      dut.io.sourceFinish #= 1
+      for (column <- 0 until 12) {
+        pushB(dut, 0, aIndex = 1, k = 1, column = column, value = 1)
+      }
+      dut.io.sourceFinish #= 3
+      dut.io.finish #= true
+      dut.clockDomain.waitSampling()
+      dut.io.finish #= false
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 1000) {
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(dut.io.done.toBoolean,
+        s"accepted=${dut.io.acceptedBElements.toLong}, " +
+          s"issued=${dut.io.issuedBElements.toLong}")
+      assert(!dut.io.trGtDrainActive.toBoolean)
+      assert(observed == ((3, 0, 2L) +:
+        (1 until 12).map(column => (3, column, 1L))))
+    }
+  }
+
+  test("TrGT reduces equal coordinates across virtual sources and subrows") {
+    val multiSourceCfg = cfg.copy(macLanes = 8, localDepthPerBank = 16)
+    val multiSourceTileCfg = GustavsonTileConfig(multiSourceCfg,
+      accumulatorEntries = 8, fifoDepthPerSubrow = 4)
+    simConfig.compile(new TrGtSubrowScheduler(multiSourceTileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.aLoad.valid #= false
+      dut.io.start.valid #= false
+      dut.io.sourceFinish #= 0
+      dut.io.finish #= false
+      dut.io.result.ready #= true
+      for (subrow <- 0 until multiSourceCfg.localBanks) {
+        dut.io.bPush(subrow).valid #= false
+      }
+
+      loadA(dut, 4, row = 5, k = 0, value = 1)
+      loadA(dut, 5, row = 5, k = 7, value = 4)
+      loadA(dut, 6, row = 5, k = 12, value = 1)
+      dut.io.start.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.start.payload.groupId #= false
+      dut.io.start.valid #= true
+      while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      dut.io.start.valid #= false
+
+      // Let subrow 3 become visible first. A radix-K merge must not consume
+      // it until the still-open subrow 2 has supplied its equal-coordinate
+      // heads.
+      pushB(dut, 3, aIndex = 6, k = 12, column = 0, value = 1)
+      dut.clockDomain.waitSampling(10)
+      pushB(dut, 2, aIndex = 4, k = 0, column = 0, value = 1)
+      pushB(dut, 2, aIndex = 5, k = 7, column = 0, value = 1)
+      dut.io.finish #= true
+      dut.clockDomain.waitSampling()
+      dut.io.finish #= false
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 500) {
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+
+      assert(dut.io.done.toBoolean)
+      assert(!dut.io.trGtDrainActive.toBoolean)
+      assert(observed == Seq((5, 0, 6L)))
+    }
+  }
+
+  test("TrGT closes active sources whose B rows are empty") {
+    simConfig.compile {
+      val dut = new TrGtSubrowScheduler(tileCfg)
+      dut.engine.debugState.simPublic()
+      dut.engine.inputDone.simPublic()
+      dut.engine.trGtCommandTagCount.simPublic()
+      dut.engine.trGtHeadFifoCounts.foreach(_.simPublic())
+      dut.engine.temporalOutstanding.simPublic()
+      dut.engine.mergeCommitValid.simPublic()
+      dut.engine.oldEntryValid.simPublic()
+      dut.engine.oldReadPending.simPublic()
+      dut.engine.oldIndex.simPublic()
+      dut.engine.oldCount.simPublic()
+      dut.engine.writeIndex.simPublic()
+      dut
+    }.doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      initializeTrGt(dut)
+      dut.io.result.ready #= true
+      loadA(dut, 0, row = 0, k = 0, value = 1)
+      loadA(dut, 1, row = 0, k = 1, value = 2)
+      loadA(dut, 2, row = 1, k = 1, value = 3)
+
+      dut.io.start.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.start.payload.groupId #= false
+      dut.io.start.valid #= true
+      while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      dut.io.start.valid #= false
+      pushB(dut, 0, aIndex = 0, k = 0, column = 0, value = 4)
+      pushB(dut, 0, aIndex = 0, k = 0, column = 1, value = 5)
+      dut.io.finish #= true
+      dut.clockDomain.waitSampling()
+      dut.io.finish #= false
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 500) {
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(dut.io.done.toBoolean,
+        s"accepted=${dut.io.acceptedBElements.toLong}, " +
+          s"issued=${dut.io.issuedBElements.toLong}, " +
+          s"state=${dut.engine.debugState.toInt}, " +
+          s"inputDone=${dut.engine.inputDone.toBoolean}, " +
+          s"tags=${dut.engine.trGtCommandTagCount.toInt}, " +
+          s"heads=${dut.engine.trGtHeadFifoCounts.map(_.toInt).mkString(",")}, " +
+          s"temporal=${dut.engine.temporalOutstanding.toInt}, " +
+          s"commit=${dut.engine.mergeCommitValid.toBoolean}, " +
+          s"oldValid=${dut.engine.oldEntryValid.toBoolean}, " +
+          s"oldPending=${dut.engine.oldReadPending.toBoolean}, " +
+          s"old=${dut.engine.oldIndex.toInt}/${dut.engine.oldCount.toInt}, " +
+          s"write=${dut.engine.writeIndex.toInt}")
+      assert(observed == Seq((0, 0, 4L), (0, 1, 5L)))
+    }
+  }
+
+  test("TrGT sustains uneven packed rows through banked SRAM") {
+    val denseCfg = cfg.copy(fiberWidth = 8, macLanes = 16,
+      localDepthPerBank = 32)
+    val denseTileCfg = GustavsonTileConfig(denseCfg,
+      accumulatorEntries = 64, fifoDepthPerSubrow = 8)
+    simConfig.compile(new ExternalBufferedTrGtHarness(denseTileCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.clear #= false
+      dut.io.aLoad.valid #= false
+      dut.io.start.valid #= false
+      dut.io.sourceFinish #= 0
+      dut.io.finish #= false
+      dut.io.result.ready #= true
+      for (subrow <- 0 until denseCfg.localBanks) {
+        dut.io.bPush(subrow).valid #= false
+      }
+      val activeSources = Seq(0, 1, 2, 4, 5, 6, 7, 8, 12)
+      for (source <- activeSources) {
+        val row = if (source < 4) 0 else if (source < 12) 1 else 2
+        loadA(dut, source, row = row, k = source, value = 1)
+      }
+      dut.io.start.payload.mode #= TrapezoidDataflow.TrGt
+      dut.io.start.payload.groupId #= false
+      dut.io.start.valid #= true
+      while (!dut.io.start.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      dut.io.start.valid #= false
+
+      var finishedSources = BigInt(0)
+      val sourceGroups = Seq(Seq(0, 1, 2), Seq(4, 5, 6, 7, 8), Seq(12))
+      for (sources <- sourceGroups; column <- 0 until 16; source <- sources) {
+        val subrow = source / denseCfg.macLanesPerSubrow
+        pushB(dut, subrow, aIndex = source, k = source,
+          column = column, value = 1)
+        if (column == 15) {
+          finishedSources = finishedSources.setBit(source)
+          dut.io.sourceFinish #= finishedSources
+        }
+      }
+      dut.io.finish #= true
+      dut.clockDomain.waitSampling()
+      dut.io.finish #= false
+
+      val observed = mutable.ArrayBuffer.empty[(Int, Int, Long)]
+      var timeout = 0
+      while (!dut.io.done.toBoolean && timeout < 5000) {
+        if (dut.io.result.valid.toBoolean && dut.io.result.ready.toBoolean) {
+          observed += ((dut.io.result.payload.row.toInt,
+            dut.io.result.payload.column.toInt,
+            dut.io.result.payload.value.toLong))
+        }
+        dut.clockDomain.waitSampling()
+        timeout += 1
+      }
+      assert(dut.io.done.toBoolean,
+        s"accepted=${dut.io.acceptedBElements.toLong}, " +
+          s"issued=${dut.io.issuedBElements.toLong}")
+      assert(observed == (for {
+        row <- 0 until 3
+        column <- 0 until 16
+        value = Seq(3L, 5L, 1L)(row)
+      } yield (row, column, value)))
     }
   }
 
@@ -422,6 +758,7 @@ class GustavsonFrontendsSpec extends AnyFunSuite {
       dut.io.clear #= false
       dut.io.aLoad.valid #= false
       dut.io.start.valid #= false
+      dut.io.sourceFinish #= 0
       dut.io.finish #= false
       dut.io.result.ready #= false
       for (subrow <- 0 until cfg.localBanks) {

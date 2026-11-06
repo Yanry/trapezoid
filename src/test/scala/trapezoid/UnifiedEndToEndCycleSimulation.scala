@@ -658,6 +658,25 @@ object EndToEndCycleSimulation extends App {
           case coordinate if observedMap.get(coordinate) != expected.get(coordinate) =>
             s"$coordinate:${observedMap.get(coordinate)}!=${expected.get(coordinate)}"
         }.take(8)
+      val differenceContributions = resultDifferences.map { difference =>
+        val coordinate = difference.takeWhile(_ != ':')
+          .stripPrefix("(").stripSuffix(")").split(',').map(_.trim.toInt)
+        val row = coordinate(0)
+        val column = coordinate(1)
+        val aEntries = (0 until dimension).collect {
+          case k if workload.a(row, k) != 0 => k -> workload.a(row, k)
+        }
+        val contributions = (0 until dimension).collect {
+          case k if workload.a(row, k) != 0 && workload.b(k, column) != 0 =>
+            s"a=${aEntries.indexWhere(_._1 == k)},k=$k:" +
+              s"${workload.a(row, k)}*${workload.b(k, column)}=" +
+              s"${workload.a(row, k) * workload.b(k, column)}"
+        }
+        s"($row,$column)=[${contributions.mkString(",")}]," +
+          s"aRow=[${aEntries.zipWithIndex.map { case ((k, value), ordinal) =>
+            s"$ordinal:k$k=$value"
+          }.mkString(",")}]"
+      }
       val missingRows = expected.keySet.diff(observedMap.keySet).toVector
         .groupBy(_._1).toVector.sortBy(_._1)
         .map { case (row, coordinates) => s"$row:${coordinates.size}" }
@@ -672,7 +691,8 @@ object EndToEndCycleSimulation extends App {
           s"aRows=${aRowNonZeros.mkString(",")}, " +
           s"assigned=${dut.io.trgtAssignedTiles.toLong}, " +
           s"completed=${dut.io.trgtCompletedTiles.toLong}, " +
-          s"differences=${resultDifferences.mkString(",")}")
+          s"differences=${resultDifferences.mkString(",")}, " +
+          s"contributions=${differenceContributions.mkString(";")}")
       require(writeRequests == expected.size)
 
       Measurement(workload.category, workload.sample, modeName,

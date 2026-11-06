@@ -37,6 +37,7 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
       dut.io.tripResult.ready #= false
       dut.io.trgtALoad(0).valid #= false
       dut.io.trgtStart(0).valid #= false
+      dut.io.trgtSourceFinish(0) #= 0
       dut.io.trgtFinish #= 0
       dut.io.trgtResult(0).ready #= false
       dut.io.trgsCommand(0).valid #= false
@@ -245,6 +246,7 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
       dut.io.tripResult.ready #= false
       dut.io.trgtALoad(0).valid #= false
       dut.io.trgtStart(0).valid #= false
+      dut.io.trgtSourceFinish(0) #= 0
       dut.io.trgtFinish #= 0
       dut.io.trgtResult(0).ready #= true
       dut.io.trgsCommand(0).valid #= false

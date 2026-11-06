@@ -109,4 +109,62 @@ class DualModeMrnNodeSpec extends AnyFunSuite {
         assert(dut.io.temporalOutputs(0).payload.first.value.toLong == 18)
       }
   }
+
+  test("N-1 augmented tree reduces a six-lane segment across subtree boundaries") {
+    val treeCfg = cfg.copy(maxFibers = 2, macLanes = 8, outputLanes = 4)
+    simConfig.compile(new DualModeMrnTree(treeCfg)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.input.valid #= false
+      dut.io.output.ready #= true
+      for (port <- 0 until treeCfg.localBanks) {
+        dut.io.temporalInputs(port).valid #= false
+        dut.io.temporalInputs(port).payload.mode #= MrnNodeMode.GustavsonMerge
+        dut.io.temporalInputs(port).payload.left.valid #= false
+        dut.io.temporalInputs(port).payload.left.row #= 0
+        dut.io.temporalInputs(port).payload.left.column #= 0
+        dut.io.temporalInputs(port).payload.left.value #= 0
+        dut.io.temporalInputs(port).payload.right.valid #= false
+        dut.io.temporalInputs(port).payload.right.row #= 0
+        dut.io.temporalInputs(port).payload.right.column #= 0
+        dut.io.temporalInputs(port).payload.right.value #= 0
+        dut.io.temporalOutputs(port).ready #= true
+      }
+
+      dut.io.input.payload.mode #= TrapezoidDataflow.TrIp
+      dut.io.input.payload.endOfTile #= true
+      dut.io.input.payload.overflow #= false
+      dut.io.input.payload.responseTag #= 3
+      dut.io.input.payload.selectedColumns #= 2
+      dut.io.input.payload.effectualMacs #= 8
+      for (lane <- 0 until treeCfg.macLanes) {
+        val entry = dut.io.input.payload.lanes(lane)
+        entry.valid #= true
+        entry.segmentStart #= lane == 0 || lane == 6
+        entry.row #= (if (lane < 6) 4 else 9)
+        entry.column #= (if (lane < 6) 5 else 2)
+        entry.destinationBank #= lane % treeCfg.localBanks
+        entry.destinationWordOffset #= 0
+        entry.value #= lane + 1
+      }
+
+      dut.io.input.valid #= true
+      while (!dut.io.input.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      dut.io.input.valid #= false
+      while (!dut.io.output.valid.toBoolean) dut.clockDomain.waitSampling()
+
+      assert(dut.io.output.payload.lanes(0).valid.toBoolean)
+      assert(dut.io.output.payload.lanes(0).row.toInt == 4)
+      assert(dut.io.output.payload.lanes(0).column.toInt == 5)
+      assert(dut.io.output.payload.lanes(0).value.toLong == 21)
+      assert(dut.io.output.payload.lanes(1).valid.toBoolean)
+      assert(dut.io.output.payload.lanes(1).row.toInt == 9)
+      assert(dut.io.output.payload.lanes(1).column.toInt == 2)
+      assert(dut.io.output.payload.lanes(1).value.toLong == 15)
+      for (lane <- 2 until treeCfg.macLanes) {
+        assert(!dut.io.output.payload.lanes(lane).valid.toBoolean)
+      }
+      assert(!dut.io.output.payload.overflow.toBoolean)
+    }
+  }
 }

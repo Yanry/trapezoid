@@ -791,9 +791,9 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   reductionInput.payload.lanes := orderedProducts
   macStage.ready := reductionInput.ready
 
-  // The paper assigns one cycle to every MRN level.  The explicit dual-mode
-  // tree keeps comparator, gated adder and mux logic together at each level;
-  // the segment head flag prevents reductions from crossing coordinates.
+  // The paper assigns one cycle to every MRN level. The explicit dual-mode
+  // tree keeps comparator, gated adder and local switch logic together at each
+  // level; coordinate controls prevent reductions from crossing segments.
   val mrnTree = new DualModeMrnTree(cfg)
   mrnTree.io.input << reductionInput
   for (port <- 0 until cfg.localBanks) {

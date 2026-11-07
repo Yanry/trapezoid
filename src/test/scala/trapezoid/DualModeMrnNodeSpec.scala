@@ -58,14 +58,16 @@ class DualModeMrnNodeSpec extends AnyFunSuite {
       .doSim { dut =>
         dut.clockDomain.forkStimulus(10)
         dut.io.input.valid #= true
-        dut.io.input.payload.mode #= TrapezoidDataflow.TrGs
-        dut.io.input.payload.endOfTile #= false
-        dut.io.input.payload.overflow #= false
-        dut.io.input.payload.selectedColumns #= 0
-        dut.io.input.payload.effectualMacs #= 0
+        dut.io.input.payload.reduction.mode #= TrapezoidDataflow.TrGs
+        dut.io.input.payload.reduction.endOfTile #= false
+        dut.io.input.payload.reduction.responseTag #= 0
+        dut.io.input.payload.reduction.overflow #= false
+        dut.io.input.payload.reduction.selectedColumns #= 0
+        dut.io.input.payload.reduction.effectualMacs #= 0
+        dut.io.input.payload.profile #= SpatialMrnProfile.OrderedMerge
         dut.io.output.ready #= false
         for (lane <- 0 until cfg.macLanes) {
-          val entry = dut.io.input.payload.lanes(lane)
+          val entry = dut.io.input.payload.reduction.lanes(lane)
           entry.valid #= false
           entry.segmentStart #= false
           entry.row #= 0
@@ -73,6 +75,21 @@ class DualModeMrnNodeSpec extends AnyFunSuite {
           entry.destinationBank #= 0
           entry.destinationWordOffset #= 0
           entry.value #= 0
+          dut.io.input.payload.subtrees(lane).count #= 0
+          dut.io.input.payload.subtrees(lane).head.valid #= false
+          dut.io.input.payload.subtrees(lane).head.segmentStart #= false
+          dut.io.input.payload.subtrees(lane).head.row #= 0
+          dut.io.input.payload.subtrees(lane).head.column #= 0
+          dut.io.input.payload.subtrees(lane).head.destinationBank #= 0
+          dut.io.input.payload.subtrees(lane).head.destinationWordOffset #= 0
+          dut.io.input.payload.subtrees(lane).head.value #= 0
+          dut.io.input.payload.subtrees(lane).tail.valid #= false
+          dut.io.input.payload.subtrees(lane).tail.segmentStart #= false
+          dut.io.input.payload.subtrees(lane).tail.row #= 0
+          dut.io.input.payload.subtrees(lane).tail.column #= 0
+          dut.io.input.payload.subtrees(lane).tail.destinationBank #= 0
+          dut.io.input.payload.subtrees(lane).tail.destinationWordOffset #= 0
+          dut.io.input.payload.subtrees(lane).tail.value #= 0
         }
         for (port <- 0 until cfg.localBanks) {
           dut.io.temporalInputs(port).valid #= false

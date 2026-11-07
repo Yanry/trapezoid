@@ -7,6 +7,69 @@ object MrnNodeMode extends SpinalEnum {
   val IpReduce, GustavsonMerge = newElement()
 }
 
+/** Spatial policy selected before a command enters the augmented MRN.
+  *
+  * The policy is control metadata, while coordinate equality remains a
+  * data-dependent boundary event evaluated by the node comparator.
+  */
+object SpatialMrnNodeMode extends SpinalEnum {
+  val IpReduce, OrderedMerge = newElement()
+}
+
+/** Mapper-selected MRN profile carried with each command. */
+object SpatialMrnProfile extends SpinalEnum {
+  val IpReduction, OrderedMerge = newElement()
+
+  def fromDataflow(dataflow: TrapezoidDataflow.C): SpatialMrnProfile.C = {
+    val profile = SpatialMrnProfile()
+    profile := SpatialMrnProfile.IpReduction
+    when(dataflow === TrapezoidDataflow.TrGt ||
+        dataflow === TrapezoidDataflow.TrGs) {
+      profile := SpatialMrnProfile.OrderedMerge
+    }
+    profile
+  }
+}
+
+/** One independently addressed node word in the mapper control table. */
+case class SpatialMrnNodeConfig() extends Bundle {
+  val mode = SpatialMrnNodeMode()
+  val reduceOnEqual = Bool()
+  val checkOrdered = Bool()
+}
+
+/** Per-level view of the mapper-generated MRN control memory.
+  *
+  * Every physical node owns a distinct word addressed by its global tree
+  * index. The current profiles contain regular settings, but the table keeps
+  * the node boundary explicit for future layer-specific programming.
+  */
+class SpatialMrnControlMemory(
+    cfg: TrapezoidConfig,
+    level: Int,
+    nodeCount: Int
+) extends Component {
+  private val levelBase = cfg.macLanes - (cfg.macLanes >> level)
+
+  val io = new Bundle {
+    val profile = in(SpatialMrnProfile())
+    val nodeConfigs = out Vec(SpatialMrnNodeConfig(), nodeCount)
+  }
+
+  for (node <- 0 until nodeCount) {
+    val globalNodeId = levelBase + node
+    val config = io.nodeConfigs(node)
+    val orderedProfile = io.profile === SpatialMrnProfile.OrderedMerge
+    config.mode := Mux(orderedProfile,
+      SpatialMrnNodeMode.OrderedMerge, SpatialMrnNodeMode.IpReduce)
+    config.reduceOnEqual := True
+    config.checkOrdered := orderedProfile
+    config.mode.setName(s"mrnNode${globalNodeId}Mode")
+    config.reduceOnEqual.setName(s"mrnNode${globalNodeId}ReduceOnEqual")
+    config.checkOrdered.setName(s"mrnNode${globalNodeId}CheckOrdered")
+  }
+}
+
 case class MrnNodeEntry(cfg: TrapezoidConfig) extends Bundle {
   val valid = Bool()
   val row = UInt(cfg.coordinateWidth bits)

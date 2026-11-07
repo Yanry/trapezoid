@@ -67,6 +67,8 @@ case class PERowReductionPayload(cfg: TrapezoidConfig) extends Bundle {
 case class TrapezoidPERowIo(cfg: TrapezoidConfig) extends Bundle {
   val command = slave(Stream(PERowCommand(cfg)))
   val response = master(Stream(PERowResponse(cfg)))
+  /** Mapper/compiler programming port for the per-level MRN control store. */
+  val mrnProgram = slave(Flow(SpatialMrnControlWrite(cfg)))
   val temporalMrnInputs = Vec(slave(Stream(DualModeMrnRequest(cfg))),
     cfg.localBanks)
   val temporalMrnOutputs = Vec(master(Stream(DualModeMrnResponse(cfg))),
@@ -83,9 +85,17 @@ trait TrapezoidPERowComponent {
 }
 
 object TrapezoidPERowComponent {
+  def tieOffMrnProgramming(
+      pe: TrapezoidPERowComponent,
+      cfg: TrapezoidConfig): Unit = {
+    pe.io.mrnProgram.valid := False
+    pe.io.mrnProgram.payload := SpatialMrnControlWrite(cfg).getZero
+  }
+
   def tieOffTemporalMrn(
       pe: TrapezoidPERowComponent,
       cfg: TrapezoidConfig): Unit = {
+    tieOffMrnProgramming(pe, cfg)
     for (port <- 0 until cfg.localBanks) {
       pe.io.temporalMrnInputs(port).valid := False
       pe.io.temporalMrnInputs(port).payload := DualModeMrnRequest(cfg).getZero
@@ -796,6 +806,8 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   // level; coordinate controls prevent reductions from crossing segments.
   val mrnTree = new DualModeMrnTree(cfg)
   mrnTree.io.input << reductionInput
+  mrnTree.io.program.valid := io.mrnProgram.valid
+  mrnTree.io.program.payload := io.mrnProgram.payload
   for (port <- 0 until cfg.localBanks) {
     mrnTree.io.temporalInputs(port) << io.temporalMrnInputs(port)
     io.temporalMrnOutputs(port) << mrnTree.io.temporalOutputs(port)

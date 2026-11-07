@@ -53,10 +53,57 @@ class DualModeMrnNodeSpec extends AnyFunSuite {
     }
   }
 
+  test("mapper programming updates one addressed MRN node word") {
+    val nodeCount = cfg.macLanes / 2
+    simConfig.compile(new SpatialMrnControlMemory(
+      cfg, level = 0, nodeCount = nodeCount, subtreeCapacity = 2,
+      temporalPortPositions = Map(0 -> 1))).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.profile #= SpatialMrnProfile.OrderedMerge
+      dut.io.program.valid #= false
+      dut.clockDomain.waitSampling()
+
+      assert(dut.io.nodeConfigs(1).mode.toEnum ==
+        SpatialMrnNodeMode.OrderedMerge)
+      assert(dut.io.nodeConfigs(1).temporalEnable.toBoolean)
+      assert(dut.io.nodeConfigs(1).temporalOwner.toInt == 0)
+
+      dut.io.program.payload.profile #= SpatialMrnProfile.OrderedMerge
+      dut.io.program.payload.level #= 0
+      dut.io.program.payload.node #= 1
+      dut.io.program.payload.mode #= SpatialMrnNodeMode.IpReduce
+      dut.io.program.payload.reduceOnEqual #= false
+      dut.io.program.payload.checkOrdered #= false
+      dut.io.program.payload.subtreeBase #= 2
+      dut.io.program.payload.subtreeLength #= 1
+      dut.io.program.payload.routeMode #= 1
+      dut.io.program.payload.routeShift #= 1
+      dut.io.program.payload.temporalEnable #= true
+      dut.io.program.payload.temporalOwner #= 2
+      dut.io.program.valid #= true
+      dut.clockDomain.waitSampling()
+      dut.io.program.valid #= false
+      sleep(1)
+
+      assert(dut.io.nodeConfigs(1).programmed.toBoolean)
+      assert(dut.io.nodeConfigs(1).mode.toEnum == SpatialMrnNodeMode.IpReduce)
+      assert(!dut.io.nodeConfigs(1).reduceOnEqual.toBoolean)
+      assert(!dut.io.nodeConfigs(1).checkOrdered.toBoolean)
+      assert(dut.io.nodeConfigs(1).subtreeBase.toInt == 2)
+      assert(dut.io.nodeConfigs(1).subtreeLength.toInt == 1)
+      assert(dut.io.nodeConfigs(1).routeMode.toInt == 1)
+      assert(dut.io.nodeConfigs(1).routeShift.toInt == 1)
+      assert(dut.io.nodeConfigs(1).temporalEnable.toBoolean)
+      assert(dut.io.nodeConfigs(1).temporalOwner.toInt == 2)
+      assert(!dut.io.nodeConfigs(0).programmed.toBoolean)
+    }
+  }
+
   test("temporal merge can preempt a held spatial payload") {
     simConfig.compile(new DualModeMrnLevel(cfg, level = 0, Map(0 -> 1)))
       .doSim { dut =>
         dut.clockDomain.forkStimulus(10)
+        dut.io.program.valid #= false
         dut.io.input.valid #= true
         dut.io.input.payload.reduction.mode #= TrapezoidDataflow.TrGs
         dut.io.input.payload.reduction.endOfTile #= false
@@ -131,6 +178,7 @@ class DualModeMrnNodeSpec extends AnyFunSuite {
     val treeCfg = cfg.copy(maxFibers = 2, macLanes = 8, outputLanes = 4)
     simConfig.compile(new DualModeMrnTree(treeCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
+      dut.io.program.valid #= false
       dut.io.input.valid #= false
       dut.io.output.ready #= true
       for (port <- 0 until treeCfg.localBanks) {
@@ -182,6 +230,30 @@ class DualModeMrnNodeSpec extends AnyFunSuite {
         assert(!dut.io.output.payload.lanes(lane).valid.toBoolean)
       }
       assert(!dut.io.output.payload.overflow.toBoolean)
+
+      dut.clockDomain.waitSampling()
+      dut.io.program.payload.profile #= SpatialMrnProfile.IpReduction
+      dut.io.program.payload.level #= 0
+      dut.io.program.payload.node #= 0
+      dut.io.program.payload.mode #= SpatialMrnNodeMode.IpReduce
+      dut.io.program.payload.reduceOnEqual #= true
+      dut.io.program.payload.checkOrdered #= false
+      dut.io.program.payload.subtreeBase #= 1
+      dut.io.program.payload.subtreeLength #= 2
+      dut.io.program.payload.routeMode #= 0
+      dut.io.program.payload.routeShift #= 0
+      dut.io.program.payload.temporalEnable #= true
+      dut.io.program.payload.temporalOwner #= 0
+      dut.io.program.valid #= true
+      dut.clockDomain.waitSampling()
+      dut.io.program.valid #= false
+
+      dut.io.input.valid #= true
+      while (!dut.io.input.ready.toBoolean) dut.clockDomain.waitSampling()
+      dut.clockDomain.waitSampling()
+      dut.io.input.valid #= false
+      while (!dut.io.output.valid.toBoolean) dut.clockDomain.waitSampling()
+      assert(dut.io.output.payload.overflow.toBoolean)
     }
   }
 }

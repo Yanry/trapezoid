@@ -31,39 +31,119 @@ object SpatialMrnProfile extends SpinalEnum {
   }
 }
 
-/** One independently addressed node word in the mapper control table. */
-case class SpatialMrnNodeConfig() extends Bundle {
+/** One independently addressed node word in the mapper control store. */
+case class SpatialMrnNodeConfig(cfg: TrapezoidConfig) extends Bundle {
+  val programmed = Bool()
   val mode = SpatialMrnNodeMode()
   val reduceOnEqual = Bool()
   val checkOrdered = Bool()
+  val subtreeBase = UInt(log2Up(cfg.macLanes + 1) bits)
+  val subtreeLength = UInt(log2Up(cfg.macLanes + 1) bits)
+  val routeMode = Bits(2 bits)
+  val routeShift = UInt(log2Up(cfg.macLanes + 1) bits)
+  val temporalEnable = Bool()
+  val temporalOwner = UInt(log2Up(cfg.localBanks + 1) bits)
 }
 
-/** Per-level view of the mapper-generated MRN control memory.
+/** One mapper/compiler write to the MRN control store. */
+case class SpatialMrnControlWrite(cfg: TrapezoidConfig) extends Bundle {
+  val profile = SpatialMrnProfile()
+  val level = UInt(scala.math.max(1, log2Up(cfg.mrnReductionLevels)) bits)
+  val node = UInt(scala.math.max(1, log2Up(cfg.macLanes)) bits)
+  val mode = SpatialMrnNodeMode()
+  val reduceOnEqual = Bool()
+  val checkOrdered = Bool()
+  val subtreeBase = UInt(log2Up(cfg.macLanes + 1) bits)
+  val subtreeLength = UInt(log2Up(cfg.macLanes + 1) bits)
+  val routeMode = Bits(2 bits)
+  val routeShift = UInt(log2Up(cfg.macLanes + 1) bits)
+  val temporalEnable = Bool()
+  val temporalOwner = UInt(log2Up(cfg.localBanks + 1) bits)
+}
+
+/** Per-level view of the mapper-programmable MRN control store.
   *
-  * Every physical node owns a distinct word addressed by its global tree
-  * index. The current profiles contain regular settings, but the table keeps
-  * the node boundary explicit for future layer-specific programming.
+  * Every physical node owns one word per profile. The words are distributed
+  * registers because all nodes consume their settings in parallel; a single
+  * serial programming port updates one addressed word at a time.
   */
 class SpatialMrnControlMemory(
     cfg: TrapezoidConfig,
     level: Int,
-    nodeCount: Int
+    nodeCount: Int,
+    subtreeCapacity: Int,
+    temporalPortPositions: Map[Int, Int]
 ) extends Component {
   private val levelBase = cfg.macLanes - (cfg.macLanes >> level)
+  private val profileCount = 2
+  private val wordCount = profileCount * nodeCount
+  private val addressWidth = scala.math.max(1, log2Up(wordCount))
+  private val countWidth = log2Up(cfg.macLanes + 1)
 
   val io = new Bundle {
     val profile = in(SpatialMrnProfile())
-    val nodeConfigs = out Vec(SpatialMrnNodeConfig(), nodeCount)
+    val program = slave(Flow(SpatialMrnControlWrite(cfg)))
+    val nodeConfigs = out Vec(SpatialMrnNodeConfig(cfg), nodeCount)
+  }
+
+  private val configWidth = SpatialMrnNodeConfig(cfg).getBitsWidth
+  val controlWords = Vec((0 until wordCount).map(_ =>
+    Reg(Bits(configWidth bits)) init 0))
+  val programmedValid = Vec((0 until wordCount).map(_ => RegInit(False)))
+  val programAddress = UInt(addressWidth bits)
+  programAddress := (io.program.payload.profile.asBits.asUInt *
+    U(nodeCount, addressWidth bits) + io.program.payload.node).resized
+  when(io.program.valid && io.program.payload.level === U(level,
+      io.program.payload.level.getWidth bits) &&
+      io.program.payload.node < U(nodeCount, io.program.payload.node.getWidth bits)) {
+    val writeWord = SpatialMrnNodeConfig(cfg)
+    writeWord.programmed := True
+    writeWord.mode := io.program.payload.mode
+    writeWord.reduceOnEqual := io.program.payload.reduceOnEqual
+    writeWord.checkOrdered := io.program.payload.checkOrdered
+    writeWord.subtreeBase := io.program.payload.subtreeBase
+    writeWord.subtreeLength := io.program.payload.subtreeLength
+    writeWord.routeMode := io.program.payload.routeMode
+    writeWord.routeShift := io.program.payload.routeShift
+    writeWord.temporalEnable := io.program.payload.temporalEnable
+    writeWord.temporalOwner := io.program.payload.temporalOwner
+    controlWords(programAddress) := writeWord.asBits
+    programmedValid(programAddress) := True
   }
 
   for (node <- 0 until nodeCount) {
     val globalNodeId = levelBase + node
-    val config = io.nodeConfigs(node)
+    val defaultConfig = SpatialMrnNodeConfig(cfg)
     val orderedProfile = io.profile === SpatialMrnProfile.OrderedMerge
-    config.mode := Mux(orderedProfile,
+    defaultConfig.programmed := False
+    defaultConfig.mode := Mux(orderedProfile,
       SpatialMrnNodeMode.OrderedMerge, SpatialMrnNodeMode.IpReduce)
-    config.reduceOnEqual := True
-    config.checkOrdered := orderedProfile
+    defaultConfig.reduceOnEqual := True
+    defaultConfig.checkOrdered := orderedProfile
+    defaultConfig.subtreeBase := U(node * subtreeCapacity, countWidth bits)
+    defaultConfig.subtreeLength := U(subtreeCapacity, countWidth bits)
+    defaultConfig.routeMode := 0
+    defaultConfig.routeShift := 0
+    temporalPortPositions.collectFirst {
+      case (port, mappedNode) if mappedNode == node => port
+    } match {
+      case Some(port) =>
+        defaultConfig.temporalEnable := True
+        defaultConfig.temporalOwner := U(port, defaultConfig.temporalOwner.getWidth bits)
+      case None =>
+        defaultConfig.temporalEnable := False
+        defaultConfig.temporalOwner := U(cfg.localBanks,
+          defaultConfig.temporalOwner.getWidth bits)
+    }
+
+    val storedBits = Mux(orderedProfile,
+      controlWords(nodeCount + node), controlWords(node))
+    val storedConfig = SpatialMrnNodeConfig(cfg)
+    storedConfig.assignFromBits(storedBits)
+    val storedValid = Mux(orderedProfile,
+      programmedValid(nodeCount + node), programmedValid(node))
+    val config = io.nodeConfigs(node)
+    config := Mux(storedValid, storedConfig, defaultConfig)
     config.mode.setName(s"mrnNode${globalNodeId}Mode")
     config.reduceOnEqual.setName(s"mrnNode${globalNodeId}ReduceOnEqual")
     config.checkOrdered.setName(s"mrnNode${globalNodeId}CheckOrdered")

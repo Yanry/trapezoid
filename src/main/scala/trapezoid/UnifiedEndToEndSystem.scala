@@ -1698,6 +1698,8 @@ class UnifiedEndToEndSystem(
 
   val io = new Bundle {
     val clear = in Bool()
+    /** Mapper/control-processor writes to each PE row's MRN control store. */
+    val mrnProgram = Vec(slave(Flow(SpatialMrnControlWrite(cfg))), cfg.peRows)
     val descriptor = slave(Stream(UnifiedMatrixDescriptor(systemCfg)))
     val dmaReadRequest = master(Stream(CacheRefillRequest(cacheCfg)))
     val dmaReadResponse = slave(Stream(CacheRefillResponse(cacheCfg)))
@@ -1788,6 +1790,10 @@ class UnifiedEndToEndSystem(
   writeback.io.clear := io.clear
   if (useSharedArray) {
     sharedTile.io.clear := io.clear
+    for (row <- 0 until cfg.peRows) {
+      sharedTile.io.mrnProgram(row).valid := io.mrnProgram(row).valid
+      sharedTile.io.mrnProgram(row).payload := io.mrnProgram(row).payload
+    }
     sharedTile.io.tripALoad <> ip.io.tileALoad
     sharedTile.io.tripBLoad <> ip.io.tileBLoad
     sharedTile.io.tripStart <> ip.io.tileStart

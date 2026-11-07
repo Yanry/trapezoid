@@ -207,6 +207,8 @@ object PaperSinglePERowCycleSimulation extends App {
     io.response.valid := core.io.response.valid
     io.response.payload := core.io.response.payload
     core.io.response.ready := io.response.ready
+    core.io.mrnProgram.valid := io.mrnProgram.valid
+    core.io.mrnProgram.payload := io.mrnProgram.payload
     for (port <- 0 until cfg.localBanks) {
       core.io.temporalMrnInputs(port).valid := io.temporalMrnInputs(port).valid
       core.io.temporalMrnInputs(port).payload := io.temporalMrnInputs(port).payload

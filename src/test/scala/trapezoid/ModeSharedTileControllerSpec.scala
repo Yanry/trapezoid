@@ -30,6 +30,7 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
     simConfig.compile(new ModeSharedTileController(
       tripCfg, gustavsonCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
+      dut.io.mrnProgram(0).valid #= false
       dut.io.clear #= true
       dut.io.tripALoad.valid #= false
       dut.io.tripBLoad.valid #= false
@@ -239,6 +240,7 @@ class ModeSharedTileControllerSpec extends AnyFunSuite {
     simConfig.compile(new ModeSharedTileController(
       tripCfg, multiOutstandingCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
+      dut.io.mrnProgram(0).valid #= false
       dut.io.clear #= true
       dut.io.tripALoad.valid #= false
       dut.io.tripBLoad.valid #= false

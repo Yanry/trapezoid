@@ -440,6 +440,7 @@ object EndToEndCycleSimulation extends App {
   simConfig.compile(new UnifiedEndToEndSystem(systemCfg, peFactory,
     hardwareProfile)).doSim { dut =>
     dut.clockDomain.forkStimulus(10)
+    for (row <- 0 until cfg.peRows) dut.io.mrnProgram(row).valid #= false
     dut.io.clear #= false
     dut.io.descriptor.valid #= false
     dut.io.dmaReadRequest.ready #= true

@@ -26,6 +26,8 @@ class ModeSharedTileController(
 
   val io = new Bundle {
     val clear = in Bool()
+    /** CSR-facing mapper writes, independently addressed per PE row. */
+    val mrnProgram = Vec(slave(Flow(SpatialMrnControlWrite(cfg))), cfg.peRows)
 
     val tripALoad = slave(Stream(IndexedFiber(cfg, tripCfg.rowIndexWidth)))
     val tripBLoad = slave(Stream(IndexedFiber(cfg, tripCfg.columnIndexWidth)))
@@ -111,6 +113,8 @@ class ModeSharedTileController(
     val scheduler = trgt(row)
     val spatial = trgs(row)
     val pe = peRows(row)
+    pe.io.mrnProgram.valid := io.mrnProgram(row).valid
+    pe.io.mrnProgram.payload := io.mrnProgram(row).payload
     val rowFree = !trgtOwned(row) && !trgsOwned(row) && peInFlight(row) === 0
     val trgtMayStart = !trip.io.busy && !tripClaimsArray && rowFree
 

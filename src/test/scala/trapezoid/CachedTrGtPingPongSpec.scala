@@ -30,6 +30,8 @@ class SharedTrGtAdapterHarness(systemCfg: EndToEndSystemConfig) extends Componen
     systemCfg.matrix.tile, systemCfg.gustavson.tile)
   adapter.io.clear := io.clear
   tile.io.clear := io.clear
+  tile.io.mrnProgram(0).valid := False
+  tile.io.mrnProgram(0).payload := SpatialMrnControlWrite(cfg).getZero
   adapter.io.rowCommand <> io.rowCommand
   adapter.io.cacheRequest <> io.cacheRequest
   adapter.io.cacheResponse <> io.cacheResponse

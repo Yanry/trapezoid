@@ -70,6 +70,7 @@ class DualModeMrnLevel(
   val io = new Bundle {
     val input = slave(Stream(PERowMrnLevelPayload(cfg, nodeCount * 2)))
     val output = master(Stream(PERowMrnLevelPayload(cfg, nodeCount)))
+    val program = slave(Flow(SpatialMrnControlWrite(cfg)))
     val temporalInputs = Vec(slave(Stream(DualModeMrnRequest(cfg))),
       cfg.localBanks)
     val temporalOutputs = Vec(master(Stream(DualModeMrnResponse(cfg))),
@@ -103,8 +104,12 @@ class DualModeMrnLevel(
   }
 
   val nodeOrderViolations = Vec(Bool(), nodeCount)
-  val controlMemory = new SpatialMrnControlMemory(cfg, level, nodeCount)
+  val nodeConfigViolations = Vec(Bool(), nodeCount)
+  val controlMemory = new SpatialMrnControlMemory(
+    cfg, level, nodeCount, subtreeCapacity, temporalPortPositions)
   controlMemory.io.profile := io.input.payload.profile
+  controlMemory.io.program.valid := io.program.valid
+  controlMemory.io.program.payload := io.program.payload
 
   for (node <- 0 until nodeCount) {
     val subtreeBase = node * subtreeCapacity
@@ -120,6 +125,26 @@ class DualModeMrnLevel(
     control.leftCount := leftMetadata.count
     control.rightCount := rightMetadata.count
     control.nodeMode := nodeConfig.mode
+    val configuredSlice = nodeConfig.subtreeBase ===
+      U(subtreeBase, nodeConfig.subtreeBase.getWidth bits)
+    val configuredLength = nodeConfig.subtreeLength ===
+      U(subtreeCapacity, nodeConfig.subtreeLength.getWidth bits)
+    val nodeDisabled = nodeConfig.subtreeLength === 0
+    val routeConfigLegal = !nodeConfig.routeMode(1) &&
+      (!nodeConfig.routeMode(0) ||
+        nodeConfig.routeShift < U(subtreeCapacity,
+          nodeConfig.routeShift.getWidth bits))
+    val temporalConfigLegal = temporalPortPositions.collectFirst {
+      case (port, mappedNode) if mappedNode == node =>
+        !nodeConfig.temporalEnable ||
+          nodeConfig.temporalOwner === U(port,
+            nodeConfig.temporalOwner.getWidth bits)
+    }.getOrElse(!nodeConfig.temporalEnable)
+    val nodeConfigLegal = !nodeConfig.programmed ||
+      ((nodeDisabled || (configuredSlice && configuredLength)) &&
+        routeConfigLegal && temporalConfigLegal)
+    val nodeActive = !nodeDisabled && configuredSlice && configuredLength
+    nodeConfigViolations(node) := !nodeConfigLegal
     val leftTail = leftMetadata.tail
     val rightHead = rightMetadata.head
 
@@ -128,7 +153,10 @@ class DualModeMrnLevel(
     }
     val cell = temporalPort match {
       case Some(port) =>
-        val useTemporal = io.temporalInputs(port).valid
+        val useTemporal = io.temporalInputs(port).valid &&
+          nodeConfig.temporalEnable &&
+          nodeConfig.temporalOwner === U(port,
+            nodeConfig.temporalOwner.getWidth bits)
         val shared = DualModeMrnCell(
           cfg,
           Mux(useTemporal, io.temporalInputs(port).payload.left.valid,
@@ -163,17 +191,24 @@ class DualModeMrnLevel(
 
     // Per-node runtime control: an equal boundary selects the adder and drops
     // one duplicate coordinate. A mismatch forwards both child segment lists.
-    control.reduceBoundary := nodeConfig.reduceOnEqual && cell.sameCoordinate
-    control.outputCount := (control.leftCount + control.rightCount -
+    control.reduceBoundary := nodeActive && nodeConfig.reduceOnEqual &&
+      cell.sameCoordinate
+    val naturalOutputCount = (control.leftCount + control.rightCount -
       control.reduceBoundary.asUInt).resize(countWidth)
+    control.outputCount := Mux(nodeActive, naturalOutputCount,
+      U(0, countWidth bits))
     val rightShiftWide = UInt(countWidth bits)
     rightShiftWide := U(childCapacity, countWidth bits) - control.leftCount
     when(control.reduceBoundary) {
       rightShiftWide := U(childCapacity + 1, countWidth bits) -
         control.leftCount
     }
+    when(nodeConfig.routeMode(0) && nodeActive) {
+      rightShiftWide := nodeConfig.routeShift.resize(countWidth)
+    }
     control.rightShift := rightShiftWide.resized
-    nodeOrderViolations(node) := nodeConfig.checkOrdered && leftTail.valid &&
+    nodeOrderViolations(node) := nodeActive && nodeConfig.checkOrdered &&
+      leftTail.valid &&
       rightHead.valid && !cell.sameCoordinate && !cell.leftBeforeRight
 
     val reducedBoundary = PERowReducedProduct(cfg)
@@ -186,24 +221,27 @@ class DualModeMrnLevel(
     reducedBoundary.value := cell.reducedValue
 
     val outputMetadata = transformed.payload.subtrees(node)
-    outputMetadata.count := control.outputCount
+    outputMetadata.count := Mux(nodeActive, control.outputCount,
+      U(0, outputMetadata.count.getWidth bits))
     outputMetadata.head := PERowReducedProduct(cfg).getZero
     outputMetadata.tail := PERowReducedProduct(cfg).getZero
-    when(control.leftCount =/= 0) {
-      outputMetadata.head := leftMetadata.head
-      when(control.reduceBoundary && control.leftCount === 1) {
-        outputMetadata.head := reducedBoundary
+    when(nodeActive) {
+      when(control.leftCount =/= 0) {
+        outputMetadata.head := leftMetadata.head
+        when(control.reduceBoundary && control.leftCount === 1) {
+          outputMetadata.head := reducedBoundary
+        }
+      } elsewhen(control.rightCount =/= 0) {
+        outputMetadata.head := rightMetadata.head
       }
-    } elsewhen(control.rightCount =/= 0) {
-      outputMetadata.head := rightMetadata.head
-    }
-    when(control.rightCount =/= 0) {
-      outputMetadata.tail := rightMetadata.tail
-      when(control.reduceBoundary && control.rightCount === 1) {
-        outputMetadata.tail := reducedBoundary
+      when(control.rightCount =/= 0) {
+        outputMetadata.tail := rightMetadata.tail
+        when(control.reduceBoundary && control.rightCount === 1) {
+          outputMetadata.tail := reducedBoundary
+        }
+      } elsewhen(control.leftCount =/= 0) {
+        outputMetadata.tail := leftMetadata.tail
       }
-    } elsewhen(control.leftCount =/= 0) {
-      outputMetadata.tail := leftMetadata.tail
     }
 
     // Put the right child in the upper half, suppress a coalesced head, then
@@ -290,7 +328,8 @@ class DualModeMrnLevel(
 
   transformed.payload.reduction.overflow :=
     io.input.payload.reduction.overflow ||
-    nodeOrderViolations.asBits.orR
+    nodeOrderViolations.asBits.orR ||
+    nodeConfigViolations.asBits.orR
   io.output << transformed.m2sPipe()
 }
 
@@ -299,6 +338,7 @@ class DualModeMrnTree(cfg: TrapezoidConfig) extends Component {
   val io = new Bundle {
     val input = slave(Stream(PERowReductionPayload(cfg)))
     val output = master(Stream(PERowReductionPayload(cfg)))
+    val program = slave(Flow(SpatialMrnControlWrite(cfg)))
     val temporalInputs = Vec(slave(Stream(DualModeMrnRequest(cfg))),
       cfg.localBanks)
     val temporalOutputs = Vec(master(Stream(DualModeMrnResponse(cfg))),
@@ -334,6 +374,8 @@ class DualModeMrnTree(cfg: TrapezoidConfig) extends Component {
     }.toMap
     val level = new DualModeMrnLevel(cfg, levelIndex, levelPorts)
     level.io.input << stage
+    level.io.program.valid := io.program.valid
+    level.io.program.payload := io.program.payload
     for (port <- 0 until cfg.localBanks) {
       if (levelPorts.contains(port)) {
         level.io.temporalInputs(port) << io.temporalInputs(port)

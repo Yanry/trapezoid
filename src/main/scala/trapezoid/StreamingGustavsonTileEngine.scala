@@ -251,6 +251,7 @@ class GustavsonTileEngine(
     temporalMrnOutput << io.peTemporalMrnOutput
   } else {
     val pe = peFactory(cfg)
+  TrapezoidPERowComponent.tieOffMrnProgramming(pe, cfg)
     pe.io.command.valid := peCommandValid
     pe.io.command.payload := peCommandPayload
     peCommandReady := pe.io.command.ready

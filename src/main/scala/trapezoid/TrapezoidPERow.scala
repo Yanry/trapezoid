@@ -677,7 +677,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   routeStage.ready := macInput.ready
   val macStage = macInput.m2sPipe()
 
-  // Stage 3: order products and mark segment boundaries at the MRN leaves.
+  // Stage 3: prepare source-ordered products and segment metadata for the MRN leaves.
   val mac = macStage.payload
   val tripMode = mac.mode === TrapezoidDataflow.DenseIp ||
     mac.mode === TrapezoidDataflow.TrIp
@@ -726,47 +726,15 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val gustOrderError = mac.overflow ||
     (mac.mode === TrapezoidDataflow.TrGs && trGsOrderError)
 
-  val trGtRank = Vec(UInt(log2Up(cfg.localBanks + 1) bits), cfg.localBanks)
-  for (lane <- 0 until cfg.localBanks) {
-    val precedes = Bits(cfg.localBanks bits)
-    for (other <- 0 until cfg.localBanks) {
-      if (other == lane) {
-        precedes(other) := False
-      } else {
-        val lowerCoordinate = mac.gustRow(other) < mac.gustRow(lane) ||
-          (mac.gustRow(other) === mac.gustRow(lane) &&
-            mac.gustColumn(other) < mac.gustColumn(lane))
-        val sameCoordinateEarlier = if (other < lane) {
-          mac.gustRow(other) === mac.gustRow(lane) &&
-            mac.gustColumn(other) === mac.gustColumn(lane)
-        } else {
-          False
-        }
-        precedes(other) := mac.laneValid(other) &&
-          (lowerCoordinate || sameCoordinateEarlier)
-      }
-    }
-    trGtRank(lane) := CountOne(precedes).resized
-  }
-
-  val trGtSorted = Vec(PERowReducedProduct(cfg), cfg.cacheLineWords)
-  for (position <- 0 until cfg.cacheLineWords) {
-    trGtSorted(position) := PERowReducedProduct(cfg).getZero
-    if (position < cfg.localBanks) {
-      for (source <- 0 until cfg.localBanks) {
-        when(mac.laneValid(source) && trGtRank(source) === position) {
-          trGtSorted(position) := gustLeaves(source)
-        }
-      }
-    }
-  }
-
+  // TrGT deliberately keeps the source-head order here.  Its spatial MRN
+  // below performs the radix-K head selection and equal-coordinate coalesce;
+  // there is no independent rank-sort network between MAC and MRN.
   val orderedProducts = Vec(PERowReducedProduct(cfg), cfg.macLanes)
   for (position <- 0 until cfg.macLanes) {
     val selected = if (position < cfg.cacheLineWords) {
       Mux(tripMode, tripLeaves(position),
         Mux(mac.mode === TrapezoidDataflow.TrGs,
-          trGsCompacted.entries(position), trGtSorted(position)))
+          trGsCompacted.entries(position), gustLeaves(position)))
     } else {
       Mux(tripMode, tripLeaves(position),
         PERowReducedProduct(cfg).getZero)
@@ -804,8 +772,28 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   // The paper assigns one cycle to every MRN level. The explicit dual-mode
   // tree keeps comparator, gated adder and local switch logic together at each
   // level; coordinate controls prevent reductions from crossing segments.
+  val trGtSpatialMrn = new TrGtRadixKSpatialMrn(cfg)
   val mrnTree = new DualModeMrnTree(cfg)
-  mrnTree.io.input << reductionInput
+  val trGtReduction = reductionInput.payload.mode === TrapezoidDataflow.TrGt
+
+  // TrGT is accepted by the stateful radix-K head merger.  TrIP/TrGS bypass
+  // that block directly, so the new TrGT-specific stages do not alter their
+  // latency or their II.  The one-entry ownership rule prevents a new direct
+  // command from overtaking a resident TrGT vector.
+  trGtSpatialMrn.io.input.valid := reductionInput.valid &&
+    trGtReduction && !trGtSpatialMrn.io.busy
+  trGtSpatialMrn.io.input.payload := reductionInput.payload
+  mrnTree.io.input.valid := Mux(trGtSpatialMrn.io.busy,
+    trGtSpatialMrn.io.output.valid,
+    reductionInput.valid && !trGtReduction)
+  mrnTree.io.input.payload := Mux(trGtSpatialMrn.io.busy,
+    trGtSpatialMrn.io.output.payload,
+    reductionInput.payload)
+  trGtSpatialMrn.io.output.ready := mrnTree.io.input.ready
+  reductionInput.ready := Mux(trGtSpatialMrn.io.busy,
+    False,
+    Mux(trGtReduction, trGtSpatialMrn.io.input.ready,
+      mrnTree.io.input.ready))
   mrnTree.io.program.valid := io.mrnProgram.valid
   mrnTree.io.program.payload := io.mrnProgram.payload
   for (port <- 0 until cfg.localBanks) {

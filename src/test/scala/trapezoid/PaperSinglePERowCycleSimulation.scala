@@ -125,6 +125,7 @@ object PaperSinglePERowCycleSimulation extends App {
     .toAbsolutePath.normalize()
   private val kernelInputs = Vector(
     Paths.get("src/main/scala/trapezoid/TrapezoidPERow.scala"),
+    Paths.get("src/main/scala/trapezoid/TrGtRadixKSpatialMrn.scala"),
     Paths.get("src/main/scala/trapezoid/DualModeMrnNode.scala"),
     Paths.get("src/main/scala/trapezoid/DualModeMrnTree.scala"),
     Paths.get("src/main/scala/trapezoid/MultiFiberIntersection.scala"),

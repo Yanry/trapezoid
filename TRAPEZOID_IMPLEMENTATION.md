@@ -552,6 +552,34 @@ utilization = usefulMacs / laneSlots
 
 `usefulMacs` 和 `laneSlots` 是解释指标，不是额外的周期。端到端测试的 boundary 是 descriptor 到 C write response；单 PE row 测试的 boundary 是 command 到 response。
 
+## 9.1 UnifiedEndToEndSystem 综合入口
+
+`scripts/scripts_trapezoid` 现在针对生成的 `UnifiedEndToEndSystem.v`，不再使用旧的 `FP_*_Multiplier` 变量。先用真实 Verilator 入口生成 RTL，再调用 Synopsys Design Compiler：
+
+若只需要生成一份包含四种 mode、但共享同一套 PE rows、MRN 和 local SRAM 的可综合 RTL，不需要启动 Verilator：
+
+```bash
+sbt -batch 'Compile/runMain trapezoid.GenerateUnifiedEndToEndSystem --scale=small'
+sbt -batch 'Compile/runMain trapezoid.GenerateUnifiedEndToEndSystem --scale=scaled-paper'
+sbt -batch 'Compile/runMain trapezoid.GenerateUnifiedEndToEndSystem --scale=paper'
+```
+
+输出分别位于 `generated-unified-small`、`generated-unified-scaled-paper` 和 `generated-unified-paper`。顶层 descriptor 的 `mode` 在运行时选择 `DenseIp/TrIp/TrGt/TrGs`；四种模式保留各自的 frontend/scheduler，但通过一个 `ModeSharedTileController` 仲裁到同一个物理 PE array。生成目录还包含综合需要的 SRAM 和 Benes RTL dependency。
+
+```bash
+SYNTH_PROFILE=small scripts/scripts_trapezoid/run_dc.sh
+```
+
+论文规模同样生成包含四种 mode、共享 128-row array 的统一 paper RTL：
+
+```bash
+sbt -batch 'Compile/runMain trapezoid.GenerateUnifiedEndToEndSystem --scale=paper'
+SYNTH_PROFILE=paper CLOCK_PERIOD_NS=2.0 \
+  scripts/scripts_trapezoid/run_dc.sh
+```
+
+综合结果位于 `dc_output_unified/<profile>_dc_output/`，包括 timing、area、power、QoR、constraint 和 mapped netlist。脚本默认使用顶层端口 `clk`、`reset`，周期为 2 ns；当前容器没有 `dc_shell` 和目标工艺库，因此这里只能完成脚本静态检查，不能在本环境报告真实 PPA。
+
 ## 10. 后续要实现论文级趋势，需要继续对齐的项目
 
 按优先级建议：

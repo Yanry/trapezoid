@@ -56,6 +56,8 @@ case class PERowReducedProduct(cfg: TrapezoidConfig) extends Bundle {
 /** Coordinate-ordered products carried through one registered MRN level. */
 case class PERowReductionPayload(cfg: TrapezoidConfig) extends Bundle {
   val mode = TrapezoidDataflow()
+  /** Mapper-selected spatial MRN profile carried with the command. */
+  val mrnProfile = SpatialMrnProfile()
   val endOfTile = Bool()
   val responseTag = UInt(cfg.responseTagWidth bits)
   val overflow = Bool()
@@ -759,6 +761,7 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val reductionInput = Stream(PERowReductionPayload(cfg))
   reductionInput.valid := macStage.valid
   reductionInput.payload.mode := mac.mode
+  reductionInput.payload.mrnProfile := SpatialMrnProfile.fromDataflow(mac.mode)
   reductionInput.payload.endOfTile := mac.endOfTile
   reductionInput.payload.responseTag := mac.responseTag
   reductionInput.payload.overflow := Mux(tripMode, mac.overflow, gustOrderError)
@@ -769,31 +772,11 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   reductionInput.payload.lanes := orderedProducts
   macStage.ready := reductionInput.ready
 
-  // The paper assigns one cycle to every MRN level. The explicit dual-mode
-  // tree keeps comparator, gated adder and local switch logic together at each
-  // level; coordinate controls prevent reductions from crossing segments.
-  val trGtSpatialMrn = new TrGtRadixKSpatialMrn(cfg)
-  val mrnTree = new DualModeMrnTree(cfg)
-  val trGtReduction = reductionInput.payload.mode === TrapezoidDataflow.TrGt
-
-  // TrGT is accepted by the stateful radix-K head merger.  TrIP/TrGS bypass
-  // that block directly, so the new TrGT-specific stages do not alter their
-  // latency or their II.  The one-entry ownership rule prevents a new direct
-  // command from overtaking a resident TrGT vector.
-  trGtSpatialMrn.io.input.valid := reductionInput.valid &&
-    trGtReduction && !trGtSpatialMrn.io.busy
-  trGtSpatialMrn.io.input.payload := reductionInput.payload
-  mrnTree.io.input.valid := Mux(trGtSpatialMrn.io.busy,
-    trGtSpatialMrn.io.output.valid,
-    reductionInput.valid && !trGtReduction)
-  mrnTree.io.input.payload := Mux(trGtSpatialMrn.io.busy,
-    trGtSpatialMrn.io.output.payload,
-    reductionInput.payload)
-  trGtSpatialMrn.io.output.ready := mrnTree.io.input.ready
-  reductionInput.ready := Mux(trGtSpatialMrn.io.busy,
-    False,
-    Mux(trGtReduction, trGtSpatialMrn.io.input.ready,
-      mrnTree.io.input.ready))
+  // All modes use one physical augmented MRN.  The shared ingress selects a
+  // mode policy: DenseIp/TrIP/TrGS enter directly, while TrGT performs its
+  // radix-K source-head merge before entering the same tree.
+  val mrnTree = new DualModeRadixKMrnTree(cfg)
+  mrnTree.io.input << reductionInput
   mrnTree.io.program.valid := io.mrnProgram.valid
   mrnTree.io.program.payload := io.mrnProgram.payload
   for (port <- 0 until cfg.localBanks) {

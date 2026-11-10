@@ -196,6 +196,7 @@ class DualModeMrnNodeSpec extends AnyFunSuite {
       }
 
       dut.io.input.payload.mode #= TrapezoidDataflow.TrIp
+      dut.io.input.payload.mrnProfile #= SpatialMrnProfile.IpReduction
       dut.io.input.payload.endOfTile #= true
       dut.io.input.payload.overflow #= false
       dut.io.input.payload.responseTag #= 3

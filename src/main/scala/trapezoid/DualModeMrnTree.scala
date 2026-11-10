@@ -87,6 +87,8 @@ class DualModeMrnLevel(
   transformed.valid := io.input.valid && !temporalDemand
   io.input.ready := transformed.ready && !temporalDemand
   transformed.payload.reduction.mode := io.input.payload.reduction.mode
+  transformed.payload.reduction.mrnProfile :=
+    io.input.payload.reduction.mrnProfile
   transformed.payload.reduction.endOfTile :=
     io.input.payload.reduction.endOfTile
   transformed.payload.reduction.responseTag :=
@@ -189,10 +191,15 @@ class DualModeMrnLevel(
           rightHead.valid, rightHead.row, rightHead.column, rightHead.value)
     }
 
-    // Per-node runtime control: an equal boundary selects the adder and drops
-    // one duplicate coordinate. A mismatch forwards both child segment lists.
-    control.reduceBoundary := nodeActive && nodeConfig.reduceOnEqual &&
-      cell.sameCoordinate
+    // Per-node mapper control selects the spatial operation policy. Both
+    // policies use the same augmented arithmetic node, but only OrderedMerge
+    // nodes enforce coordinate order; this makes the programmed node mode
+    // observable instead of being a passive sideband.
+    val orderedMergeNode = control.nodeMode === SpatialMrnNodeMode.OrderedMerge
+    val reductionNode = orderedMergeNode ||
+      control.nodeMode === SpatialMrnNodeMode.IpReduce
+    control.reduceBoundary := nodeActive && reductionNode &&
+      nodeConfig.reduceOnEqual && cell.sameCoordinate
     val naturalOutputCount = (control.leftCount + control.rightCount -
       control.reduceBoundary.asUInt).resize(countWidth)
     control.outputCount := Mux(nodeActive, naturalOutputCount,
@@ -207,7 +214,8 @@ class DualModeMrnLevel(
       rightShiftWide := nodeConfig.routeShift.resize(countWidth)
     }
     control.rightShift := rightShiftWide.resized
-    nodeOrderViolations(node) := nodeActive && nodeConfig.checkOrdered &&
+    nodeOrderViolations(node) := nodeActive && orderedMergeNode &&
+      nodeConfig.checkOrdered &&
       leftTail.valid &&
       rightHead.valid && !cell.sameCoordinate && !cell.leftBeforeRight
 
@@ -357,8 +365,7 @@ class DualModeMrnTree(cfg: TrapezoidConfig) extends Component {
   treeInput.valid := io.input.valid
   io.input.ready := treeInput.ready
   treeInput.payload.reduction := io.input.payload
-  treeInput.payload.profile :=
-    SpatialMrnProfile.fromDataflow(io.input.payload.mode)
+  treeInput.payload.profile := io.input.payload.mrnProfile
   for (lane <- 0 until cfg.macLanes) {
     treeInput.payload.subtrees(lane).count :=
       io.input.payload.lanes(lane).valid.asUInt.resized

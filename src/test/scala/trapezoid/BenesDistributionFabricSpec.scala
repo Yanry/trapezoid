@@ -359,6 +359,8 @@ class BenesDistributionFabricSpec extends AnyFunSuite {
         "the directed multicast mappings must exercise parent orientation backtracking")
       route(dut, Seq(15, 12, 12, 7, 10, 9, 14, 4, 12, 13, 8, 6, 11, 14, 14, 6),
         expectedRoutable = false, holdCycles = 7)
+      route(dut, Seq(4, 6, 8, 12, 3, 0, 2, 6, 10, 14, 1, 3, -1, -1, -1, -1),
+        expectedRoutable = false, holdCycles = 5)
       val random = new scala.util.Random(615)
       for (_ <- 0 until 100) {
         route(dut, random.shuffle((0 until 16).toVector), expectedRoutable = true)

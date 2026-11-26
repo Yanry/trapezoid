@@ -190,11 +190,11 @@ class TrIpTileControllerSpec extends AnyFunSuite {
       dut.io.clear #= false
 
       var abortTimeout = 0
-      while (dut.io.busy.toBoolean && abortTimeout < 20) {
+      while (dut.io.busy.toBoolean && abortTimeout < 1000) {
         dut.clockDomain.waitSampling()
         abortTimeout += 1
       }
-      assert(!dut.io.busy.toBoolean)
+      assert(!dut.io.busy.toBoolean, "clear must drain the variable-latency PE command")
       assert(!dut.io.done.toBoolean)
 
       dut.io.start.payload.mode #= TrapezoidDataflow.TrIp

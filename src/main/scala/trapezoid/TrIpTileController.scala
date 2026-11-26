@@ -113,6 +113,8 @@ class TrIpPERowArray(
   * PE-row-private four-bank local buffers, and reads them back in row-major
   * load order. Every PE row matches all response lanes to the four banks at
   * one line address and scatters all four-word lines in one controller stage.
+  * Failed batches commit no responses and retry one B fiber, then one A fiber
+  * per row, retaining the original fiber slots and K-tile accumulation range.
   * DenseIp and TrIp are both accepted at any input density; mode selection is
   * always controlled by the caller. When mode-shared local buffers are
   * enabled, ownership must only change while this controller is idle.
@@ -150,6 +152,7 @@ class TrIpTileController(
     val candidateColumnCount = out UInt(fiberCounterWidth bits)
     val activeRows = out Bits(cfg.peRows bits)
     val denseBypassActive = out Bool()
+    val routeRetryCount = out UInt(32 bits)
     val localBufferOwners = if (modeSharedLocalBuffers)
       in Vec(LocalBufferOwner(), cfg.peRows) else null
     val gustavsonLocalBuffers = if (modeSharedLocalBuffers)
@@ -183,6 +186,9 @@ class TrIpTileController(
   val groupSize = Reg(UInt(fiberCounterWidth bits)) init cfg.maxFibers
   val bBase = Reg(UInt(tileCfg.columnIndexWidth bits)) init 0
   val batchColumns = Reg(UInt(fiberCounterWidth bits)) init 1
+  val retryAActive = RegInit(False)
+  val retryAIndex = Reg(UInt(fiberCounterWidth bits)) init 0
+  val routeRetryCount = Reg(UInt(32 bits)) init 0
   val outputCell = Reg(UInt(cellIndexWidth bits)) init 0
   val modeError = RegInit(False)
   val denseBypassActive = RegInit(False)
@@ -206,6 +212,7 @@ class TrIpTileController(
   io.awaitingKTile := accumulationOpen
   io.unsupportedMode := modeError
   io.denseBypassActive := denseBypassActive
+  io.routeRetryCount := routeRetryCount
   io.activeAOffset := aOffset
   io.activeAGroupSize := groupSize
   io.activeBBase := bBase
@@ -307,7 +314,8 @@ class TrIpTileController(
         packers(pe).io.aMask(fiber) := aStorage(globalRow).mask
         when(validA) { rowActive(pe) := True }
 
-        commandA(pe)(fiber).valid := validA
+        commandA(pe)(fiber).valid := validA &&
+          (!retryAActive || retryAIndex === fiber)
         commandA(pe)(fiber).tag := aStorage(globalRow).tag
         commandA(pe)(fiber).mask := aStorage(globalRow).mask
         for (value <- 0 until cfg.fiberWidth) {
@@ -402,9 +410,11 @@ class TrIpTileController(
 
   val responseRegs = Vec((0 until cfg.peRows).map(_ => Reg(PERowResponse(cfg))))
   val allResponsesValid = peResponseValid.andR
+  val anyResponseOverflow = peResponses.map(_.overflow).reduce(_ || _)
+  // Abort also waits for the whole batch: PE responses have different latencies.
   val peResponseReady =
-    (!io.clear && state === TrIpTileState.Collect && allResponsesValid) ||
-      state === TrIpTileState.AbortDrain
+    allResponsesValid && ((!io.clear && state === TrIpTileState.Collect) ||
+      state === TrIpTileState.AbortDrain)
   if (externalPeArray) {
     for (pe <- 0 until cfg.peRows) io.peResponses(pe).ready := peResponseReady
   } else {
@@ -741,7 +751,7 @@ class TrIpTileController(
   val denseStartBypass = io.start.payload.mode === TrapezoidDataflow.DenseIp &&
     allDeclaredARowsDense && allDeclaredBColumnsDense
 
-  def advanceSchedule(): Unit = {
+  def advanceBatch(): Unit = {
     when(finalBatch) {
       bBase := 0
       when(finalAGroup) {
@@ -769,6 +779,25 @@ class TrIpTileController(
     }
   }
 
+  def advanceSchedule(): Unit = {
+    when(retryAActive && retryAIndex + 1 < aOffset + groupSize) {
+      retryAIndex := retryAIndex + 1
+      state := TrIpTileState.Dispatch
+    } otherwise {
+      retryAActive := False
+      advanceBatch()
+    }
+  }
+
+  def failTile(): Unit = {
+    modeError := True
+    accumulationOpen := False
+    retryAActive := False
+    doneReg := True
+    for (row <- 0 until tileCfg.maxRows) resultValid(row) := 0
+    state := TrIpTileState.Idle
+  }
+
   switch(state) {
     is(TrIpTileState.Idle) {
       when(io.start.fire) {
@@ -782,6 +811,9 @@ class TrIpTileController(
           U(1, fiberCounterWidth bits), U(cfg.maxFibers, fiberCounterWidth bits))
         denseBypassActive := denseStartBypass
         bBase := 0
+        retryAActive := False
+        retryAIndex := 0
+        routeRetryCount := 0
         outputCell := 0
         val invalidStart = (io.start.payload.mode =/= TrapezoidDataflow.DenseIp &&
           io.start.payload.mode =/= TrapezoidDataflow.TrIp) ||
@@ -862,9 +894,24 @@ class TrIpTileController(
 
     is(TrIpTileState.Collect) {
       when(allResponsesValid) {
-        for (pe <- 0 until cfg.peRows) responseRegs(pe) := peResponses(pe)
         commandInFlight := False
-        state := TrIpTileState.Scatter
+        when(anyResponseOverflow) {
+          when(batchColumns > 1) {
+            batchColumns := 1
+            routeRetryCount := routeRetryCount + 1
+            state := TrIpTileState.Dispatch
+          } elsewhen(!retryAActive && groupSize > 1) {
+            retryAActive := True
+            retryAIndex := aOffset
+            routeRetryCount := routeRetryCount + 1
+            state := TrIpTileState.Dispatch
+          } otherwise {
+            failTile()
+          }
+        } otherwise {
+          for (pe <- 0 until cfg.peRows) responseRegs(pe) := peResponses(pe)
+          state := TrIpTileState.Scatter
+        }
       }
     }
 
@@ -957,6 +1004,9 @@ class TrIpTileController(
     doneReg := False
     modeError := False
     accumulationOpen := False
+    retryAActive := False
+    retryAIndex := 0
+    routeRetryCount := 0
   }
 }
 

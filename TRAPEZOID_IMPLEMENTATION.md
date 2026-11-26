@@ -184,6 +184,22 @@ TrIP 主路径保留独立的 A/B `BenesDistributionFabric`，其物理连线、
 
 PE row 用 `aSent/bSent` 分别防止重复发射，用 `aResultValid/bResultValid` 分别保留已完成结果；一侧走快路径或命中缓存时，另一侧可以单独搜索。两路控制可用后才释放命令：任一路 `routable=false` 时，当前命令携带 `overflow=true` 返回、结果数为 0、MAC lane 无效，并消费两路结果，后续命令继续执行。控制缓存保持每侧 4 项，A/B 独立匹配和替换，不再用 A+B 联合 key。若缓存记录覆盖当前全部有效 lane，且这些 lane 的 source index 一致，即可复用，因此长路由也能服务兼容的短前缀；不能将未覆盖的新 lane 误当成 cache hit。只有成功 command 的通用结果会入缓存；`endOfTile` 同时清空两侧。超过 MAC 容量的 MFIU 请求直接返回 overflow。DenseIP 完整单 A/B fiber、空交集和 Gustavson 模式仍旁路通用求解器。
 
+必须区分“有解但没有搜索完成”和“真实无解”：Beneš 支持任意排列，不代表一次传输支持任意多播映射。MFIU 的有效乘法数不超过 `macLanes`，只能保证容量，不能保证 A/B 两侧都可路由。例如 16-lane B 请求 `[4,6,8,12,3,0,2,6,10,14,1,3]`（其余 lane 无效）确实不可路由；求解器应返回失败，由调度器拆批，不能伪造成功控制字。
+
+`TrIpTileController.Collect` 现在先汇总所有 PE 的 `overflow`，再决定是否进入 `Scatter`。任意 PE 失败，本批所有 PE 的响应一起退休且均不写 local buffer，也不更新 `resultValid`；保持当前 K tile、`bBase`、`aOffset` 和原 `groupSize`，按以下顺序重发：
+
+```text
+多 A × 多 B 失败 → 原 A group × 单 B
+单 B 仍失败      → 逐个 A × 当前单 B
+单 A/单 B 仍失败 → done=1、unsupportedMode=1，终止本 tile
+```
+
+单 A 重试仅屏蔽其他 A fiber 的 `valid`，保留原 fiber 槽位，因此 `destinationBank` 和输出行标签不变。完成原 A group 的全部单 A 子任务后，才按实际成功的 `batchColumns` 推进 B；不会重置 `bBase`、重算先前已经提交的列，或跳过原失败批次剩余的列。失败前已经成功提交的其他批次不重放。正常可路由批次继续使用多列打包，DenseIP 的 sparse fallback 同样受到保护。
+
+最终失败会关闭 K 累加序列并清除本 tile 的 `resultValid`；现有 matrix controller 的错误路径继续将错误传到 `UnifiedEndToEndSystem.io.error`。调用方必须把 `done && error` 视为失败，不能使用任务可能已写出的其他 tile。这里复用名为 `unsupportedMode` 的旧 tile 错误接口，不表示这次一定是 mode 非法；PS 软件寄存器仍需板级 wrapper 对接。tile 级 `io.routeRetryCount` 统计本 K tile 因 overflow 缩小批次的次数，`start`/`clear` 清零；它不统计成功子任务数，也不是端到端周期计数。
+
+`clear` 中止在途命令时，`AbortDrain` 也等待全部 PE 响应到齐后才统一握手。不能提前消费较快 PE 的响应，否则不同路由延迟下可能永远等不到 `allResponsesValid`。
+
 `BenesPerformanceCounters` 通过 PE row、`ModeSharedTileController` 和 Unified 顶层公开：每侧 fast route、cache hit、search 次数、search cycle、backtrack 次数，以及 route command 和 prepare cycle。search cycle 仅统计 solver 执行，不包含输出响应等待；backtrack 包括快速方向试探失败后恢复完整搜索，以及分量翻转重试。每个成功的非空 route command，在每侧只计入 fast/cache/search 中的一类。`EndToEndCycleSimulation` 输出每个 workload 的计数增量，并跨 PE row 求和；这些 occupancy 总量会包含并行 row 的重叠时间，不能直接相加得到顶层端到端周期。mode-specialized、非 Unified 的顶层暂不提供这组统计，benchmark 不打印其零占位。
 
 回归入口为 `sbt -batch 'testOnly trapezoid.BenesDistributionFabricSpec trapezoid.TrapezoidPERowSpec'`。覆盖四路所有 mapping/valid mask、所有未溢出的 small MFIU mask、16 路回溯反例、不可路由响应及恢复、随机 permutation/由真实 switch controls 构造的 multicast、响应背压、求解中复位、128 路完整 fabric，以及 PE 命令/tag/operand 对齐和单侧失败注入。另验证 16/128 路广播和 masked-spread 快路径的真实 fabric 输出，16/32-lane PE 的单侧搜索、warm cache、短前缀复用及 endOfTile 失效。定向 MFIU 反例为 `A masks=[224,206,18,34]`、`B masks=[160,33,198,1]`，8-wide fiber、16 MAC、14 个有效乘法，最终应产生 9 个坐标结果。Vivado 综合、时序、面积和功耗尚需目标平台工具验证。
@@ -293,6 +309,8 @@ cluster wrapper 会先用 global bank bits 选择 cluster，再删除 cluster in
 ```
 
 `DynamicColumnPacker` 逐列估算 effectual MAC 数，在不超过当前 `macLanes` 的前提下选择最大 B column 前缀。一个命令完成后，调度器继续发送剩余列。A/B 的 values 通过 source index 复用，避免每个 MAC lane 都存一份独立操作数。
+
+packing 的容量判断不是 multicast 可路由性判断。失败批次由 `Collect` 在提交前整体拆分为单 B、必要时单 A/单 B 后重试，见 4.4；未发生失败时不强制改成单 B 分发。`Scatter` 仅消费全部 PE 都成功的响应。
 
 ### 5.3 `TrGt`
 
@@ -455,6 +473,21 @@ cache hit 数没有增加，是因为更多请求直接进入更快的广播/spr
 TrGT 现在不会因 packed group 内切换 B row 而进入坐标回退 epoch；本轮 `TrGT / MS x D / sample 0` 的完整 RTL 仿真结束于 3867 cycle，未出现 issued B element 永久等待。与旧的组合 rank sorter 相比，TrGT 每条命令现在要经过 radix-K head capture、merge/advance 和 emit，因而在单 PE row 端到端周期中可观察到额外的结构开销；这正是“把排序功能移入 MRN”后的真实代价，不应误解为前置排序器仍然存在。TrGT 在较密场景仍慢于推荐 mode，主要原因变为 command 数、每命令的 K 路 head 决策、单 cache issue point、read DMA 活跃周期和 C writeback 流量，而不是 B-row column 回退。
 
 完整双 group B-window、双 refill channel、cache 计数和最终 C checksum 仍全部通过。benchmark 没有在计时区间内执行 control programming，未写 word 使用默认 profile。调试参数 `--sample=<index>` 和 `--timeout=<cycles>` 可在超时时报告 TrGS assigned/completed/allocated、各 row state、PE in-flight、pending result 和 SRAM merge 状态。本轮另完成 8 个 Benes fabric/solver 测试及 14 个 PE-row 测试，16/128 路 solver 和重新生成的 small 顶层通过 Verilator lint。生成器重新输出了 `generated-unified-small/UnifiedEndToEndSystem.v` 及匹配的 SRAM、Benes SystemVerilog dependency。PE-row 测试初始化显式关闭 `mrnProgram.valid`，避免随机输入意外改写 profile control store。
+
+针对真实不可路由 multicast 的正确性回归位于 `src/test/scala/trapezoid/TrIpRouteRetrySpec.scala`：
+
+```bash
+sbt -batch 'testOnly trapezoid.TrIpRouteRetrySpec'
+sbt -batch 'testOnly trapezoid.BenesDistributionFabricSpec -- -z sixteen'
+```
+
+这些测试不修改 Beneš 数据网络或 MRN 算术。真实 PE 路径使用 `A masks=[0x69,0xA6]`、`B masks=[0xEE,0x37]`，构造两个 8-wide K tile；分别验证 TrIP 和 DenseIP sparse fallback，确保 `C[6,0]=-5+(-9)=-14`，并逐项检查其余坐标。随后用共享四 mode 的 Unified 顶层执行针对该反例构造的完整 16×16 有符号矩阵：从 descriptor、A/B DMA、cache、重试和 K 累加一直验证到最终 C 写响应，所有坐标、写地址、写数量和数值均与软件参考一致。它不是只比 checksum，也不是把软件计算周期拼接进 RTL 周期。
+
+另外使用可控 PE 失败注入验证单 A/单 B 重试、跨 local-buffer word/line 的 bank 和地址保持、已提交列不重放，以及最终失败后关闭累加并可启动新 tile。IpOnly Unified 路径验证不可恢复失败传播到 matrix/top `error`，且该失败任务不产生 C 写请求。独立的 16-lane solver 测试仍要求上述 B 映射返回 `routable=false`，随后继续处理可路由请求；不会为了使矩阵通过而把无解改报成功。
+
+2026-11-26 完成本次数值修复后的验证：`TrIpRouteRetrySpec`、`TrIpTileControllerSpec`、`TrIpMatrixControllerSpec`、`TrIpCachedMatrixSystemSpec`、`UnifiedEndToEndSystemSpec` 共 13 个测试，以及 1 个定向 16-lane solver 测试全部通过。随后重新运行 `--scale=small --samples=1` 的全部 24 个端到端 case，所有结果、写数量和 checksum 通过，周期与上表逐项一致；例如 MS×MS 的 TrIP 仍为 1376 cycle。正常可路由批次没有新增调度周期，真实失败批次则会实际支付求解、失败响应和拆批重发的额外周期。原有合成 benchmark 未触发本次反例，因此不能仅凭其周期表证明任意 multicast 输入的正确性；应同时运行上述定向测试。本轮未重跑 7.2，其历史测量不能用来估计本次失败重试的 paper-width 开销。
+
+修复后的四 mode 共享 small 顶层已重新生成到 `generated-unified-small/UnifiedEndToEndSystem.v`，同时更新同目录的 `TrapezoidSram.v`、`TrapezoidBenesRouteControl.sv`。三者一起通过 `verilator --lint-only -Wno-fatal --top-module UnifiedEndToEndSystem` 检查，无 error；仍有位宽截断/扩展、无符号比较和常量比较 warning，不能将其描述为零 warning 或已经通过 FPGA 时序验证。
 
 ### 7.2 `PaperSinglePERowCycleSimulation`
 

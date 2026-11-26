@@ -239,7 +239,12 @@ object EndToEndCycleSimulation extends App {
       cacheHits: Long,
       cacheMisses: Long,
       usefulMacs: Long,
-      checksum: Long)
+      checksum: Long,
+      benesCounters: Vector[Long])
+
+  private val benesCounterNames = Vector("commands", "aCacheHits", "bCacheHits",
+    "aFastRoutes", "bFastRoutes", "aSearches", "bSearches", "prepareCycles",
+    "aSearchCycles", "bSearchCycles", "aBacktracks", "bBacktracks")
 
   private val categories = Vector(
     Category("HS x HS", highlySparseBasisPoints, highlySparseBasisPoints, "TrGt"),
@@ -464,6 +469,13 @@ object EndToEndCycleSimulation extends App {
     dut.io.dmaWriteResponse.payload.address #= 0
     dut.io.dmaWriteResponse.payload.error #= false
 
+    def readBenesCounters(): Vector[Long] = benesCounterNames.map { name =>
+      (0 until cfg.peRows).map { row =>
+        dut.io.benesPerformance(row).elements.find(_._1 == name).get._2
+          .asInstanceOf[spinal.core.UInt].toLong
+      }.sum
+    }
+
     def run(workload: Workload, modeName: String): Measurement = {
       dut.io.clear #= true
       dut.io.descriptor.valid #= false
@@ -477,6 +489,7 @@ object EndToEndCycleSimulation extends App {
       dut.clockDomain.waitSampling(2)
       dut.io.clear #= false
 
+      val benesStart = readBenesCounters()
       val mode = modeName match {
         case "DenseIp" => TrapezoidDataflow.DenseIp
         case "TrIp" => TrapezoidDataflow.TrIp
@@ -701,7 +714,10 @@ object EndToEndCycleSimulation extends App {
         if (firstWriteEdge < 0) 0 else firstWriteEdge - startEdge + 1,
         readActiveCycles, writeActiveCycles, readRequests, writeRequests,
         dut.io.cacheHitCount.toLong, dut.io.cacheMissCount.toLong,
-        usefulMacs(workload), checksum(observed))
+        usefulMacs(workload), checksum(observed),
+        readBenesCounters().zip(benesStart).map {
+          case (after, before) => (after - before) & 0xffffffffL
+        })
     }
 
     for (workload <- selectedWorkloads; mode <- selectedModes) {
@@ -771,6 +787,16 @@ object EndToEndCycleSimulation extends App {
       f"${average(category, mode)(_.cacheHits)}%.1f | " +
       f"${average(category, mode)(_.cacheMisses)}%.1f | " +
       f"${average(category, mode)(_.usefulMacs)}%.1f |")
+  }
+  if (hardwareProfile == EndToEndHardwareProfile.Unified) {
+    println("\nBenes RTL counter deltas summed across PE rows")
+    println("| Category | Mode | " + benesCounterNames.mkString(" | ") + " |")
+    println("| :--- | :--- | " + benesCounterNames.map(_ => "---:").mkString(" | ") + " |")
+    for (category <- selectedCategories; mode <- selectedModes) {
+      val counters = benesCounterNames.indices.map(index =>
+        f"${average(category, mode)(_.benesCounters(index))}%.1f")
+      println(s"| ${category.name} | $mode | ${counters.mkString(" | ")} |")
+    }
   }
   println("\nEvery total is counted from Verilator RTL clock edges. CSR pointer walking, " +
     "clustered-cache misses/refills, compute, result backpressure, and final C write " +

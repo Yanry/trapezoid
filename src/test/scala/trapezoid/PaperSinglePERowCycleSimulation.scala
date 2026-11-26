@@ -219,6 +219,7 @@ object PaperSinglePERowCycleSimulation extends App {
       core.io.temporalMrnOutputs(port).ready := io.temporalMrnOutputs(port).ready
     }
     io.controlPrepareCycles := core.io.controlPrepareCycles
+    io.benesPerformance := core.io.benesPerformance
     io.routeCycles := core.io.routeCycles
     io.macCycles := core.io.macCycles
     io.mrnCycles := core.io.mrnCycles

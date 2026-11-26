@@ -1,6 +1,7 @@
 package trapezoid
 
 import org.scalatest.funsuite.AnyFunSuite
+import spinal.core._
 import spinal.core.sim._
 
 class TrapezoidPERowSpec extends AnyFunSuite {
@@ -27,6 +28,8 @@ class TrapezoidPERowSpec extends AnyFunSuite {
       config: TrapezoidConfig = cfg): Unit = {
     dut.io.command.valid #= false
     dut.io.command.payload.endOfTile #= false
+    dut.io.command.payload.responseTag #= 0
+    dut.io.mrnProgram.valid #= false
     dut.io.response.ready #= true
     for (port <- 0 until config.localBanks) {
       dut.io.temporalMrnInputs(port).valid #= false
@@ -256,85 +259,247 @@ class TrapezoidPERowSpec extends AnyFunSuite {
     }
   }
 
-  test("paper-width Benes control cache amortizes repeated route preparation") {
-    val routedCfg = cfg.copy(
-      fiberWidth = 8,
-      maxFibers = 4,
-      macLanes = 32,
-      outputLanes = 16,
-      localDepthPerBank = 16)
+  test("backtracking TrIP commands retain operands and tags under response backpressure") {
+    val routedCfg = cfg.copy(fiberWidth = 8, maxFibers = 4,
+      macLanes = 16, outputLanes = 16)
+    val backtrackingA = Vector(224, 206, 18, 34)
+    val backtrackingB = Vector(160, 33, 198, 1)
+    val commands = Vector(
+      ("TrIp", backtrackingA, backtrackingB),
+      ("TrIp", backtrackingA, backtrackingB),
+      ("DenseIp", Vector(255, 0, 0, 0), Vector(255, 0, 0, 0)),
+      ("TrIp", Vector(0, 0, 0, 0), Vector(1, 0, 0, 0)),
+      ("TrIp", Vector.fill(4)(255), Vector.fill(4)(255)),
+      ("TrIp", backtrackingA, backtrackingB))
+    def aValue(command: Int, fiber: Int, coordinate: Int): Int =
+      1 + command + 3 * fiber + coordinate
+    def bValue(command: Int, fiber: Int, coordinate: Int): Int =
+      2 + command + 5 * fiber + coordinate
+    val expected = commands.zipWithIndex.map { case ((_, aMasks, bMasks), command) =>
+      (for {
+        aFiber <- 0 until 4
+        bFiber <- 0 until 4
+        sum = (0 until 8).filter(coordinate =>
+          (aMasks(aFiber) & bMasks(bFiber) & (1 << coordinate)) != 0)
+          .map(coordinate => aValue(command, aFiber, coordinate) *
+            bValue(command, bFiber, coordinate)).sum
+        if sum != 0
+      } yield ((10 + aFiber, 20 + bFiber), sum)).toMap
+    }
     simConfig.compile(new TrapezoidPERow(routedCfg)).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       clearInputs(dut, routedCfg)
+      dut.clockDomain.waitSampling(10)
+      var sent = 0
+      var received = 0
+      var cycle = 0
+      var stalledResponse: Option[Vector[BigInt]] = None
+      while (received < commands.size && cycle < 20000) {
+        dut.io.command.valid #= sent < commands.size
+        dut.io.response.ready #= cycle % 13 >= 7
+        if (sent < commands.size) {
+          val (mode, aMasks, bMasks) = commands(sent)
+          dut.io.command.payload.mode #=
+            (if (mode == "DenseIp") TrapezoidDataflow.DenseIp else TrapezoidDataflow.TrIp)
+          dut.io.command.payload.responseTag #= sent
+          dut.io.command.payload.endOfTile #= (sent == commands.size - 1)
+          for (fiber <- 0 until 4) {
+            dut.io.command.payload.trip.a(fiber).valid #= (aMasks(fiber) != 0)
+            dut.io.command.payload.trip.a(fiber).mask #= aMasks(fiber)
+            dut.io.command.payload.trip.a(fiber).tag #= 10 + fiber
+            dut.io.command.payload.trip.b(fiber).valid #= (bMasks(fiber) != 0)
+            dut.io.command.payload.trip.b(fiber).mask #= bMasks(fiber)
+            dut.io.command.payload.trip.b(fiber).tag #= 20 + fiber
+            val aCoordinates = (0 until 8).filter(coordinate =>
+              (aMasks(fiber) & (1 << coordinate)) != 0)
+            val bCoordinates = (0 until 8).filter(coordinate =>
+              (bMasks(fiber) & (1 << coordinate)) != 0)
+            for (entry <- 0 until 8) {
+              dut.io.command.payload.trip.a(fiber).values(entry) #=
+                (if (entry < aCoordinates.size) aValue(sent, fiber, aCoordinates(entry)) else 0)
+              dut.io.command.payload.trip.b(fiber).values(entry) #=
+                (if (entry < bCoordinates.size) bValue(sent, fiber, bCoordinates(entry)) else 0)
+            }
+          }
+        }
+        sleep(1)
+        if (dut.io.command.valid.toBoolean && dut.io.command.ready.toBoolean) sent += 1
+        if (dut.io.response.valid.toBoolean) {
+          val response = dut.io.response.payload
+          val snapshot = Vector(response.responseTag.toBigInt,
+            response.count.toBigInt, response.selectedColumns.toBigInt,
+            response.effectualMacs.toBigInt,
+            BigInt(if (response.overflow.toBoolean) 1 else 0)) ++
+            (0 until routedCfg.outputLanes).flatMap { index =>
+              val result = response.results(index)
+              Vector(result.row.toBigInt, result.column.toBigInt, result.value.toBigInt,
+                BigInt(if (result.valid.toBoolean) 1 else 0),
+                BigInt(if (result.endOfTile.toBoolean) 1 else 0),
+                response.destinationBank(index).toBigInt,
+                response.destinationWordOffset(index).toBigInt)
+            }
+          stalledResponse.foreach(previous => assert(previous == snapshot))
+          if (dut.io.response.ready.toBoolean) {
+            assert(response.responseTag.toInt == received)
+            assert(response.overflow.toBoolean == (received == 4))
+            if (received == 4) {
+              assert(response.count.toInt == 0)
+            } else {
+              val observed = (0 until response.count.toInt).map { index =>
+                val result = response.results(index)
+                assert(result.endOfTile.toBoolean == (received == commands.size - 1))
+                ((result.row.toInt, result.column.toInt), result.value.toInt)
+              }.toMap
+              assert(observed == expected(received))
+            }
+            received += 1
+            stalledResponse = None
+          } else {
+            stalledResponse = Some(snapshot)
+          }
+        } else {
+          assert(stalledResponse.isEmpty)
+        }
+        dut.clockDomain.waitSampling()
+        cycle += 1
+      }
+      assert(sent == commands.size && received == commands.size)
+      assert(dut.io.controlPrepareCycles.toLong > 0)
+    }
+  }
+
+  test("a completed unroutable A control returns overflow and releases the next command") {
+    val routedCfg = cfg.copy(fiberWidth = 8, maxFibers = 4,
+      macLanes = 16, outputLanes = 16)
+    class FaultInjectedPERow extends TrapezoidPERow(routedCfg) {
+      val injectFailure = in Bool()
+      aResult.routable.allowOverride
+      when(injectFailure) { aResult.routable := False }
+    }
+    simConfig.compile(new FaultInjectedPERow).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      clearInputs(dut, routedCfg)
+      dut.injectFailure #= true
       dut.io.command.payload.mode #= TrapezoidDataflow.TrIp
-
-      dut.io.command.payload.trip.a(0).valid #= true
-      dut.io.command.payload.trip.a(0).tag #= 1
-      dut.io.command.payload.trip.a(0).mask #= 0x1
-      dut.io.command.payload.trip.a(0).values(0) #= 3
-      dut.io.command.payload.trip.b(0).valid #= true
-      dut.io.command.payload.trip.b(0).tag #= 2
-      dut.io.command.payload.trip.b(0).mask #= 0x1
-      dut.io.command.payload.trip.b(0).values(0) #= 5
-
-      val broadcastPrepareStart = dut.io.controlPrepareCycles.toLong
-      issue(dut)
-      val broadcastPrepareCycles =
-        dut.io.controlPrepareCycles.toLong - broadcastPrepareStart
-      assert(broadcastPrepareCycles <= 1,
-        "a single-source multicast route must bypass the generic Benes solver")
-      assert(dut.io.response.payload.count.toInt == 1)
-      assert(dut.io.response.payload.results(0).value.toInt == 15)
-      dut.clockDomain.waitSampling()
-
-      dut.io.command.payload.trip.a(0).valid #= true
-      dut.io.command.payload.trip.a(0).tag #= 1
-      dut.io.command.payload.trip.a(0).mask #= 0xff
-      dut.io.command.payload.trip.b(0).valid #= true
-      dut.io.command.payload.trip.b(0).tag #= 2
-      dut.io.command.payload.trip.b(0).mask #= 0xff
-      for (entry <- 0 until routedCfg.fiberWidth) {
-        dut.io.command.payload.trip.a(0).values(entry) #= entry + 1
-        dut.io.command.payload.trip.b(0).values(entry) #= entry + 2
+      val aMasks = Vector(224, 206, 18, 34)
+      val bMasks = Vector(160, 33, 198, 1)
+      for (fiber <- 0 until 4) {
+        dut.io.command.payload.trip.a(fiber).valid #= true
+        dut.io.command.payload.trip.a(fiber).tag #= fiber
+        dut.io.command.payload.trip.a(fiber).mask #= aMasks(fiber)
+        dut.io.command.payload.trip.b(fiber).valid #= true
+        dut.io.command.payload.trip.b(fiber).tag #= fiber
+        dut.io.command.payload.trip.b(fiber).mask #= bMasks(fiber)
+        for (entry <- 0 until 8) {
+          dut.io.command.payload.trip.a(fiber).values(entry) #= 1
+          dut.io.command.payload.trip.b(fiber).values(entry) #= 1
+        }
       }
-
-      issue(dut)
-      val firstPrepareCycles = dut.io.controlPrepareCycles.toLong
-      assert(firstPrepareCycles > 0 &&
-        firstPrepareCycles <= routedCfg.mrnReductionLevels + 1,
-        "the first spread route must use the bounded metadata pipeline")
-      dut.clockDomain.waitSampling()
-
-      issue(dut)
-      val repeatedPrepareCycles =
-        dut.io.controlPrepareCycles.toLong - firstPrepareCycles
-      assert(repeatedPrepareCycles <= 1,
-        "a cached route pattern must bypass the multi-cycle Benes solver")
-
-      dut.io.command.payload.endOfTile #= true
-      issue(dut)
-      val tileEndPrepareCycles = dut.io.controlPrepareCycles.toLong
-      dut.io.command.payload.endOfTile #= false
-      issue(dut)
-      val nextTilePrepareCycles =
-        dut.io.controlPrepareCycles.toLong - tileEndPrepareCycles
-      assert(nextTilePrepareCycles > 0 &&
-        nextTilePrepareCycles <= routedCfg.mrnReductionLevels + 1,
-        "the first spread route of a new tile must refill the control cache")
-
-      dut.io.command.payload.trip.a(1).valid #= true
-      dut.io.command.payload.trip.a(1).tag #= 3
-      dut.io.command.payload.trip.a(1).mask #= 0xff
-      for (entry <- 0 until routedCfg.fiberWidth) {
-        dut.io.command.payload.trip.a(1).values(entry) #= entry + 3
+      for (transaction <- 0 until 2) {
+        dut.io.command.payload.responseTag #= transaction
+        dut.io.command.valid #= true
+        sleep(1)
+        while (!dut.io.command.ready.toBoolean) dut.clockDomain.waitSampling()
+        dut.clockDomain.waitSampling()
+        dut.io.command.valid #= false
+        sleep(1)
+        var cycles = 0
+        while (!dut.io.response.valid.toBoolean && cycles < 10000) {
+          dut.clockDomain.waitSampling()
+          sleep(1)
+          cycles += 1
+        }
+        assert(dut.io.response.valid.toBoolean)
+        assert(dut.io.response.payload.responseTag.toInt == transaction)
+        assert(dut.io.response.payload.overflow.toBoolean == (transaction == 0))
+        assert(dut.io.response.payload.count.toInt == (if (transaction == 0) 0 else 9))
+        if (transaction == 1) {
+          assert((0 until 9).map(index =>
+            dut.io.response.payload.results(index).value.toInt).sum == 14)
+        }
+        dut.clockDomain.waitSampling()
+        dut.injectFailure #= false
       }
-      val fallbackStart = dut.io.controlPrepareCycles.toLong
-      issue(dut)
-      val fallbackCycles = dut.io.controlPrepareCycles.toLong - fallbackStart
-      val boundedPathCycles = routedCfg.mrnReductionLevels + 4
-      assert(fallbackCycles > 0 &&
-        fallbackCycles <= boundedPathCycles,
-        "the bounded metadata path includes descriptor and control FIFO latency")
+    }
+  }
+
+  test("Benes fast paths and per-operand caches work at small and paper widths") {
+    for (laneCount <- Seq(16, 32)) {
+      val routedCfg = cfg.copy(fiberWidth = 8, maxFibers = 4,
+        macLanes = laneCount, outputLanes = 16, localDepthPerBank = 16)
+      simConfig.compile(new TrapezoidPERow(routedCfg)).doSim { dut =>
+        dut.clockDomain.forkStimulus(10)
+        clearInputs(dut, routedCfg)
+        dut.io.command.payload.mode #= TrapezoidDataflow.TrIp
+        dut.io.command.payload.trip.a(0).valid #= true
+        dut.io.command.payload.trip.a(0).tag #= 1
+        dut.io.command.payload.trip.a(0).mask #= 1
+        dut.io.command.payload.trip.a(0).values(0) #= 3
+        dut.io.command.payload.trip.b(0).valid #= true
+        dut.io.command.payload.trip.b(0).tag #= 2
+        dut.io.command.payload.trip.b(0).mask #= 1
+        dut.io.command.payload.trip.b(0).values(0) #= 5
+        issue(dut)
+        assert(dut.io.controlPrepareCycles.toLong == 0)
+        assert(dut.io.response.payload.results(0).value.toInt == 15)
+        dut.clockDomain.waitSampling()
+
+        dut.io.command.payload.trip.a(0).mask #= 255
+        dut.io.command.payload.trip.b(0).mask #= 255
+        for (entry <- 0 until 8) {
+          dut.io.command.payload.trip.a(0).values(entry) #= entry + 1
+          dut.io.command.payload.trip.b(0).values(entry) #= entry + 2
+        }
+        issue(dut)
+        assert(dut.io.controlPrepareCycles.toLong == 0)
+        assert(dut.io.benesPerformance.aSearches.toLong == 0)
+        assert(dut.io.benesPerformance.bSearches.toLong == 0)
+        dut.clockDomain.waitSampling()
+
+        dut.io.command.payload.trip.a(1).valid #= true
+        dut.io.command.payload.trip.a(1).tag #= 3
+        dut.io.command.payload.trip.a(1).mask #= 255
+        for (entry <- 0 until 8) {
+          dut.io.command.payload.trip.a(1).values(entry) #= entry + 3
+        }
+        issue(dut)
+        assert(!dut.io.response.payload.overflow.toBoolean)
+        assert(dut.io.response.payload.count.toInt == 2)
+        assert(dut.io.benesPerformance.aSearches.toLong == 0)
+        assert(dut.io.benesPerformance.bSearches.toLong == 1)
+        val firstPrepare = dut.io.controlPrepareCycles.toLong
+        assert(firstPrepare > 0 && firstPrepare < 1000)
+        dut.clockDomain.waitSampling()
+
+        for (entry <- 0 until 8) {
+          dut.io.command.payload.trip.b(0).values(entry) #= entry + 4
+        }
+        issue(dut)
+        assert(dut.io.controlPrepareCycles.toLong == firstPrepare)
+        assert(dut.io.benesPerformance.bSearches.toLong == 1)
+        assert(dut.io.benesPerformance.bCacheHits.toLong == 1)
+        assert(dut.io.response.payload.results(0).value.toInt ==
+          (0 until 8).map(entry => (entry + 1) * (entry + 4)).sum)
+        dut.clockDomain.waitSampling()
+
+        dut.io.command.payload.trip.a(1).mask #= 15
+        issue(dut)
+        assert(dut.io.controlPrepareCycles.toLong == firstPrepare)
+        assert(dut.io.benesPerformance.bSearches.toLong == 1)
+        assert(dut.io.benesPerformance.bCacheHits.toLong == 2)
+        assert(dut.io.response.payload.results(1).value.toInt ==
+          (0 until 4).map(entry => (entry + 3) * (entry + 4)).sum)
+        dut.clockDomain.waitSampling()
+        dut.io.command.payload.trip.a(1).mask #= 255
+        dut.io.command.payload.endOfTile #= true
+        issue(dut)
+        dut.clockDomain.waitSampling()
+        dut.io.command.payload.endOfTile #= false
+        issue(dut)
+        assert(dut.io.benesPerformance.aSearches.toLong == 0)
+        assert(dut.io.benesPerformance.bSearches.toLong == 2)
+        assert(dut.io.controlPrepareCycles.toLong > firstPrepare)
+      }
     }
   }
 

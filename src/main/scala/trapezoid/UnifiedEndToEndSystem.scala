@@ -1700,6 +1700,7 @@ class UnifiedEndToEndSystem(
     val clear = in Bool()
     /** Mapper/control-processor writes to each PE row's MRN control store. */
     val mrnProgram = Vec(slave(Flow(SpatialMrnControlWrite(cfg))), cfg.peRows)
+    val benesPerformance = out Vec(BenesPerformanceCounters(), cfg.peRows)
     val descriptor = slave(Stream(UnifiedMatrixDescriptor(systemCfg)))
     val dmaReadRequest = master(Stream(CacheRefillRequest(cacheCfg)))
     val dmaReadResponse = slave(Stream(CacheRefillResponse(cacheCfg)))
@@ -1790,6 +1791,7 @@ class UnifiedEndToEndSystem(
   writeback.io.clear := io.clear
   if (useSharedArray) {
     sharedTile.io.clear := io.clear
+    io.benesPerformance := sharedTile.io.benesPerformance
     for (row <- 0 until cfg.peRows) {
       sharedTile.io.mrnProgram(row).valid := io.mrnProgram(row).valid
       sharedTile.io.mrnProgram(row).payload := io.mrnProgram(row).payload
@@ -1836,6 +1838,11 @@ class UnifiedEndToEndSystem(
       sharedTile.io.trgsUnsupportedMode
   }
 
+  if (!useSharedArray) {
+    for (row <- 0 until cfg.peRows) {
+      io.benesPerformance(row) := BenesPerformanceCounters().getZero
+    }
+  }
   io.busy := state =/= UnifiedEndToEndState.Idle
   io.done := doneReg
   io.error := errorReg || writeback.io.error

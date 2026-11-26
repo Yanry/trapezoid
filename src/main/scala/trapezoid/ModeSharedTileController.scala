@@ -70,6 +70,7 @@ class ModeSharedTileController(
     val trgsDebugMergeIssued = out Vec(Bits(cfg.localBanks bits), cfg.peRows)
 
     val localBufferOwners = out Vec(LocalBufferOwner(), cfg.peRows)
+    val benesPerformance = out Vec(BenesPerformanceCounters(), cfg.peRows)
   }
 
   val trip = new TrIpTileController(
@@ -113,6 +114,7 @@ class ModeSharedTileController(
     val scheduler = trgt(row)
     val spatial = trgs(row)
     val pe = peRows(row)
+    io.benesPerformance(row) := pe.io.benesPerformance
     pe.io.mrnProgram.valid := io.mrnProgram(row).valid
     pe.io.mrnProgram.payload := io.mrnProgram(row).payload
     val rowFree = !trgtOwned(row) && !trgsOwned(row) && peInFlight(row) === 0

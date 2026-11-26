@@ -132,14 +132,14 @@ PE row 的主要流水阶段为：
 ```text
 descriptor FIFO
   -> MFIU / dense fast path
-  -> metadata FIFO / control FIFO / A-B distribution
+  -> request/response Benes control / A-B distribution
   -> multiplier lanes
   -> mode-specific coordinate ordering
   -> N-1-node augmented MRN reduction
   -> response FIFO
 ```
 
-paper-width command 约 43 Kbit，SpinalHDL 1.7 无法把它压成一个超宽 FIFO RAM word，因此 descriptor FIFO 使用两个串联的 elastic register stage；较小配置继续使用 `StreamFifoLowLatency`。route metadata 与 A/B control 分别使用独立的 2-entry FIFO，控制准备和超宽 operand descriptor 不再共用一个 holding register。
+paper-width command 约 43 Kbit，SpinalHDL 1.7 无法把它压成一个超宽 FIFO RAM word，因此 descriptor FIFO 使用两个串联的 elastic register stage；较小配置继续使用 `StreamFifoLowLatency`。当前 descriptor 在 A/B 路由准备期间保持在 FIFO 头部；两路求解器在各自请求握手时锁存 metadata，PE row 用独立的 sent/result-valid 状态和结果寄存器保存两路控制字。通用路径不再使用旧的 metadata FIFO 和两路 2-entry control FIFO。
 
 输入命令通过 `valid/ready` 进入，输出通过 `valid/ready` 返回。响应包括结果坐标、累加值、结果数量、effectual MAC 数、动态列数和 overflow 状态。
 
@@ -172,11 +172,21 @@ MFIU 面向最多 4 个 A fiber 和 4 个 B fiber：
 
 PE row 中有独立的 A、B 两个 `OperandDistributionNetwork`。MFIU 输出的是“哪个 source 参与哪个乘法”的索引；distribution network 把 source value 多播到对应 MAC lane。
 
-TrIP 主路径保留独立的 A/B Benes fabric。MFIU 输出 `routeValid + sourceIndex` metadata。16 lane 及以下使用完整组合 Benes 控制生成；paper-width 路径分为三类：单一 source 使用动态 broadcast controls，compacted spread permutation 使用预计算 Benes controls，其它 repeated-source block multicast 和不规则 route 进入通用 metadata pipeline。
+TrIP 主路径保留独立的 A/B `BenesDistributionFabric`，其物理连线、每个输出独立选择的 multicast 能力和控制字位序没有变化。MFIU 输出 `routeValid + sourceIndex` metadata。small 和 paper-width 的通用路径使用支持回溯的多周期 `BenesRouteControlGenerator`；`PipelinedBenesRouteControlGenerator` 仅保留为宽配置的兼容模块名，不代表固定深度、II=1 的通用 solver。2026-11-26 的性能优化将组合式 `RestrictedBenesRouteControlGenerator` 接入所有宽度：A/B 各自识别广播或 spread pattern，各自选择快路径、控制缓存或通用求解器，不再要求两侧同时属于同一种路径。快路径直接生成驱动真实 Beneš fabric 的控制字；它没有以选择树代替数据网络。旧 `PipelinedRestrictedBenesRouteControlGenerator` 保留供独立流水接口测试，PE row 不再为识别出的规则路由支付其 token pipeline 延迟。
 
-受限控制器先检查 broadcast 或 `sourceIndex == spread(outputLane)`，128 lane 时经过 `log2(128)=7` 个 ready/valid stage。通用路径由 descriptor FIFO 写入 `PERowBenesMetadata` FIFO，A/B metadata 同步进入两个 7-stage、II=1 token pipeline，结果再写入独立 A/B control FIFO。这样 repeated-source pattern 不再执行旧版约 263-cycle 的逐命令图着色；7.2 中 `MS x MS` 和 `MS x D` 的 cold prepare 已降到 18/9 cycle。
+通用控制 RTL 位于 `src/main/resources/rtl/TrapezoidBenesRouteControl.sv`，不再包含运行时递归 task。状态机使用 `log2(macLanes)` 层寄存器栈，按深度优先顺序处理上、下子网：`INITIALIZE -> COLOR_GRAPH -> BUILD_CHILDREN -> PUSH_LOWER -> RETURN_SUCCESS`。每个 frame 保存 valid/source、控制字基址、base color、component ID/count、component flip、下子网请求及返回阶段。图边仍表示 output pair 的不同源冲突和 input pair 两侧源的冲突；染色过程中发现奇环会返回父 frame。
 
-paper-width 通用 repeated-source/不规则 route 现在由 `TrapezoidBenesRouteControl.sv` 根据 MFIU metadata 生成完整的 128-lane、13-stage Benes control word，A/B 两棵 fabric 使用独立 control FIFO 接收结果；不再存在 direct-distribution bridge。当前 7-stage endpoint 已改为只在各级寄存 `routeValid + sourceIndex` metadata，末端根据第 7 级稳定 metadata 生成控制字，避免在每个 stage 复制完整 control word；A/B 两路可以 II=1 地接收 metadata，PE row 只有在 A/B 控制字都有效且 `routable` 时才消费 route。Verilator 已对这些 route 做了 `routable` 断言和端到端 checksum 验证。当前剩余差距是末端 `solveSubnet` 仍为组合式图遍历，尚未拆成论文意义上“每个 Benes level 各自执行一个 metadata step”的完全状态机；下一步应将末端 solver 替换为 level-local metadata FSM。PE row 内的 4-entry route cache 仍复用已准备的 controls/token，`endOfTile` 会恢复 cold state。
+每次完整搜索以 `actualColor = baseColor XOR componentFlip[componentId]` 生成上下子网。固定第一个连通分量不翻转，枚举其余分量的方向；任意子网失败时进入 `RETRY_ORIENTATION`，只有当前 frame 的所有方向都失败，才向父 frame 返回失败。全局控制字按各 frame 的固定基址写入，成功的上子网控制在下子网求解期间保留。16 路布局仍为 `[15:0] first / [55:16] upper / [95:56] lower / [111:96] last`；128 路仍输出 13 级 fabric 的完整控制字。
+
+通用求解器还做了四项与数据类别无关的优化：空子网直接返回，其未使用的控制位不影响任何有效输出；4 路子网用固定 16 种颜色检查构造三层 switch 控制，不继续入栈，四路全部 mapping/valid mask 由穷举 RTL 测试覆盖；较大子网若只请求同一个源，直接生成广播控制，并只覆盖该子网控制区域；对于不超过 16 lane 的 solver，先检查按输出奇偶分配上下子网的方向是否满足本级冲突约束，合法则直接尝试子网，子网失败后重新进行完整分量染色和方向枚举。播种新分量时同时展开种子的一跳邻居，减少一个遍历周期。以上快路径均没有把失败当成无解，也没有取消回溯；较大 solver 的通用图遍历仍按状态机执行。
+
+`start.valid && start.ready` 锁存请求，求解期间不依赖外部输入继续保持。成功与确认无解都会产生一次 `result`；`result.valid && !result.ready` 时控制字和 routable 保持稳定。全 invalid 请求视为无约束、可路由。求解器不设置会把“尚未搜索完成”误报为“无解”的固定超时；最坏方向搜索可能随分量数指数增长，因此通用路径既不是固定 7 cycle，也不是 II=1。
+
+PE row 用 `aSent/bSent` 分别防止重复发射，用 `aResultValid/bResultValid` 分别保留已完成结果；一侧走快路径或命中缓存时，另一侧可以单独搜索。两路控制可用后才释放命令：任一路 `routable=false` 时，当前命令携带 `overflow=true` 返回、结果数为 0、MAC lane 无效，并消费两路结果，后续命令继续执行。控制缓存保持每侧 4 项，A/B 独立匹配和替换，不再用 A+B 联合 key。若缓存记录覆盖当前全部有效 lane，且这些 lane 的 source index 一致，即可复用，因此长路由也能服务兼容的短前缀；不能将未覆盖的新 lane 误当成 cache hit。只有成功 command 的通用结果会入缓存；`endOfTile` 同时清空两侧。超过 MAC 容量的 MFIU 请求直接返回 overflow。DenseIP 完整单 A/B fiber、空交集和 Gustavson 模式仍旁路通用求解器。
+
+`BenesPerformanceCounters` 通过 PE row、`ModeSharedTileController` 和 Unified 顶层公开：每侧 fast route、cache hit、search 次数、search cycle、backtrack 次数，以及 route command 和 prepare cycle。search cycle 仅统计 solver 执行，不包含输出响应等待；backtrack 包括快速方向试探失败后恢复完整搜索，以及分量翻转重试。每个成功的非空 route command，在每侧只计入 fast/cache/search 中的一类。`EndToEndCycleSimulation` 输出每个 workload 的计数增量，并跨 PE row 求和；这些 occupancy 总量会包含并行 row 的重叠时间，不能直接相加得到顶层端到端周期。mode-specialized、非 Unified 的顶层暂不提供这组统计，benchmark 不打印其零占位。
+
+回归入口为 `sbt -batch 'testOnly trapezoid.BenesDistributionFabricSpec trapezoid.TrapezoidPERowSpec'`。覆盖四路所有 mapping/valid mask、所有未溢出的 small MFIU mask、16 路回溯反例、不可路由响应及恢复、随机 permutation/由真实 switch controls 构造的 multicast、响应背压、求解中复位、128 路完整 fabric，以及 PE 命令/tag/operand 对齐和单侧失败注入。另验证 16/128 路广播和 masked-spread 快路径的真实 fabric 输出，16/32-lane PE 的单侧搜索、warm cache、短前缀复用及 endOfTile 失效。定向 MFIU 反例为 `A masks=[224,206,18,34]`、`B masks=[160,33,198,1]`，8-wide fiber、16 MAC、14 个有效乘法，最终应产生 9 个坐标结果。Vivado 综合、时序、面积和功耗尚需目标平台工具验证。
 
 ### 4.5 Reduction tree 和 MRN
 
@@ -365,6 +375,8 @@ descriptor accepted
 
 ## 7. 两个 RTL 周期测试
 
+版本说明：2026-11-25 至 11-26 已替换通用 Benes 求解器并调整 PE row 控制等待逻辑。7.1 已于 2026-11-26 重新运行；7.2 仍保留 2026-11-10 的历史基线，尤其其中 TrIP 的 cold-route 周期不能直接代表新实现。计时边界和测试入口不变。
+
 ### 7.1 `EndToEndCycleSimulation`
 
 源文件：`src/test/scala/trapezoid/UnifiedEndToEndCycleSimulation.scala`。
@@ -411,26 +423,44 @@ final C write response consumed
 - 论文原始 FPGA/ASIC 的频率、NoC 和功耗；
 - 128-row full paper array 的已完成周期结果，除非确实完成对应仿真。
 
-2026-11-10 在逐级缩宽的 subtree `{count,head,tail}` link、按 global node ID 分布式保存的可编程 profile control store、规则 level-local switch stages 和 `N-1` augmented MRN，以及 array-level `groupId/sourceId` 长期 B stream、逐 source close、K 路虚拟 FIFO 和跨 subrow `(row,column)` 合并上重新完成真实 Verilator 验证。24 个 case（6 类 x 4 mode x 1 sample）的结果、write 数和 checksum 全部通过；小规模 RTL 使用 2 个 refill channel 和每 bank 2 个 MSHR。本轮 `EndToEndCycleSimulation --scale=small --samples=1` 的 Verilator 编译/仿真主机时间不计入硬件周期。下面是本轮单 sample 的端到端周期结果：
+2026-11-26 在可回溯 Benes solver、全宽度独立 A/B 快路径、每侧 4 项独立控制缓存、兼容短路由复用、空/广播/4 路子网简化和带失败回退的快速方向试探上重新完成真实 Verilator 验证。原有共享 MRN、array-level 长期 B stream、K 路虚拟 FIFO、2 个 refill channel 和每 bank 2 个 MSHR 保持启用。24 个 case（6 类 x 4 mode x 1 sample）的结果、write 数和 checksum 全部通过。运行命令为 `sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation --scale=small --samples=1'`；矩阵、稀疏度、DMA 延迟和计时边界均未更改，主机编译/仿真时间不计入硬件周期。新结果如下：
 
 | Category | DenseIp | TrIp | TrGt | TrGs |
 | --- | ---: | ---: | ---: | ---: |
-| HS x HS | 1050 | 730 | 419 | 350 |
-| HS x MS | 1071 | 751 | 461 | 350 |
-| HS x D | 1095 | 775 | 585 | 350 |
-| MS x MS | 1475 | 1150 | 2163 | 1918 |
-| MS x D | 1852 | 1516 | 3867 | 2422 |
-| D x D | 1852 | 1916 | 8103 | 7328 |
+| HS x HS | 1072 | 730 | 419 | 350 |
+| HS x MS | 1093 | 751 | 461 | 350 |
+| HS x D | 1117 | 775 | 585 | 350 |
+| MS x MS | 1497 | 1376 | 2163 | 1918 |
+| MS x D | 1874 | 1662 | 3867 | 2422 |
+| D x D | 1874 | 1938 | 8103 | 7328 |
 
-这些数字来自同一个共享 `ModeSharedTileController`、同一套 PE row/local storage、cluster ROB、双 refill channel 和 cold-cache 模型。`HS x MS/D` 下 TrGS 最快，`MS x MS/D` 下 TrIP 最快，`D x D` 下 DenseIp 最快；这三组推荐方向与论文一致。`HS x HS` 仍是 TrGS 的 350 cycle 小于 TrGT 的 419 cycle，原因是 16x16、0.39% A 只有一个非零，TrGT 的 subrow packing 没有第二条短 row 可合并，却仍要完成 CSR 扫描、同步 local-buffer 读、radix-K spatial MRN 和 packed-group close。
+这些数字来自同一个共享 `ModeSharedTileController`、同一套 PE row/local storage、cluster ROB、双 refill channel 和 cold-cache 模型。相对于本轮优化前的可回溯 solver，TrIP 的 `MS x MS` 从 2326 降至 1376 cycle，减少 950 cycle（40.8%）；`MS x D` 从 1904 降至 1662。MS×MS 中 TrIP 重新快于同配置 DenseIP 的 1497、TrGT 的 2163 和 TrGS 的 1918。DenseIP 不满足“单个完整 A/B fiber”快路径时也进入 Beneš，因此同样受益。TrGT/TrGS 的全部 12 个 case 周期保持不变。`HS x HS` 仍是 TrGS 的 350 cycle 小于 TrGT 的 419 cycle；该小矩阵的 A 只有一个非零，TrGT subrow packing 缺少可并行的活动 row，却仍需支付 CSR、local-buffer 读、radix-K MRN 和 packed-group close 开销。
+
+MS×MS 的计数定位表明，原来的主要成本是普通求解遍历，基线并没有触发实际回溯。下面是相同 sample 0、独立启动 TrIP 测试的 RTL counter delta，按 4 个 PE row 求和；优化后的独立启动总周期同样为 1376，排除了依赖前一个 mode 暖控制缓存的解释。
+
+| 指标 | 优化前 | 优化后 |
+| --- | ---: | ---: |
+| 非空路由命令 | 86 | 86 |
+| A / B fast route | 45 / 45 | 67 / 69 |
+| A / B cache hit | 8 / 8 | 5 / 3 |
+| A / B 通用搜索次数 | 33 / 33 | 14 / 14 |
+| A / B 搜索活动周期 | 2158 / 2168 | 214 / 230 |
+| prepareCycles 总量 | 2248 | 376 |
+| A / B 回溯次数 | 0 / 0 | 0 / 0 |
+
+cache hit 数没有增加，是因为更多请求直接进入更快的广播/spread 路径，且每侧 fast/cache/search 互斥分类；并不表示需要盲目增大缓存。计数总量包含并行 row 的重叠时间，不能将 2248 或 376 当作顶层等待时长。独立复现命令为 `sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation --scale=small --mode=TrIp --category=MSxMS --samples=1'`。
+
+另用 `--category=MSxMS --samples=3` 完成 3 个样本 × 4 mode 的 12 个 case，平均端到端周期为 DenseIP 1492.7、TrIP 1346.0、TrGT 2167.7、TrGS 1884.3，所有结果和 checksum 一致。该均值仅代表这三个合成 small 样本；不能推断所有 MS 矩阵或完整 paper 阵列必然具有相同排序。控制准备仍主要发生在命令头部，array controller 的 Dispatch/Collect/Scatter 串行批次没有改为跨批预取或多批 outstanding。
 
 TrGT 现在不会因 packed group 内切换 B row 而进入坐标回退 epoch；本轮 `TrGT / MS x D / sample 0` 的完整 RTL 仿真结束于 3867 cycle，未出现 issued B element 永久等待。与旧的组合 rank sorter 相比，TrGT 每条命令现在要经过 radix-K head capture、merge/advance 和 emit，因而在单 PE row 端到端周期中可观察到额外的结构开销；这正是“把排序功能移入 MRN”后的真实代价，不应误解为前置排序器仍然存在。TrGT 在较密场景仍慢于推荐 mode，主要原因变为 command 数、每命令的 K 路 head 决策、单 cache issue point、read DMA 活跃周期和 C writeback 流量，而不是 B-row column 回退。
 
-完整双 group B-window、双 refill channel、cache 计数和最终 C checksum 仍全部通过。benchmark 没有在计时区间内执行 control programming，未写 word 使用默认 profile，MRN 的 programming latency 不计入 command-to-response 周期。完整运行后又把 programming port 提升到 Unified 顶层；`ModeSharedTileControllerSpec` 和 `UnifiedEndToEndSystemSpec` 已覆盖最终端口连接。调试参数 `--sample=<index>` 和 `--timeout=<cycles>` 可在超时时报告 TrGS assigned/completed/allocated、各 row state、PE in-flight、pending result 和 SRAM merge 状态。本次 7.1 命令为 `sbt -batch 'Test/runMain trapezoid.EndToEndCycleSimulation --scale=small --samples=1'`。
+完整双 group B-window、双 refill channel、cache 计数和最终 C checksum 仍全部通过。benchmark 没有在计时区间内执行 control programming，未写 word 使用默认 profile。调试参数 `--sample=<index>` 和 `--timeout=<cycles>` 可在超时时报告 TrGS assigned/completed/allocated、各 row state、PE in-flight、pending result 和 SRAM merge 状态。本轮另完成 8 个 Benes fabric/solver 测试及 14 个 PE-row 测试，16/128 路 solver 和重新生成的 small 顶层通过 Verilator lint。生成器重新输出了 `generated-unified-small/UnifiedEndToEndSystem.v` 及匹配的 SRAM、Benes SystemVerilog dependency。PE-row 测试初始化显式关闭 `mrnProgram.valid`，避免随机输入意外改写 profile control store。
 
 ### 7.2 `PaperSinglePERowCycleSimulation`
 
 源文件：`src/test/scala/trapezoid/PaperSinglePERowCycleSimulation.scala`。
+
+本节数值仍属于 2026-11-10 旧 solver 的历史测量；本轮只完成 128 路独立 solver/fabric 功能测试，未重新运行整套 paper 单 PE row benchmark。以下 cold prepare 和 mode 趋势不能作为新 solver 的实测结果。
 
 运行：
 
@@ -471,9 +501,9 @@ scripts/run-paper-single-perow.sh
 
 这里的 DenseIp 141 cycle 主要由 128 个逐列 command 加 descriptor/control、PE row pipeline 和 drain 构成。TrGS 主要由当前命令拆分数量决定；TrGT 还包含共享 MRN 入口内部的四路 source-head radix-K merge。`HS x HS` 只有一个 effectual MAC，TrIP/TrGS 仍是 14 cycle，而 TrGT 由共享入口 policy 的 capture/emit 边界变为 17 cycle。
 
-受限 Benes pipeline 的 broadcast/spread pattern 保持固定准备周期：`HS x MS` 为 14 prepare cycle，`HS x D` 和 `D x D` 均为 7。本轮 24 个 case 的 checksum、命令/响应数、输出坐标数和 useful MAC 数全部通过。TrIP/TrGS/DenseIp 与上一版保持相同的主路径边界；TrGT 周期变化来自共享 MRN 入口中的状态化 radix-K policy，而不是测试模型估算。7.2 不实例化 array-level TrGT scheduler 或 `GustavsonTileEngine`，长期 source merge 由 7.1 和独立 scheduler/temporal RTL 回归覆盖。
+旧版测量中，受限 Benes pipeline 的 broadcast/spread pattern 对应 `HS x MS` 的 14 prepare cycle，以及 `HS x D`、`D x D` 的 7 prepare cycle。2026-11-10 的 24 个 case 曾全部通过 checksum、命令/响应数、输出坐标数和 useful MAC 数检查；这些值尚未按新 solver 和新增 A/B result register 重新计时。7.2 不实例化 array-level TrGT scheduler 或 `GustavsonTileEngine`，长期 source merge 由 7.1 和独立 scheduler/temporal RTL 回归覆盖。
 
-`MS x MS` 和 `MS x D` 的旧 fallback 已消失。当前 `MS x MS` 为 38 cycle、18 prepare，`MS x D` 为 54/9。prepare 大于单次 7-stage 深度，是因为一个 workload 中存在多个 cold route metadata，且 counter 统计 command head 等待 control FIFO 的实际周期；它不再表现为 `263 x commandCount`。TrGT 的 741/3597/16397 cycle 则主要随 `182/896/4096` 条 command 和每条 command 的四路 head merge 增长。
+历史表中的 `MS x MS` 为 38 cycle、18 prepare，`MS x D` 为 54/9。这些数值来自旧的固定深度 metadata endpoint；新通用 solver 已改为显式方向搜索，不能继续假定 cold prepare 为 7 cycle 或 II=1。历史 TrGT 的 741/3597/16397 cycle 则主要随 `182/896/4096` 条 command 和每条 command 的四路 head merge 增长。
 
 `HS x HS` 中 TrIP、TrGS 是 14 cycle，TrGT 是 17 cycle，并不表示论文的 mode selector 应把该类别改选 TrIP。这个 single-row workload 只有一个有效乘法；TrIP/TrGS 退化成一条 command 加相同 PE pipeline，而 TrGT 还显式支付一次共享 radix-K ingress policy 的 capture/emit 边界。阵列级 subrow packing、cache traffic 和跨 row load balance 仍不在 7.2 边界内。
 
@@ -501,7 +531,7 @@ scripts/run-paper-single-perow.sh
 
 ### 8.3 mode 的命令拆分还不是论文完整 scheduler
 
-当前测试为了覆盖全部组合，使用明确的、可验证的 command grouping：DenseIp 一列一命令，TrGt 按 B column 和 A bank 分组，TrGs 按 A nonzero 和 B line 分组，TrIp 使用当前动态 packing。论文中的 scheduler 还会联合考虑 subrow、buffer occupancy、跨 row 负载和 memory availability。paper 单-row TrIP 已能在 tile 内缓存并复用 route controls，所有 cold route 都进入固定深度 metadata pipeline；当前 repeated-source/不规则 pattern 也已经由通用 Benes 每级控制驱动，而不是 direct-distribution bridge。命令拆分和物理分发结构与论文不同时，周期和面积排序仍会不同。
+当前测试为了覆盖全部组合，使用明确的、可验证的 command grouping：DenseIp 一列一命令，TrGt 按 B column 和 A bank 分组，TrGs 按 A nonzero 和 B line 分组，TrIp 使用当前动态 packing。论文中的 scheduler 还会联合考虑 subrow、buffer occupancy、跨 row 负载和 memory availability。TrIP 在 tile 内缓存并复用成功的 route controls；cold route 依 pattern 使用广播/受限快路径或可回溯多周期求解器。通用路径的延迟由图着色、子网遍历和方向重试决定。命令拆分、控制准备方式和物理分发结构与论文不同时，周期和面积排序仍会不同。
 
 ### 8.4 计时边界不同
 
@@ -515,7 +545,7 @@ paper profile 已配置为论文的 4 clusters、128 banks、16-way、64 B line 
 
 ### 8.6 hardware implementation 仍有结构差异
 
-TrIP 已有两级 descriptor elastic FIFO、独立 route metadata FIFO、A/B control FIFO 和 7-stage/II=1 metadata pipeline，旧的约 263-cycle graph-coloring fallback 已删除。broadcast、compacted spread、repeated-source block multicast 和不规则 route 都驱动同一棵 Benes fabric；paper-width 通用控制由 `TrapezoidBenesRouteControl.sv` 生成并输出 `routable`。7.2 的 `MS x MS`、`MS x D` 和 `D x D` 均通过真实 Benes path 完成功能验证。当前 7 个 stage 只寄存 `routeValid + sourceIndex` metadata，完整 control word 只在末端生成，避免了宽控制字在每级复制；但图遍历 task 仍在末端组合完成，尚未拆成论文意义上的逐级、每周期一个 metadata step 的状态机。因此控制器面积、关键路径和功耗还不能视为论文 PPA 结果。
+TrIP 的 descriptor elastic FIFO 保持不变；当前通用 Benes control path 使用显式寄存器栈和可回溯状态机，两路结果独立握手并与命令对齐，已移除组合式递归 `solveSubnet` task。广播和大宽度 spread 受限快路径保留，通用路径为 variable-latency、单请求在途。它优先保证完整方向搜索和失败响应能正常退休，尚不具备论文理想化的逐级 II=1 控制吞吐；复杂 repeated-source route 的 cold prepare 可能显著增加。两路数据 fabric 始终保持 Beneš 结构。资源、关键路径和功耗仍需综合后判断，不能用仿真周期推断 PPA。
 
 论文 TrGT 把不同 A rows 映射到一个 PE row 的四个 subrows。当前 scheduler 已实现 occupancy-aware 多行 packing、长行多 subrow 占用、两个 group descriptor/A context，以及按实际 line count 分配的完整 B-window group buffer。cache request/response 使用 `groupId + sourceId + lineId`，每条长期 B stream 有独立 cursor 和完成位；每个 local bank 内又有 K 个 SRAM-backed virtual FIFO head。B-line payload 仍通过 inferred `Mem.readSync` 建模一拍 local-buffer 读，valid bitmap、descriptor、cursor 和 outstanding 状态仍是寄存器控制面。background group 可以连续预取所有有效 A 的 B lines，但当前单 cache request 端口仍只有一个 issue point，尚未达到论文多通道 steady-state 带宽；这些 inferred memory 也尚未绑定目标工艺的同步 SRAM BlackBox。
 
@@ -585,7 +615,7 @@ SYNTH_PROFILE=paper CLOCK_PERIOD_NS=2.0 \
 按优先级建议：
 
 1. 将 TrGT descriptor/cursor/valid/completion 控制面、K 路 virtual FIFO 和现有 B group `readSync` memory 映射到目标工艺的同步 SRAM/elastic queue BlackBox；增加多 request issue，使 background group 的整组预取能真正与 execute group steady-state 重叠。
-2. 将当前已能工作的 paper-width 组合式 Benes route solver 进一步拆成真正逐级的 metadata/control pipeline，使图遍历本身也满足 II=1，并对每级 switch control 做综合面积、时序和功耗比较。
+2. 在现有可回溯 Benes solver 上测量 component/子网搜索代价，先完成目标 FPGA 的综合与时序验证，再评估更小的逐步 build datapath、route cache 容量和多 context pipeline。任何吞吐优化都必须保留连通分量方向重试、无解响应退休和 A/B 命令对齐语义；不能把普通 metadata 延迟链当成求解逻辑本身已达到 II=1。
 3. 在已经贯穿 Unified 顶层的 MRN programming port 上实现软件可见 CSR address map、busy/error/status、layer descriptor loader 和 mapper 配置生成器；增加配置 legality/readback 测试，并决定采用当前分布式 active words，还是采用紧凑 backing SRAM 加逐 layer shadow load。随后综合比较旧 769-cell prefix scan、新 127-node tree 在 control store、head/tail metadata register、switch mux、面积、关键路径和 switching activity 上的净变化。
 4. 在已完成长期 `groupId/sourceId` B stream、四端口 MRN 算术复用、同步 SRAM/elastic head queue 和 tagged multi-outstanding 的基础上，把当前组合式跨 subrow head barrier 流水化，并评估是否能让相邻 packed group 在不破坏 output-row 顺序时共享 temporal partial 生命周期。再把 TrGS 的 slot/replay/output 控制统一到同一套长期 merge-control，并统一 standalone 与 mode-shared 路径。
 5. 在现有多 MSHR/多 refill channel 上增加同地址 miss coalescing、同 set/bank replay、channel QoS 和真实 DMA burst/channel mapping。

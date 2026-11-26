@@ -66,6 +66,21 @@ case class PERowReductionPayload(cfg: TrapezoidConfig) extends Bundle {
   val lanes = Vec(PERowReducedProduct(cfg), cfg.macLanes)
 }
 
+case class BenesPerformanceCounters() extends Bundle {
+  val commands = UInt(32 bits)
+  val aCacheHits = UInt(32 bits)
+  val bCacheHits = UInt(32 bits)
+  val aFastRoutes = UInt(32 bits)
+  val bFastRoutes = UInt(32 bits)
+  val aSearches = UInt(32 bits)
+  val bSearches = UInt(32 bits)
+  val prepareCycles = UInt(32 bits)
+  val aSearchCycles = UInt(32 bits)
+  val bSearchCycles = UInt(32 bits)
+  val aBacktracks = UInt(32 bits)
+  val bBacktracks = UInt(32 bits)
+}
+
 case class TrapezoidPERowIo(cfg: TrapezoidConfig) extends Bundle {
   val command = slave(Stream(PERowCommand(cfg)))
   val response = master(Stream(PERowResponse(cfg)))
@@ -80,6 +95,7 @@ case class TrapezoidPERowIo(cfg: TrapezoidConfig) extends Bundle {
   val macCycles = out UInt(32 bits)
   val mrnCycles = out UInt(32 bits)
   val responseCycles = out UInt(32 bits)
+  val benesPerformance = out(BenesPerformanceCounters())
 }
 
 trait TrapezoidPERowComponent {
@@ -207,32 +223,14 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
 
   // Stage 1: the MFIU/shift equivalent distributes operands to fixed lanes.
   val mfiu = new MultiFiberIntersection(cfg)
-  private val pipelinedBenesControls = cfg.macLanes > 16
-  val aBenesControls = if (!pipelinedBenesControls)
-    new BenesRouteControlGenerator(cfg) else null
-  val bBenesControls = if (!pipelinedBenesControls)
-    new BenesRouteControlGenerator(cfg) else null
-  val aPipelinedBenesControls = if (pipelinedBenesControls)
-    new PipelinedBenesRouteControlGenerator(cfg) else null
-  val bPipelinedBenesControls = if (pipelinedBenesControls)
-    new PipelinedBenesRouteControlGenerator(cfg) else null
-  val aControlFifo = if (pipelinedBenesControls)
-    new StreamFifoLowLatency(BenesRouteControlResult(cfg), depth = 2,
-      latency = 1, useVec = false) else null
-  val bControlFifo = if (pipelinedBenesControls)
-    new StreamFifoLowLatency(BenesRouteControlResult(cfg), depth = 2,
-      latency = 1, useVec = false) else null
-  val routeMetadataFifo = if (pipelinedBenesControls)
-    new StreamFifoLowLatency(PERowBenesMetadata(cfg), depth = 2,
-      latency = 1, useVec = false) else null
-  val aRestrictedBenesControls = if (pipelinedBenesControls)
-    new PipelinedRestrictedBenesRouteControlGenerator(cfg) else null
-  val bRestrictedBenesControls = if (pipelinedBenesControls)
-    new PipelinedRestrictedBenesRouteControlGenerator(cfg) else null
-  val aBroadcastBenesControls = if (pipelinedBenesControls)
-    new BenesBroadcastControlGenerator(cfg) else null
-  val bBroadcastBenesControls = if (pipelinedBenesControls)
-    new BenesBroadcastControlGenerator(cfg) else null
+  val aBenesControls: BenesRouteControlGenerator =
+    if (cfg.macLanes > 16) new PipelinedBenesRouteControlGenerator(cfg)
+    else new BenesRouteControlGenerator(cfg)
+  val bBenesControls: BenesRouteControlGenerator =
+    if (cfg.macLanes > 16) new PipelinedBenesRouteControlGenerator(cfg)
+    else new BenesRouteControlGenerator(cfg)
+  val aFastControls = new RestrictedBenesRouteControlGenerator(cfg)
+  val bFastControls = new RestrictedBenesRouteControlGenerator(cfg)
   val aBenesFabric = new BenesDistributionFabric(cfg)
   val bBenesFabric = new BenesDistributionFabric(cfg)
   val input = inputStage.payload
@@ -277,62 +275,32 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   val routeControlsReady = Bool()
   val aRouteRoutable = Bool()
   val bRouteRoutable = Bool()
-  val sparseRouteNeedsControl = useSparseTripRoute && mfiu.io.count =/= 0
-  val controlsStarted = if (pipelinedBenesControls) RegInit(False) else null
+  val sparseRouteNeedsControl = useSparseTripRoute &&
+    mfiu.io.count =/= 0 && !mfiu.io.overflow
+  val aSent = RegInit(False)
+  val bSent = RegInit(False)
+  val aResultValid = RegInit(False)
+  val bResultValid = RegInit(False)
+  val aResult = Reg(BenesRouteControlResult(cfg))
+  val bResult = Reg(BenesRouteControlResult(cfg))
   private val controlCacheEntries = 4
-  val controlCacheValid = if (pipelinedBenesControls)
-    Vec((0 until controlCacheEntries).map(_ => RegInit(False))) else null
-  val controlCacheRouteValid = if (pipelinedBenesControls)
-    Vec((0 until controlCacheEntries).map(_ =>
-      Reg(Bits(cfg.macLanes bits)) init 0)) else null
-  val controlCacheASources = if (pipelinedBenesControls)
-    Vec((0 until controlCacheEntries).map(_ =>
-      Vec((0 until cfg.macLanes).map(_ =>
-        Reg(UInt(cfg.macLaneIndexWidth bits)) init 0)))) else null
-  val controlCacheBSources = if (pipelinedBenesControls)
-    Vec((0 until controlCacheEntries).map(_ =>
-      Vec((0 until cfg.macLanes).map(_ =>
-        Reg(UInt(cfg.macLaneIndexWidth bits)) init 0)))) else null
-  val controlCacheAControls = if (pipelinedBenesControls)
-    Vec((0 until controlCacheEntries).map(_ =>
-      Reg(Bits(cfg.benesControlWidth bits)) init 0)) else null
-  val controlCacheBControls = if (pipelinedBenesControls)
-    Vec((0 until controlCacheEntries).map(_ =>
-      Reg(Bits(cfg.benesControlWidth bits)) init 0)) else null
-  val controlCacheReplace = if (pipelinedBenesControls)
-    Reg(UInt(log2Up(controlCacheEntries) bits)) init 0 else null
-  val controlCacheHit = Bool()
-  val cachedAControls = Bits(cfg.benesControlWidth bits)
-  val cachedBControls = Bits(cfg.benesControlWidth bits)
-  val aBroadcastSource = UInt(cfg.macLaneIndexWidth bits)
-  val bBroadcastSource = UInt(cfg.macLaneIndexWidth bits)
-  cachedAControls := 0
-  cachedBControls := 0
-  aBroadcastSource := 0
-  bBroadcastSource := 0
-  val routeValidBits = mfiu.io.routes.map(_.valid).asBits
-  val firstValidRoute = OHMasking.first(routeValidBits)
+  val aCacheValid = Vec((0 until controlCacheEntries).map(_ => RegInit(False)))
+  val bCacheValid = Vec((0 until controlCacheEntries).map(_ => RegInit(False)))
+  val aCacheMetadata = Vec((0 until controlCacheEntries).map(_ =>
+    Reg(BenesRouteMetadata(cfg))))
+  val bCacheMetadata = Vec((0 until controlCacheEntries).map(_ =>
+    Reg(BenesRouteMetadata(cfg))))
+  val aCacheControls = Vec((0 until controlCacheEntries).map(_ =>
+    Reg(Bits(cfg.benesControlWidth bits))))
+  val bCacheControls = Vec((0 until controlCacheEntries).map(_ =>
+    Reg(Bits(cfg.benesControlWidth bits))))
+  val aCacheReplace = Reg(UInt(log2Up(controlCacheEntries) bits)) init 0
+  val bCacheReplace = Reg(UInt(log2Up(controlCacheEntries) bits)) init 0
+  val currentMetadata = PERowBenesMetadata(cfg)
+  currentMetadata.routeValid := mfiu.io.routes.map(_.valid).asBits
   for (lane <- 0 until cfg.macLanes) {
-    when(firstValidRoute(lane)) {
-      aBroadcastSource := mfiu.io.routes(lane).aSourceIndex
-      bBroadcastSource := mfiu.io.routes(lane).bSourceIndex
-    }
-  }
-  val aBroadcastMismatch = (0 until cfg.macLanes).map { lane =>
-    mfiu.io.routes(lane).valid &&
-      mfiu.io.routes(lane).aSourceIndex =/= aBroadcastSource
-  }.reduce(_ || _)
-  val bBroadcastMismatch = (0 until cfg.macLanes).map { lane =>
-    mfiu.io.routes(lane).valid &&
-      mfiu.io.routes(lane).bSourceIndex =/= bBroadcastSource
-  }.reduce(_ || _)
-  val broadcastRouteFastPath = sparseRouteNeedsControl &&
-    !aBroadcastMismatch && !bBroadcastMismatch
-  val restrictedRouteFastPath = Bool()
-  // Every sparse route now retires through the programmable Benes fabric.
-  // Broadcast and restricted spread retain their specialized controls, while
-  // all other MFIU metadata uses the general per-level control pipeline.
-  for (lane <- 0 until cfg.macLanes) {
+    currentMetadata.aSourceIndices(lane) := mfiu.io.routes(lane).aSourceIndex
+    currentMetadata.bSourceIndices(lane) := mfiu.io.routes(lane).bSourceIndex
     aBenesFabric.io.sources(lane)(0) := mfiu.io.aSourceValid(lane)
     aBenesFabric.io.sources(lane)(cfg.dataWidth downto 1) :=
       mfiu.io.aSources(lane).asBits
@@ -340,157 +308,63 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
     bBenesFabric.io.sources(lane)(cfg.dataWidth downto 1) :=
       mfiu.io.bSources(lane).asBits
   }
-  if (pipelinedBenesControls) {
-    aBroadcastBenesControls.io.sourceIndex := aBroadcastSource
-    bBroadcastBenesControls.io.sourceIndex := bBroadcastSource
+  aBenesControls.io.start.payload.routeValid := currentMetadata.routeValid
+  aBenesControls.io.start.payload.sourceIndices := currentMetadata.aSourceIndices
+  bBenesControls.io.start.payload.routeValid := currentMetadata.routeValid
+  bBenesControls.io.start.payload.sourceIndices := currentMetadata.bSourceIndices
+  aFastControls.io.metadata := aBenesControls.io.start.payload
+  bFastControls.io.metadata := bBenesControls.io.start.payload
+  val aFastRoute = aFastControls.io.supported
+  val bFastRoute = bFastControls.io.supported
+  val aCacheHits = Bits(controlCacheEntries bits)
+  val bCacheHits = Bits(controlCacheEntries bits)
+  for (entry <- 0 until controlCacheEntries) {
+    var aMatches: Bool = (aCacheMetadata(entry).routeValid & currentMetadata.routeValid) ===
+      currentMetadata.routeValid
+    var bMatches: Bool = (bCacheMetadata(entry).routeValid & currentMetadata.routeValid) ===
+      currentMetadata.routeValid
     for (lane <- 0 until cfg.macLanes) {
-      aRestrictedBenesControls.io.start.payload.routeValid(lane) :=
-        mfiu.io.routes(lane).valid
-      bRestrictedBenesControls.io.start.payload.routeValid(lane) :=
-        mfiu.io.routes(lane).valid
-      aRestrictedBenesControls.io.start.payload.sourceIndices(lane) :=
-        mfiu.io.routes(lane).aSourceIndex
-      bRestrictedBenesControls.io.start.payload.sourceIndices(lane) :=
-        mfiu.io.routes(lane).bSourceIndex
+      aMatches = aMatches && (!currentMetadata.routeValid(lane) ||
+        aCacheMetadata(entry).sourceIndices(lane) === currentMetadata.aSourceIndices(lane))
+      bMatches = bMatches && (!currentMetadata.routeValid(lane) ||
+        bCacheMetadata(entry).sourceIndices(lane) === currentMetadata.bSourceIndices(lane))
     }
-    restrictedRouteFastPath := sparseRouteNeedsControl &&
-      !broadcastRouteFastPath &&
-      aRestrictedBenesControls.io.startSupported &&
-      bRestrictedBenesControls.io.startSupported
-
-    // The metadata FIFO is only opened for the general multicast path. It
-    // lets the wide descriptor FIFO advance independently of the seven-stage
-    // control result FIFO while retaining A/B route alignment.
-    routeMetadataFifo.io.push.valid := inputStage.valid &&
-      sparseRouteNeedsControl && !broadcastRouteFastPath &&
-      !restrictedRouteFastPath && !controlCacheHit && !controlsStarted &&
-      !routeMetadataFifo.io.pop.valid
-    routeMetadataFifo.io.push.payload.routeValid := routeValidBits
-    for (lane <- 0 until cfg.macLanes) {
-      routeMetadataFifo.io.push.payload.aSourceIndices(lane) :=
-        mfiu.io.routes(lane).aSourceIndex
-      routeMetadataFifo.io.push.payload.bSourceIndices(lane) :=
-        mfiu.io.routes(lane).bSourceIndex
-    }
-    aControlFifo.io.push.valid := aPipelinedBenesControls.io.result.valid
-    aControlFifo.io.push.payload := aPipelinedBenesControls.io.result.payload
-    aPipelinedBenesControls.io.result.ready := aControlFifo.io.push.ready
-    bControlFifo.io.push.valid := bPipelinedBenesControls.io.result.valid
-    bControlFifo.io.push.payload := bPipelinedBenesControls.io.result.payload
-    bPipelinedBenesControls.io.result.ready := bControlFifo.io.push.ready
-    val cacheHits = Bits(controlCacheEntries bits)
-    for (entry <- 0 until controlCacheEntries) {
-      var metadataMatches: Bool =
-        controlCacheRouteValid(entry) === mfiu.io.routes.map(_.valid).asBits
-      for (lane <- 0 until cfg.macLanes) {
-        metadataMatches = metadataMatches &&
-          (!mfiu.io.routes(lane).valid ||
-            (controlCacheASources(entry)(lane) ===
-              mfiu.io.routes(lane).aSourceIndex &&
-              controlCacheBSources(entry)(lane) ===
-                mfiu.io.routes(lane).bSourceIndex))
-      }
-      cacheHits(entry) := controlCacheValid(entry) && metadataMatches
-    }
-    controlCacheHit := cacheHits.orR
-    val cacheHitIndex = UInt(log2Up(controlCacheEntries) bits)
-    cacheHitIndex := 0
-    for (entry <- 0 until controlCacheEntries) {
-      when(cacheHits(entry)) { cacheHitIndex := entry }
-      when(cacheHitIndex === entry) {
-        cachedAControls := controlCacheAControls(entry)
-        cachedBControls := controlCacheBControls(entry)
-      }
-    }
-    val startRestricted = inputStage.valid && restrictedRouteFastPath &&
-      !controlCacheHit && !controlsStarted &&
-      aRestrictedBenesControls.io.start.ready &&
-      bRestrictedBenesControls.io.start.ready
-    aRestrictedBenesControls.io.start.valid := startRestricted
-    bRestrictedBenesControls.io.start.valid := startRestricted
-    val startBoth = routeMetadataFifo.io.pop.valid &&
-      !broadcastRouteFastPath && !restrictedRouteFastPath &&
-      !controlCacheHit && !controlsStarted &&
-      aPipelinedBenesControls.io.start.ready &&
-      bPipelinedBenesControls.io.start.ready
-    aPipelinedBenesControls.io.start.valid := startBoth
-    bPipelinedBenesControls.io.start.valid := startBoth
-    for (lane <- 0 until cfg.macLanes) {
-      aPipelinedBenesControls.io.start.payload.routeValid(lane) :=
-        routeMetadataFifo.io.pop.payload.routeValid(lane)
-      bPipelinedBenesControls.io.start.payload.routeValid(lane) :=
-        routeMetadataFifo.io.pop.payload.routeValid(lane)
-      aPipelinedBenesControls.io.start.payload.sourceIndices(lane) :=
-        routeMetadataFifo.io.pop.payload.aSourceIndices(lane)
-      bPipelinedBenesControls.io.start.payload.sourceIndices(lane) :=
-        routeMetadataFifo.io.pop.payload.bSourceIndices(lane)
-    }
-    routeMetadataFifo.io.pop.ready := startBoth
-    when((aPipelinedBenesControls.io.start.fire &&
-        bPipelinedBenesControls.io.start.fire) ||
-        (aRestrictedBenesControls.io.start.fire &&
-          bRestrictedBenesControls.io.start.fire)) {
-      controlsStarted := True
-    }
-    val benesControlsReady = aControlFifo.io.pop.valid &&
-      bControlFifo.io.pop.valid &&
-      aControlFifo.io.pop.payload.routable &&
-      bControlFifo.io.pop.payload.routable
-    val restrictedControlsReady =
-      aRestrictedBenesControls.io.result.valid &&
-        bRestrictedBenesControls.io.result.valid &&
-        aRestrictedBenesControls.io.result.payload.routable &&
-        bRestrictedBenesControls.io.result.payload.routable
-    routeControlsReady := !sparseRouteNeedsControl ||
-      broadcastRouteFastPath ||
-      controlCacheHit ||
-      Mux(restrictedRouteFastPath,
-        restrictedControlsReady,
-        benesControlsReady)
-    aRouteRoutable := !sparseRouteNeedsControl ||
-      broadcastRouteFastPath ||
-      controlCacheHit ||
-      Mux(restrictedRouteFastPath,
-        aRestrictedBenesControls.io.result.valid &&
-          aRestrictedBenesControls.io.result.payload.routable,
-        aControlFifo.io.pop.valid && aControlFifo.io.pop.payload.routable)
-    bRouteRoutable := !sparseRouteNeedsControl ||
-      broadcastRouteFastPath ||
-      controlCacheHit ||
-      Mux(restrictedRouteFastPath,
-        bRestrictedBenesControls.io.result.valid &&
-          bRestrictedBenesControls.io.result.payload.routable,
-        bControlFifo.io.pop.valid && bControlFifo.io.pop.payload.routable)
-    aBenesFabric.io.controls := Mux(broadcastRouteFastPath,
-      aBroadcastBenesControls.io.controls,
-      Mux(controlCacheHit, cachedAControls,
-        Mux(restrictedRouteFastPath,
-          aRestrictedBenesControls.io.result.payload.controls,
-          aControlFifo.io.pop.payload.controls)))
-    bBenesFabric.io.controls := Mux(broadcastRouteFastPath,
-      bBroadcastBenesControls.io.controls,
-      Mux(controlCacheHit, cachedBControls,
-        Mux(restrictedRouteFastPath,
-          bRestrictedBenesControls.io.result.payload.controls,
-          bControlFifo.io.pop.payload.controls)))
-    when(inputStage.valid && sparseRouteNeedsControl && !controlCacheHit &&
-        !routeControlsReady) {
-      controlPrepareCycleCounter := controlPrepareCycleCounter + 1
-    }
-  } else {
-    restrictedRouteFastPath := False
-    controlCacheHit := False
-    for (lane <- 0 until cfg.macLanes) {
-      aBenesControls.io.routeValid(lane) := mfiu.io.routes(lane).valid
-      bBenesControls.io.routeValid(lane) := mfiu.io.routes(lane).valid
-      aBenesControls.io.sourceIndices(lane) := mfiu.io.routes(lane).aSourceIndex
-      bBenesControls.io.sourceIndices(lane) := mfiu.io.routes(lane).bSourceIndex
-    }
-    routeControlsReady := True
-    aRouteRoutable := aBenesControls.io.routable
-    bRouteRoutable := bBenesControls.io.routable
-    aBenesFabric.io.controls := aBenesControls.io.controls
-    bBenesFabric.io.controls := bBenesControls.io.controls
+    aCacheHits(entry) := aCacheValid(entry) && aMatches
+    bCacheHits(entry) := bCacheValid(entry) && bMatches
+  }
+  val aCacheHit = aCacheHits.orR
+  val bCacheHit = bCacheHits.orR
+  val aCacheHitIndex = OHToUInt(OHMasking.first(aCacheHits))
+  val bCacheHitIndex = OHToUInt(OHMasking.first(bCacheHits))
+  val requestNeeded = inputStage.valid && sparseRouteNeedsControl
+  aBenesControls.io.start.valid := requestNeeded && !aFastRoute && !aCacheHit && !aSent
+  bBenesControls.io.start.valid := requestNeeded && !bFastRoute && !bCacheHit && !bSent
+  aBenesControls.io.result.ready := !aResultValid
+  bBenesControls.io.result.ready := !bResultValid
+  when(aBenesControls.io.start.fire) { aSent := True }
+  when(bBenesControls.io.start.fire) { bSent := True }
+  when(aBenesControls.io.result.fire) {
+    aResult := aBenesControls.io.result.payload
+    aResultValid := True
+  }
+  when(bBenesControls.io.result.fire) {
+    bResult := bBenesControls.io.result.payload
+    bResultValid := True
+  }
+  val aControlsAvailable = aFastRoute || aCacheHit || aResultValid
+  val bControlsAvailable = bFastRoute || bCacheHit || bResultValid
+  routeControlsReady := !sparseRouteNeedsControl ||
+    (aControlsAvailable && bControlsAvailable)
+  aRouteRoutable := !sparseRouteNeedsControl || aFastRoute ||
+    aCacheHit || (aResultValid && aResult.routable)
+  bRouteRoutable := !sparseRouteNeedsControl || bFastRoute ||
+    bCacheHit || (bResultValid && bResult.routable)
+  aBenesFabric.io.controls := Mux(aFastRoute, aFastControls.io.controls,
+    Mux(aCacheHit, aCacheControls(aCacheHitIndex), aResult.controls))
+  bBenesFabric.io.controls := Mux(bFastRoute, bFastControls.io.controls,
+    Mux(bCacheHit, bCacheControls(bCacheHitIndex), bResult.controls))
+  when(inputStage.valid && sparseRouteNeedsControl && !routeControlsReady) {
+    controlPrepareCycleCounter := controlPrepareCycleCounter + 1
   }
 
   val routed = PERowRoutePayload(cfg)
@@ -578,7 +452,9 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
       gustBOperand := 0
     }
 
-    routed.laneValid(lane) := Mux(inputTripMode, tripValid, gustValid)
+    routed.laneValid(lane) := Mux(inputTripMode,
+      tripValid && aRouteRoutable && bRouteRoutable && !mfiu.io.overflow,
+      gustValid)
     routed.laneAFiber(lane) := Mux(inputTripMode, tripAFiber,
       U(0, cfg.fiberIndexWidth bits))
     routed.laneBFiber(lane) := Mux(inputTripMode, tripBFiber,
@@ -597,46 +473,39 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   routeInput.valid := inputStage.valid && routeControlsReady
   routeInput.payload := routed
   inputStage.ready := routeInput.ready && routeControlsReady
-  if (pipelinedBenesControls) {
-    val consumeControls = routeInput.fire && sparseRouteNeedsControl &&
-      !broadcastRouteFastPath && !controlCacheHit
-    aRestrictedBenesControls.io.result.ready := consumeControls &&
-      restrictedRouteFastPath
-    bRestrictedBenesControls.io.result.ready := consumeControls &&
-      restrictedRouteFastPath
-    aControlFifo.io.pop.ready := consumeControls && !restrictedRouteFastPath
-    bControlFifo.io.pop.ready := consumeControls && !restrictedRouteFastPath
-    when(consumeControls) {
-      controlCacheValid(controlCacheReplace) := True
-      controlCacheRouteValid(controlCacheReplace) :=
-        mfiu.io.routes.map(_.valid).asBits
-      for (lane <- 0 until cfg.macLanes) {
-        controlCacheASources(controlCacheReplace)(lane) :=
-          mfiu.io.routes(lane).aSourceIndex
-        controlCacheBSources(controlCacheReplace)(lane) :=
-          mfiu.io.routes(lane).bSourceIndex
-      }
-      controlCacheAControls(controlCacheReplace) := Mux(
-        restrictedRouteFastPath,
-        aRestrictedBenesControls.io.result.payload.controls,
-        aControlFifo.io.pop.payload.controls)
-      controlCacheBControls(controlCacheReplace) := Mux(
-        restrictedRouteFastPath,
-        bRestrictedBenesControls.io.result.payload.controls,
-        bControlFifo.io.pop.payload.controls)
-      controlCacheReplace := controlCacheReplace + 1
-      controlsStarted := False
-    }
-    when(routeInput.fire && inputStage.payload.endOfTile) {
+  when(routeInput.fire) {
+    aSent := False
+    bSent := False
+    aResultValid := False
+    bResultValid := False
+    when(sparseRouteNeedsControl && !routed.overflow) {
       for (entry <- 0 until controlCacheEntries) {
-        controlCacheValid(entry) := False
+        when(aCacheReplace === entry && !aFastRoute && !aCacheHit && aResultValid) {
+          aCacheValid(entry) := True
+          aCacheMetadata(entry) := aBenesControls.io.start.payload
+          aCacheControls(entry) := aResult.controls
+        }
+        when(bCacheReplace === entry && !bFastRoute && !bCacheHit && bResultValid) {
+          bCacheValid(entry) := True
+          bCacheMetadata(entry) := bBenesControls.io.start.payload
+          bCacheControls(entry) := bResult.controls
+        }
       }
-      controlCacheReplace := 0
+      when(!aFastRoute && !aCacheHit && aResultValid) { aCacheReplace := aCacheReplace + 1 }
+      when(!bFastRoute && !bCacheHit && bResultValid) { bCacheReplace := bCacheReplace + 1 }
+    }
+    when(input.endOfTile) {
+      for (entry <- 0 until controlCacheEntries) {
+        aCacheValid(entry) := False
+        bCacheValid(entry) := False
+      }
+      aCacheReplace := 0
+      bCacheReplace := 0
     }
   }
-  when(routeInput.valid && useSparseTripRoute && mfiu.io.count =/= 0) {
+  when(routeInput.fire && useSparseTripRoute && !routed.overflow) {
     assert(aRouteRoutable && bRouteRoutable,
-      "MFIU emitted a route pattern not supported by the Benes solver")
+      "A successful MFIU route must have both Benes controls")
   }
   val routeStage = if (cfg.macLanes > 64) {
     routeInput.m2sPipe()
@@ -857,4 +726,32 @@ class TrapezoidPERow(cfg: TrapezoidConfig)
   io.macCycles := macCycleCounter
   io.mrnCycles := mrnCycleCounter
   io.responseCycles := responseCycleCounter
+  val benesCommandCounter = Reg(UInt(32 bits)) init 0
+  val aCacheHitCounter = Reg(UInt(32 bits)) init 0
+  val bCacheHitCounter = Reg(UInt(32 bits)) init 0
+  val aFastCounter = Reg(UInt(32 bits)) init 0
+  val bFastCounter = Reg(UInt(32 bits)) init 0
+  val aSearchCounter = Reg(UInt(32 bits)) init 0
+  val bSearchCounter = Reg(UInt(32 bits)) init 0
+  when(routeInput.fire && sparseRouteNeedsControl) {
+    benesCommandCounter := benesCommandCounter + 1
+    when(aFastRoute) { aFastCounter := aFastCounter + 1 }
+    when(bFastRoute) { bFastCounter := bFastCounter + 1 }
+    when(aCacheHit && !aFastRoute) { aCacheHitCounter := aCacheHitCounter + 1 }
+    when(bCacheHit && !bFastRoute) { bCacheHitCounter := bCacheHitCounter + 1 }
+  }
+  when(aBenesControls.io.start.fire) { aSearchCounter := aSearchCounter + 1 }
+  when(bBenesControls.io.start.fire) { bSearchCounter := bSearchCounter + 1 }
+  io.benesPerformance.commands := benesCommandCounter
+  io.benesPerformance.aCacheHits := aCacheHitCounter
+  io.benesPerformance.bCacheHits := bCacheHitCounter
+  io.benesPerformance.aFastRoutes := aFastCounter
+  io.benesPerformance.bFastRoutes := bFastCounter
+  io.benesPerformance.aSearches := aSearchCounter
+  io.benesPerformance.bSearches := bSearchCounter
+  io.benesPerformance.prepareCycles := controlPrepareCycleCounter
+  io.benesPerformance.aSearchCycles := aBenesControls.io.searchCycles
+  io.benesPerformance.bSearchCycles := bBenesControls.io.searchCycles
+  io.benesPerformance.aBacktracks := aBenesControls.io.backtrackCount
+  io.benesPerformance.bBacktracks := bBenesControls.io.backtrackCount
 }

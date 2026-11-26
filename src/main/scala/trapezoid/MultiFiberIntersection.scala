@@ -524,195 +524,36 @@ class BenesBroadcastControlGenerator(cfg: TrapezoidConfig) extends Component {
   }
 }
 
-/** Converts compact MFIU source metadata into controls for a multicast Benes.
-  *
-  * A legal route is solved recursively. The input-pair and output-pair
-  * constraints form the standard Benes routing graph; a bounded combinational
-  * two-colour propagation finds the two subnet assignments. Duplicate source
-  * requests are allowed, which is the multicast behavior needed by TrIP.
-  */
+/** Stateful multicast routing with explicit component-orientation backtracking. */
 class BenesRouteControlGenerator(cfg: TrapezoidConfig)
     extends Component {
   val io = new Bundle {
-    val routeValid = in Bits(cfg.macLanes bits)
-    val sourceIndices = in Vec(UInt(cfg.macLaneIndexWidth bits), cfg.macLanes)
-    val selectedSource = out UInt(cfg.macLaneIndexWidth bits)
-    val controls = out Bits(cfg.benesControlWidth bits)
-    val routable = out Bool()
+    val start = slave(Stream(BenesRouteMetadata(cfg)))
+    val result = master(Stream(BenesRouteControlResult(cfg)))
+    val searchCycles = out UInt(32 bits)
+    val backtrackCount = out UInt(32 bits)
   }
 
-  io.selectedSource := 0
-
-  private def solve(width: Int, valid: Vector[Bool],
-                    sources: Vector[UInt]): (Vector[Bool], Bool) = {
-    require(width >= 1 && (width & (width - 1)) == 0)
-    if (width == 1) {
-      val legal = !valid.head || sources.head === 0
-      (Vector.empty, legal)
-    } else if (width == 2) {
-      (Vector.tabulate(2)(output =>
-        Mux(valid(output), sources(output)(0), False)), True)
-    } else {
-      val sourceWidth = sources.head.getWidth
-      val sourcePairs = sources.map(_(sourceWidth - 1 downto 1))
-      val sourceSides = sources.map(_(0))
-      val assignedStages = Array.tabulate(width + 1)(_ => Vec(Bool(), width))
-      val colorStages = Array.tabulate(width + 1)(_ => Vec(Bool(), width))
-      for (node <- 0 until width) {
-        assignedStages(0)(node) := False
-        colorStages(0)(node) := False
-      }
-
-      val propagationRounds = if (width <= 16) width else log2Up(width)
-      // Small fabrics retain the complete graph walk. Paper-width fabrics use
-      // the external RTL solver; this branch only bounds any accidental wide
-      // elaboration and keeps the metadata path logarithmic.
-      for (stage <- 0 until propagationRounds) {
-        val previousAssigned = assignedStages(stage)
-        val previousColor = colorStages(stage)
-        val propagationCandidates = Vector.tabulate(width) { node =>
-          val mate = node ^ 1
-          val mateEligible = valid(node) && valid(mate) &&
-            sources(node) =/= sources(mate) && previousAssigned(mate)
-          var sourceNeighbourFound: Bool = False
-          for (other <- 0 until width) {
-            if (other != node) {
-              sourceNeighbourFound = sourceNeighbourFound ||
-                (valid(node) && valid(other) &&
-                  sourcePairs(node) === sourcePairs(other) &&
-                  sourceSides(node) =/= sourceSides(other) &&
-                  previousAssigned(other))
-            }
-          }
-          !previousAssigned(node) && (mateEligible || sourceNeighbourFound)
-        }
-        val propagationFound = propagationCandidates.reduce(_ || _)
-        val seedChoices = Vec(Bool(), width)
-        var earlierSeed: Bool = False
-        for (node <- 0 until width) {
-          val eligible = !propagationFound && !previousAssigned(node) &&
-            valid(node)
-          seedChoices(node) := eligible && !earlierSeed
-          earlierSeed = earlierSeed || eligible
-        }
-
-        for (node <- 0 until width) {
-          val mate = node ^ 1
-          val mateEligible = valid(node) && valid(mate) &&
-            sources(node) =/= sources(mate) && previousAssigned(mate)
-          var selectedColor: Bool = False
-          var neighbourFound: Bool = False
-          selectedColor = Mux(mateEligible, !previousColor(mate), False)
-          neighbourFound = mateEligible
-          for (other <- 0 until width) {
-            if (other != node) {
-              val eligible = valid(node) && valid(other) &&
-                sourcePairs(node) === sourcePairs(other) &&
-                sourceSides(node) =/= sourceSides(other) &&
-                previousAssigned(other)
-              val choice = eligible && !neighbourFound
-              selectedColor = Mux(choice, !previousColor(other), selectedColor)
-              neighbourFound = neighbourFound || eligible
-            }
-          }
-          assignedStages(stage + 1)(node) := previousAssigned(node) ||
-            seedChoices(node) || propagationCandidates(node)
-          colorStages(stage + 1)(node) := Mux(previousAssigned(node),
-            previousColor(node), Mux(propagationCandidates(node),
-              selectedColor, False))
-        }
-      }
-
-      val routeColor = colorStages(propagationRounds).toVector
-      var conflict: Bool = False
-      for (node <- 0 until width) {
-        val mate = node ^ 1
-        if (node < mate) {
-          conflict = conflict || (valid(node) && valid(mate) &&
-            sources(node) =/= sources(mate) &&
-            routeColor(node) === routeColor(mate))
-        }
-        for (other <- node + 1 until width) {
-          conflict = conflict || (valid(node) && valid(other) &&
-            sourcePairs(node) === sourcePairs(other) &&
-            sourceSides(node) =/= sourceSides(other) &&
-            routeColor(node) === routeColor(other))
-        }
-      }
-      val legal = !conflict
-
-      val firstControls = Vector.tabulate(width) { control =>
-        val pair = control / 2
-        val upper = control % 2 == 0
-        val desiredColor = if (upper) False else True
-        var selectedSource: UInt = U(pair * 2, sourceWidth bits)
-        var found: Bool = False
-        for (output <- 0 until width) {
-          val eligible = valid(output) &&
-            routeColor(output) === desiredColor &&
-            sourcePairs(output) === pair
-          val choice = eligible && !found
-          selectedSource = Mux(choice, sources(output), selectedSource)
-          found = found || eligible
-        }
-        selectedSource(0)
-      }
-
-      val upperValid = Vector.tabulate(width / 2) { output =>
-        valid(output * 2) && !routeColor(output * 2) ||
-          valid(output * 2 + 1) && !routeColor(output * 2 + 1)
-      }
-      val lowerValid = Vector.tabulate(width / 2) { output =>
-        valid(output * 2) && routeColor(output * 2) ||
-          valid(output * 2 + 1) && routeColor(output * 2 + 1)
-      }
-      val upperSources = Vector.tabulate(width / 2) { output =>
-        var source: UInt = U(0,
-          scala.math.max(1, log2Up(width / 2)) bits)
-        source = Mux(valid(output * 2) && !routeColor(output * 2),
-          sourcePairs(output * 2).resized, source)
-        source = Mux(valid(output * 2 + 1) && !routeColor(output * 2 + 1),
-          sourcePairs(output * 2 + 1).resized, source)
-        source
-      }
-      val lowerSources = Vector.tabulate(width / 2) { output =>
-        var source: UInt = U(0,
-          scala.math.max(1, log2Up(width / 2)) bits)
-        source = Mux(valid(output * 2) && routeColor(output * 2),
-          sourcePairs(output * 2).resized, source)
-        source = Mux(valid(output * 2 + 1) && routeColor(output * 2 + 1),
-          sourcePairs(output * 2 + 1).resized, source)
-        source
-      }
-      val (upperControls, upperLegal) = solve(width / 2,
-        upperValid, upperSources)
-      val (lowerControls, lowerLegal) = solve(width / 2,
-        lowerValid, lowerSources)
-      val lastControls = routeColor
-      (firstControls ++ upperControls ++ lowerControls ++ lastControls,
-        legal && upperLegal && lowerLegal)
-    }
+  val solver = new BenesRouteControlBlackBox(cfg)
+  solver.io.startValid := io.start.valid
+  io.start.ready := solver.io.startReady
+  solver.io.resultReady := io.result.ready
+  io.result.valid := solver.io.resultValid
+  solver.io.routeValid := io.start.payload.routeValid
+  for (lane <- 0 until cfg.macLanes) {
+    solver.io.sourceIndices(
+      lane * cfg.macLaneIndexWidth + cfg.macLaneIndexWidth - 1 downto
+        lane * cfg.macLaneIndexWidth) :=
+      io.start.payload.sourceIndices(lane).asBits
   }
-
-  private val route = solve(cfg.distributionWidth,
-    Vector.tabulate(cfg.distributionWidth)(index =>
-      if (index < cfg.macLanes) io.routeValid(index) else False),
-    Vector.tabulate(cfg.distributionWidth)(index =>
-      if (index < cfg.macLanes) io.sourceIndices(index)
-      else U(0, cfg.macLaneIndexWidth bits)))
-  require(route._1.length == cfg.benesControlWidth)
-  for (index <- 0 until cfg.benesControlWidth) io.controls(index) := route._1(index)
-  io.routable := route._2 && io.routeValid.orR
+  io.result.payload.controls := solver.io.controls
+  io.result.payload.routable := solver.io.routable
+  io.searchCycles := solver.io.searchCycles
+  io.backtrackCount := solver.io.backtrackCount
 }
 
-/** RTL implementation of the wide-fabric route solver.
-  *
-  * Keeping the procedural graph walk in a BlackBox prevents the 128-lane
-  * paper configuration from becoming a deeply nested Scala expression tree.
-  * The generated controls still drive the same multicast Benes fabric.
-  */
 class BenesRouteControlBlackBox(cfg: TrapezoidConfig) extends BlackBox {
-  require(cfg.distributionWidth > 16)
+  require(cfg.distributionWidth == cfg.macLanes && cfg.macLanes >= 2)
 
   addGeneric("LANES", cfg.distributionWidth)
   addGeneric("INDEX_WIDTH", cfg.macLaneIndexWidth)
@@ -732,6 +573,8 @@ class BenesRouteControlBlackBox(cfg: TrapezoidConfig) extends BlackBox {
       (cfg.distributionWidth * cfg.macLaneIndexWidth) bits)
     val controls = out Bits(cfg.benesControlWidth bits)
     val routable = out Bool()
+    val searchCycles = out UInt(32 bits)
+    val backtrackCount = out UInt(32 bits)
   }
 
   noIoPrefix()
@@ -843,6 +686,32 @@ private[trapezoid] object StaticBenesControls {
   }
 }
 
+class RestrictedBenesRouteControlGenerator(cfg: TrapezoidConfig) extends Component {
+  val io = new Bundle {
+    val metadata = in(BenesRouteMetadata(cfg))
+    val supported = out Bool()
+    val controls = out Bits(cfg.benesControlWidth bits)
+  }
+  val firstValid = OHMasking.first(io.metadata.routeValid)
+  val source = UInt(cfg.macLaneIndexWidth bits)
+  source := 0
+  for (lane <- 0 until cfg.macLanes) {
+    when(firstValid(lane)) { source := io.metadata.sourceIndices(lane) }
+  }
+  val broadcast = (0 until cfg.macLanes).map { lane =>
+    !io.metadata.routeValid(lane) || io.metadata.sourceIndices(lane) === source
+  }.reduce(_ && _)
+  val spread = (0 until cfg.macLanes).map { lane =>
+    !io.metadata.routeValid(lane) || io.metadata.sourceIndices(lane) ===
+      StaticBenesControls.spreadSourceIndex(cfg.distributionWidth, lane)
+  }.reduce(_ && _)
+  val broadcastControls = new BenesBroadcastControlGenerator(cfg)
+  broadcastControls.io.sourceIndex := source
+  io.supported := io.metadata.routeValid.orR && (broadcast || spread)
+  io.controls := Mux(broadcast, broadcastControls.io.controls,
+    B(StaticBenesControls.spreadControls(cfg.distributionWidth), cfg.benesControlWidth bits))
+}
+
 case class RestrictedBenesRouteToken(cfg: TrapezoidConfig) extends Bundle {
   val supported = Bool()
   val broadcast = Bool()
@@ -908,59 +777,10 @@ class PipelinedRestrictedBenesRouteControlGenerator(cfg: TrapezoidConfig)
   tokenStage.ready := io.result.ready
 }
 
-/** Fixed-latency metadata path for wide PE rows.
-  *
-  * Wide RTL carries compact route metadata through seven elastic stages. The
-  * current endpoint still solves the graph at the final stage; a later
-  * implementation can replace that endpoint with level-local Benes FSMs
-  * without changing the PE-row FIFO contract.
-  */
+/** Compatibility name for the variable-latency request/response solver. */
 class PipelinedBenesRouteControlGenerator(cfg: TrapezoidConfig)
-    extends Component {
+    extends BenesRouteControlGenerator(cfg) {
   addAttribute("verilator hier_block")
-
-  val io = new Bundle {
-    val start = slave(Stream(BenesRouteMetadata(cfg)))
-    val result = master(Stream(BenesRouteControlResult(cfg)))
-  }
-
-  val solved = Stream(BenesRouteControlResult(cfg))
-  solved.valid := io.start.valid
-  if (cfg.distributionWidth <= 16) {
-    val solver = new BenesRouteControlGenerator(cfg)
-    solver.io.routeValid := io.start.payload.routeValid
-    solver.io.sourceIndices := io.start.payload.sourceIndices
-    solved.payload.controls := solver.io.controls
-    solved.payload.routable := solver.io.routable
-  } else {
-    val solver = new BenesRouteControlBlackBox(cfg)
-    solver.io.startValid := io.start.valid
-    io.start.ready := solver.io.startReady
-    solver.io.resultReady := io.result.ready
-    io.result.valid := solver.io.resultValid
-    solver.io.routeValid := io.start.payload.routeValid
-    for (lane <- 0 until cfg.distributionWidth) {
-      solver.io.sourceIndices(
-        lane * cfg.macLaneIndexWidth + cfg.macLaneIndexWidth - 1 downto
-          lane * cfg.macLaneIndexWidth) :=
-        io.start.payload.sourceIndices(lane).asBits
-    }
-    io.result.payload.controls := solver.io.controls
-    io.result.payload.routable := solver.io.routable
-  }
-  if (cfg.distributionWidth <= 16) {
-    io.start.ready := solved.ready
-  }
-
-  if (cfg.distributionWidth <= 16) {
-    // Small fabrics keep the exact Scala solver and use the same elastic
-    // stage count as the paper-width implementation.
-    var staged = solved
-    for (_ <- 0 until log2Up(cfg.distributionWidth)) {
-      staged = staged.m2sPipe()
-    }
-    io.result << staged
-  }
 }
 
 /** Complete source-to-all-lanes multicast path used to validate the runtime
